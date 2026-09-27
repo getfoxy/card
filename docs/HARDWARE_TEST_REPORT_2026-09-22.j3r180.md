@@ -245,6 +245,18 @@ reinstall — applet surgery lesson: dump + sweep before surgery).
 Gate ordering proven live: the PIN check precedes slot validation and the
 burn, so an unverified session learns nothing and consumes nothing.
 
+> **Erratum, added 2026-09-27 (ENG-615). The 2026-09-23 record above is
+> unchanged.** The v0.2 CAP recorded above (`sha256 939cf24a…`) carries
+> ENG-615. Once three wrong PINs blocked the card, its gate stopped firing, and
+> `SPEND_PROOF`, `SIGN_ARBITRARY`, `LOAD_PROOF`, `CLEAR_SPENT` and `LOCK_CARD`
+> all answered `9000` with no PIN. A failed PIN check also left a verified
+> session verified. The probes above ran on a card whose PIN was set and not
+> blocked, so they hold for that case; the blocked case was not exercised.
+> **Do not install the 939cf24a CAP.** The fix is applet version 0.3 (`SELECT`
+> answers `00 03`; tracked CAP sha256 `958a8baa…`), verified in jCardSim and not
+> yet run on this card. A card answering `00 02` runs the vulnerable build:
+> sweep it, then reinstall.
+
 ## Field-hardening ledger — POS integration (2026-09-23/24)
 
 The terminal integration surfaced one failure mode per layer, each fixed at

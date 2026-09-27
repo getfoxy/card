@@ -256,15 +256,31 @@ exhausting the tries **removed** the gate: every PIN-gated command opened up
 to whoever held the card, while `VERIFY_PIN` and `GET_INFO` kept reporting it
 blocked. `CHANGE_PIN` had the mirror bug — its failed checks decremented the
 counter without ever setting `pinState`, leaving a card that reported "set"
-but could never verify. Both are fixed: the gate fires whenever a PIN exists
-in any state, and one helper owns the blocked transition for every PIN check.
-Cards flashed with v0.2.0 need the CAP reinstalled to pick this up; there is
-no proof-preserving upgrade, so sweep first.
+but could never verify. And no failed check ended the session, so a session
+that had verified stayed verified through later wrong PINs, including the
+ones that blocked the card. All three are fixed in applet 0.3: the gate fires
+whenever a PIN exists in any state; one helper owns the blocked transition for
+every PIN check; and a failed check ends the session's verification, as
+`OwnerPIN.check` does for its own validated flag. That last rule also means
+`CHANGE_PIN` can no longer exhaust the counter: it needs a verified session,
+and the `VERIFY_PIN` that opens one resets the counter.
+
+The fix changes wire behaviour, so the applet version moved to 0.3. Cards
+reporting applet version 0.2 (`SELECT` answers `00 02`) need the CAP
+reinstalled. There is no proof-preserving upgrade, so sweep first: the
+reinstall regenerates the card key.
+
+"Dead" also means **stranded**. Nothing but the card key can sign for the
+card's P2PK-locked proofs, so a blocked card's balance is unrecoverable, and
+`VERIFY_PIN` is unauthenticated: any reader in range can block a card with
+three APDUs ([`SECURITY-MODEL.md`](SECURITY-MODEL.md) #14). That loss is what
+`UNBLOCK_PIN` + PUK (ENG-617) has to remove.
 
 Provisioning: POS cards are personalised with a PIN by default
 (`cardctl set-pin` during personalisation; `fund-card --pin` when the funding
 tool gains it). The merchant terminal prompts for the PIN only when
-`GET_INFO.pinState` reports `set`.
+`GET_INFO.pinState` reports `set`, and refuses a card reporting `locked` (2)
+outright: nothing can spend from it.
 
 ---
 

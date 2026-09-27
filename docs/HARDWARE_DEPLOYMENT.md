@@ -80,6 +80,17 @@ gp --list
 
 ## Install
 
+The CAP tracked in this repo is **applet version 0.3**, sha256
+`958a8baa1050909cb241c47bff4cde7f4752b48f441614b35bda0d02cec30dda`. A CAP you
+build yourself hashes differently even from identical source, because the
+converter writes a creation timestamp into the manifest; for your own build,
+check the version `SELECT` returns after installing instead (below).
+
+**Never install a version 0.2 CAP** (the tracked one was sha256
+`939cf24a…`). It carries ENG-615: once the PIN is blocked, it stops gating
+spends. A card whose `SELECT` answers `00 02` needs reinstalling — sweep its
+balance first (see [Upgrade](#upgrade--re-personalise)).
+
 ```bash
 # Install CashuApplet.cap onto the card
 gp --install target/cashu-javacard-0.1.0.cap
@@ -98,13 +109,14 @@ gp --list
 # SELECT the applet (sends SELECT APDU with our AID)
 gp --apdu 00A4040007D2760000850102
 
-# Response: 0000 9000  (version 0.0 + SW_OK = applet responding)
+# Response: 0003 9000  (applet version 0.3 + SW_OK = applet responding)
+# 0002 here is the ENG-615 build: sweep the card, then reinstall.
 
 # GET_INFO (INS 0x01)
 gp --apdu B0010000
 
-# Response: 00 01 20 00 00 20 07 00
-#   v0.1 | 32 slots | 0 unspent | 0 spent | 32 empty | caps=0x07 | PIN unset
+# Response: 00 03 20 00 00 20 07 00
+#   v0.3 | 32 slots | 0 unspent | 0 spent | 32 empty | caps=0x07 | PIN unset
 # SW: 9000
 
 # GET_PUBKEY (INS 0x10)
@@ -131,7 +143,10 @@ gp --install target/cashu-javacard-0.1.0.cap
 ## Upgrade / re-personalise
 
 The applet has no OTA upgrade path — delete and reinstall to upgrade.
-All proof data and the card keypair are wiped on delete.
+All proof data and the card keypair are wiped on delete, and the proofs are
+P2PK-locked to that keypair, so **sweep the balance before deleting**. The
+v0.2 reinstall on the J3R180 stranded 5 sat this way (see the
+[hardware test report](HARDWARE_TEST_REPORT_2026-09-22.j3r180.md)).
 
 For production cards, use a secure messaging channel (SCP02/SCP03) with the card's default keys. Contact the card vendor for production key ceremonies.
 

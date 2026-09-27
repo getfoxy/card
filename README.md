@@ -99,8 +99,15 @@ Full reference: [`spec/APDU.md`](spec/APDU.md).
 until `VERIFY_PIN` succeeds in the same session. A card ships with **no PIN**,
 and until one is set it has bearer semantics — a hostile reader in range can
 drain it — so setting a PIN is the holder's first job. Three wrong tries block
-the card for good: there is no unblock path in this profile (see D13). See
+the card for good and strand its balance: nothing else can sign for its
+proofs, there is no unblock path in this profile, and any reader in range can
+send those three tries (threat #14 in the
+[security model](docs/SECURITY-MODEL.md)). See
 [D13](docs/DECISIONS.md#d13); D12 records the earlier no-PIN design.
+
+Applet 0.2 stopped gating once the PIN was blocked (ENG-615, fixed in 0.3). A
+card whose `SELECT` answers `00 02` needs the CAP reinstalled; sweep its
+balance first, because the reinstall regenerates the card key.
 
 **AID:** package `D2 76 00 00 85 01 02`, applet `…02 01`.
 

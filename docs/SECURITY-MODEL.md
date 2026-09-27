@@ -20,7 +20,7 @@ get around it rather than through it.
 | # | Threat | Protected? | Notes |
 |---|---|---|---|
 | 1 | Passive read of card memory | **Partially** | An attacker gets keyset id, amount, nonce and `C` — the secret string is never stored on the card, but it is reconstructible from the nonce plus the card pubkey, so treat it as leaked too. What does not leak is the private key, so the proofs stay unspendable. Balance and history leak. |
-| 2 | Hostile reader spends the card | **Once a PIN is set** | `SPEND_PROOF` and `SIGN_ARBITRARY` are gated on `VERIFY_PIN` in the same session (D13). A card with no PIN set — the factory state — can be drained by anyone in NFC range, so the holder must set one before carrying value. Three wrong tries block the card; the gate keeps refusing in the blocked state (ENG-615 closed a bug where it stopped), and there is no unblock path (D13). |
+| 2 | Hostile reader spends the card | **Once a PIN is set** | `SPEND_PROOF` and `SIGN_ARBITRARY` are gated on `VERIFY_PIN` in the same session (D13), and a failed PIN check ends that session. A card with no PIN set — the factory state — can be drained by anyone in NFC range, so the holder must set one before carrying value. Three wrong tries block the card; the gate keeps refusing in the blocked state (ENG-615 closed a bug where it stopped), and there is no unblock path (D13). That dead end is its own threat: see #14. |
 | 3 | Card lost or destroyed | ❌ **By design** | No seed, no backup, no recovery. See [D5](DECISIONS.md#d5). |
 | 4 | Cloning the chip | **Yes** | Cloning EEPROM copies the proofs but not the key; a clone cannot sign. Cards should be CC EAL 5+ to resist invasive extraction. |
 | 5 | Offline double-spend from copied data | ❌ **No** | Fundamental. An offline merchant cannot know a proof was already melted. See below. |
@@ -32,6 +32,7 @@ get around it rather than through it.
 | 11 | Tear-off during spend | ⚠️ **Unanalysed** | The status write is not in a `JCSystem` transaction. Untested on hardware. |
 | 12 | Counterfeit physical cards | **Not a concern** | Value is bound to the chip's key. A look-alike with no valid chip holds nothing. |
 | 13 | Supply-chain / pre-personalised cards | ⚠️ **Unaddressed** | Nothing currently attests that a card's key was generated on-card by an untampered applet. |
+| 14 | Hostile reader blocks the PIN (3 unauthenticated APDUs), balance unrecoverable | ❌ **No** | `VERIFY_PIN` needs no authentication, so three wrong PINs from any reader in NFC range block the card. Once blocked, nothing can sign for its proofs: they are P2PK-locked to the card key with only a `sigflag` tag (no refund key, no locktime; [D5](DECISIONS.md#d5)'s recovery proposal is unmerged), and a reinstall regenerates the key. The balance is gone. Mitigations: small balances, a shielded sleeve, and `UNBLOCK_PIN` + PUK (ENG-617) before volume issuance. See below. |
 
 ## The offline double-spend problem (#5)
 
@@ -82,21 +83,44 @@ Honest limits: this is an **operator attestation**, not a trustless proof of
 reserves. A holder cannot cryptographically verify it. Signed attestations from
 the reserve wallets would be the next step.
 
-## No PIN on spending (#2)
+## PIN-gated spending, and the blocked PIN (#2, #14)
 
-The sharpest open weakness. `SPEND_PROOF` is deliberately unauthenticated —
-possession authorises payment, which is what "bearer" means. The consequence is
-that a reader brought within NFC range can drain a card without the holder
-noticing.
+Spending is PIN-gated once a PIN is set ([D13](DECISIONS.md#d13), which
+superseded the no-PIN [D12](DECISIONS.md#d12) and resolved the decision D12
+had left open under ENG-209). `SPEND_PROOF`, `SIGN_ARBITRARY`, `LOAD_PROOF`,
+`CLEAR_SPENT` and `LOCK_CARD` answer `6982` until `VERIFY_PIN` succeeds in the
+same NFC session.
+The gate is the first statement of the spend handler, so a wrong, missing or
+blocked PIN never consumes a proof. The unverified-session case is proven on
+silicon (applet 0.2 on the J3R180, in the
+[hardware report](HARDWARE_TEST_REPORT_2026-09-22.j3r180.md)).
 
-Profile B+ (PIN-gated spending) is **specified but not implemented**. Note that
-any documentation advising users to "set a PIN for high-value cards" is
-describing something that does not exist.
+The gate does not cover a card with **no PIN**. Cards ship without one, and
+until one is set a reader in range can drain the card. Setting a PIN is the
+holder's first job.
 
-Mitigations available today are physical: shielded sleeves, small balances.
+**The blocked state had its own bug (ENG-615).** On applet 0.2 the gate checked
+`pinState == 1`, and a blocked card has `pinState == 2`, so three wrong PINs
+*removed* the gate: the card reported itself blocked and spent without asking.
+A failed PIN check also left a verified session verified, so the session that
+blocked the card could keep spending. Applet 0.3 gates whenever a PIN exists in
+any state, and a failed check ends the session's verification, the way
+`OwnerPIN.check` resets its own validated flag. The 0.3 behaviour is verified
+in jCardSim only; it has not yet run on silicon. A card whose `SELECT` answers
+`00 02` runs the vulnerable build and needs the CAP reinstalled. Sweep it
+first: a reinstall regenerates the key the proofs are locked to.
 
-This is tracked alongside the existing Flashcard fraud finding (ENG-209) and
-should be resolved before volume issuance.
+**A blocked card strands its balance (#14).** `VERIFY_PIN` is unauthenticated,
+so any reader in NFC range can send the three wrong PINs. Nothing but the card
+key can sign for the card's proofs: the P2PK secret carries only a `sigflag`
+tag, with no refund key and no locktime, and D5's recovery proposal is not
+merged. ENG-615 therefore turned "three wrong PINs = theft" into "three wrong
+PINs = destruction of funds". The thief gets nothing, the holder loses the
+balance, and there is no unblock path in this profile.
+
+Mitigations today: small balances and a shielded sleeve. `UNBLOCK_PIN` gated by
+a provisioning PUK (ENG-617) is what removes the loss, and it blocks volume
+issuance.
 
 ## What has and has not been tested
 
@@ -122,7 +146,9 @@ a few hundred taps. Treat simulator results accordingly — see
 
 ## Open items
 
-1. **PIN-gated spending** (#2) — product decision, blocks volume issuance.
+1. **`UNBLOCK_PIN` + PUK** (ENG-617, #14) — today three unauthenticated APDUs
+   strand a card's balance for good. Blocks volume issuance
+   ([D13](DECISIONS.md#d13)).
 2. **Tear-off analysis** (#11) — needs hardware.
 3. **Recovery** (#3) — [PR #4](https://github.com/lnflash/cashu-javacard/pull/4)
    is the live proposal; see [D5](DECISIONS.md#d5) for the flaw to fix first.

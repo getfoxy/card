@@ -100,7 +100,9 @@ class CashuAppletTest {
         byte[] data = resp.getData();
         assertEquals(2, data.length, "Version response must be 2 bytes");
         assertEquals(0x00, data[0], "Major version = 0");
-        assertEquals(0x02, data[1], "Minor version = 2 (D13 PIN-gated spend)");
+        assertEquals(0x03, data[1],
+            "Minor version = 3 (ENG-615: a blocked PIN keeps gating). A fixed card must not "
+                + "answer SELECT like the vulnerable 0.2 build.");
     }
 
     // =========================================================================
@@ -115,7 +117,7 @@ class CashuAppletTest {
         byte[] d = resp.getData();
         assertEquals(8, d.length, "GET_INFO must return 8 bytes");
         assertEquals(0x00, d[0] & 0xFF, "major version");
-        assertEquals(0x02, d[1] & 0xFF, "minor version");
+        assertEquals(0x03, d[1] & 0xFF, "minor version");
         assertEquals(MAX_PROOFS, d[2] & 0xFF, "max slots = 32");
         assertEquals(0, d[3] & 0xFF, "unspent = 0 initially");
         assertEquals(0, d[4] & 0xFF, "spent = 0 initially");
@@ -1265,50 +1267,166 @@ class CashuAppletTest {
             transmit(new CommandAPDU(CLA, INS_LOCK_CARD, 0, 0xDE)).getSW(),
             "LOCK_CARD on a blocked card");
 
+        // No route may re-key a blocked PIN. SET_PIN is the dangerous one:
+        // OwnerPIN.update() resets the try counter, so if SET_PIN read
+        // "blocked" as "no PIN" (the ENG-615 shape, one token away) a thief
+        // would set their own PIN, verify it and spend. CHANGE_PIN needs a
+        // verified session, which a blocked card can never grant.
+        assertEquals(SW_CONDITIONS_NOT_SATIS,
+            transmit(new CommandAPDU(CLA, INS_SET_PIN, 0, 0, NEW_PIN, 0, NEW_PIN.length)).getSW(),
+            "SET_PIN cannot re-personalise a blocked card");
+        assertEquals(SW_SECURITY_NOT_SATIS,
+            transmit(new CommandAPDU(CLA, INS_CHANGE_PIN, 0, 0, changePinData(TEST_PIN, NEW_PIN))).getSW(),
+            "CHANGE_PIN cannot re-key a blocked card");
+        assertEquals(SW_PIN_BLOCKED,
+            transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, NEW_PIN, 0, NEW_PIN.length)).getSW(),
+            "the PIN SET_PIN offered did not take");
+        assertEquals(SW_PIN_BLOCKED,
+            transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length)).getSW(),
+            "and the real PIN is refused too");
+        assertEquals(2, transmit(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)).getData()[7] & 0xFF,
+            "still blocked after every attempt to get back in");
+
         // Reads stay open: the holder can still see what is stranded.
         assertEquals(SW_OK, transmit(new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4)).getSW());
     }
 
     @Test @Order(25)
-    @DisplayName("exhausting the tries through CHANGE_PIN blocks the card the same way (ENG-615)")
-    void testChangePinExhaustionBlocksTheCard() {
+    @DisplayName("a failed CHANGE_PIN costs a try, ends the session, and counts toward the block (ENG-615)")
+    void testChangePinFailureEndsTheSessionAndCountsTowardTheBlock() {
+        assertEquals(SW_OK, loadProof1().getSW());
         personalise();
-        assertEquals(SW_OK, transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length)).getSW());
+        assertEquals(SW_OK, verify(TEST_PIN));
 
-        // A verified session, then three CHANGE_PINs that each carry the
-        // wrong current PIN. Before the fix this path decremented the counter
-        // without ever setting pinState, leaving GET_INFO saying "set" on a
-        // card that could no longer verify anything.
-        byte[] data = new byte[1 + WRONG_PIN.length + NEW_PIN.length];
-        data[0] = (byte) WRONG_PIN.length;
-        System.arraycopy(WRONG_PIN, 0, data, 1, WRONG_PIN.length);
-        System.arraycopy(NEW_PIN, 0, data, 1 + WRONG_PIN.length, NEW_PIN.length);
+        // A verified session, then a CHANGE_PIN carrying the wrong current
+        // PIN. On v0.2 this path decremented the counter without touching
+        // pinState and left the session verified, so three in a row ran the
+        // counter to zero while GET_INFO still said "set", and the session
+        // stayed open throughout.
+        byte[] wrongCurrent = changePinData(WRONG_PIN, NEW_PIN);
+        assertEquals(0x63C2, changePin(wrongCurrent), "a wrong current PIN costs a try");
 
-        assertEquals(0x63C2, transmit(new CommandAPDU(CLA, INS_CHANGE_PIN, 0, 0, data)).getSW());
-        assertEquals(0x63C1, transmit(new CommandAPDU(CLA, INS_CHANGE_PIN, 0, 0, data)).getSW());
-        assertEquals(SW_PIN_BLOCKED, transmit(new CommandAPDU(CLA, INS_CHANGE_PIN, 0, 0, data)).getSW(),
-            "the last wrong current PIN blocks, not just 63C0");
+        // The failed check ended the session, as OwnerPIN.check resets its own
+        // validated flag. The next CHANGE_PIN stops at 6982 without reaching
+        // the PIN (the counter holds at 2), the right current PIN cannot
+        // re-key from here either, and nothing the session had unlocked is
+        // still open. On v0.2 the second call answered 63C1 and the third 63C0.
+        assertEquals(SW_SECURITY_NOT_SATIS, changePin(wrongCurrent),
+            "the next CHANGE_PIN never reaches the PIN check");
+        assertEquals(SW_SECURITY_NOT_SATIS, changePin(changePinData(TEST_PIN, NEW_PIN)),
+            "not even with the right current PIN: the session is gone");
+        assertGatedCommandsRefuse("after a failed CHANGE_PIN");
 
-        byte[] info = transmit(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)).getData();
-        assertEquals(2, info[7] & 0xFF, "GET_INFO reports the PIN as blocked");
-        assertEquals(SW_PIN_BLOCKED,
-            transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length)).getSW(),
-            "even the right PIN is refused once blocked");
+        // The CHANGE_PIN failure counted: two wrong VERIFY_PINs now block the
+        // card, not three, and the block is reported the same way as any other.
+        assertEquals(0x63C1, verify(WRONG_PIN));
+        assertEquals(SW_PIN_BLOCKED, verify(WRONG_PIN),
+            "the CHANGE_PIN failure counted toward the block");
+        assertEquals(2, transmit(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)).getData()[7] & 0xFF,
+            "GET_INFO reports the PIN as blocked");
 
-        // This session proved the PIN before the card blocked, and stays
-        // verified until deselect — the honest holder who fumbled a PIN
-        // change keeps the tap they already authenticated. What must not
-        // happen is the next session getting in: re-SELECT clears the
-        // CLEAR_ON_DESELECT flag, and the gate has to hold from then on.
-        assertEquals(SW_OK,
-            transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, spendMessage(), 0, 32, 64)).getSW(),
-            "the already-verified session is still authenticated");
+        // Blocked, and neither route re-keys it: CHANGE_PIN has no session to
+        // run in, in this session or the next. After re-SELECT the gate holds
+        // and neither PIN verifies, so the new one was never installed.
+        assertEquals(SW_SECURITY_NOT_SATIS, changePin(changePinData(TEST_PIN, NEW_PIN)),
+            "CHANGE_PIN with the right current PIN on a blocked card");
         assertEquals(SW_OK,
             transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR))).getSW(),
             "re-SELECT starts a new session");
         assertEquals(SW_SECURITY_NOT_SATIS,
             transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, spendMessage(), 0, 32, 64)).getSW(),
-            "and the gate holds for every session after that");
+            "the gate holds for every session after that");
+        assertEquals(SW_SECURITY_NOT_SATIS, changePin(changePinData(TEST_PIN, NEW_PIN)),
+            "CHANGE_PIN in the new session");
+        assertEquals(SW_PIN_BLOCKED, verify(TEST_PIN), "the old PIN is refused");
+        assertEquals(SW_PIN_BLOCKED, verify(NEW_PIN), "and the new one was never installed");
+    }
+
+    @Test @Order(26)
+    @DisplayName("one wrong VERIFY_PIN after a right one ends the session (OwnerPIN.check semantics)")
+    void testFailedVerifyEndsAVerifiedSession() {
+        assertEquals(SW_OK, loadProof1().getSW());
+        personalise();
+        assertEquals(SW_OK, verify(TEST_PIN));
+
+        // OwnerPIN.check resets its validated flag before it compares, so a
+        // wrong PIN ends whatever the session had proved. On v0.2 this session
+        // stayed verified and the spend below answered 9000.
+        assertEquals(0x63C2, verify(WRONG_PIN));
+        assertGatedCommandsRefuse("after a wrong VERIFY_PIN in a verified session");
+
+        // Not a lockout: the right PIN verifies again (resetting the counter)
+        // and the session spends.
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK,
+            transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, spendMessage(), 0, 32, 64)).getSW(),
+            "a fresh verify re-opens the session");
+    }
+
+    @Test @Order(27)
+    @DisplayName("blocking the PIN from a verified session leaves that session nothing (ENG-615)")
+    void testBlockingFromAVerifiedSessionClosesIt() {
+        assertEquals(SW_OK, loadProof1().getSW());
+        personalise();
+        assertEquals(SW_OK, verify(TEST_PIN));
+
+        // Verify, then three wrong PINs in the same session. The card now
+        // reports itself blocked (GET_INFO 2, VERIFY_PIN 6983); on v0.2 this
+        // session still spent, signed, loaded and locked — "looks locked, is
+        // open", scoped to one tap. The session has to agree with the card.
+        assertEquals(0x63C2, verify(WRONG_PIN));
+        assertEquals(0x63C1, verify(WRONG_PIN));
+        assertEquals(SW_PIN_BLOCKED, verify(WRONG_PIN), "third wrong PIN blocks the card");
+        assertEquals(2, transmit(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)).getData()[7] & 0xFF,
+            "GET_INFO reports the PIN as blocked");
+        assertGatedCommandsRefuse("in the session the card was blocked from");
+        assertEquals(SW_PIN_BLOCKED, verify(TEST_PIN), "and the right PIN cannot re-open it");
+    }
+
+    // -------------------------------------------------------------------------
+    // ENG-615 helpers
+    // -------------------------------------------------------------------------
+
+    /** CHANGE_PIN data: 1-byte old PIN length, old PIN, new PIN. */
+    private static byte[] changePinData(byte[] oldPin, byte[] newPin) {
+        byte[] data = new byte[1 + oldPin.length + newPin.length];
+        data[0] = (byte) oldPin.length;
+        System.arraycopy(oldPin, 0, data, 1, oldPin.length);
+        System.arraycopy(newPin, 0, data, 1 + oldPin.length, newPin.length);
+        return data;
+    }
+
+    private int verify(byte[] pin) {
+        return transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, pin, 0, pin.length)).getSW();
+    }
+
+    private int changePin(byte[] data) {
+        return transmit(new CommandAPDU(CLA, INS_CHANGE_PIN, 0, 0, data)).getSW();
+    }
+
+    /**
+     * Every PIN-gated command answers 6982, and SPEND_PROOF refuses before it
+     * burns. Expects slot 0 to hold an unspent proof on entry. LOCK_CARD comes
+     * last: were the gate open it would lock the card for good, and a locked
+     * card answers LOAD_PROOF / CLEAR_SPENT with 6986 before their gate runs.
+     */
+    private void assertGatedCommandsRefuse(String when) {
+        assertEquals(SW_SECURITY_NOT_SATIS,
+            transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, spendMessage(), 0, 32, 64)).getSW(),
+            "SPEND_PROOF " + when);
+        assertEquals(0x01, transmit(new CommandAPDU(CLA, INS_GET_PROOF, 0, 0, 78)).getData()[0] & 0xFF,
+            "the slot is intact " + when + ": the gate ran before the burn");
+        assertEquals(SW_SECURITY_NOT_SATIS,
+            transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, spendMessage(), 0, 32, 64)).getSW(),
+            "SIGN_ARBITRARY " + when);
+        assertEquals(SW_SECURITY_NOT_SATIS,
+            transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_2, 0, PROOF_2.length, 1)).getSW(),
+            "LOAD_PROOF " + when);
+        assertEquals(SW_SECURITY_NOT_SATIS,
+            transmit(new CommandAPDU(CLA, INS_CLEAR_SPENT, 0, 0, 1)).getSW(),
+            "CLEAR_SPENT " + when);
+        assertEquals(SW_SECURITY_NOT_SATIS,
+            transmit(new CommandAPDU(CLA, INS_LOCK_CARD, 0, 0xDE)).getSW(),
+            "LOCK_CARD " + when);
     }
 }
-

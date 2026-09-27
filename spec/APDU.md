@@ -55,7 +55,7 @@ Returns applet version, capabilities, and slot statistics. Always available with
 | 4 | 1 | Spent proof count |
 | 5 | 1 | Empty slot count |
 | 6 | 1 | Capabilities flags (see below) |
-| 7 | 1 | PIN state (0=unset, 1=set, 2=locked) |
+| 7 | 1 | PIN state (0=unset, 1=set, 2=locked — the PIN is blocked, tries exhausted) |
 
 **Capabilities flags (byte 6):**
 
@@ -65,6 +65,11 @@ Returns applet version, capabilities, and slot statistics. Always available with
 | 1 | Schnorr signing supported |
 | 2 | PIN protection available |
 | 3–7 | Reserved (0) |
+
+**PIN state 2 is not "no PIN".** A blocked card still has a PIN; it can never
+be verified again (`VERIFY_PIN` answers `6983`), so every PIN-gated command
+answers `6982` permanently. There is no unblock path in this profile. A reader
+must treat 2 as "a PIN exists", never as 0.
 
 ---
 
@@ -168,7 +173,7 @@ Lightweight bulk status read. Returns a 1-byte status for every slot (0=empty, 1
 
 ## Category 0x2x — Spend (PIN required if PIN is set — Profile B+)
 
-If a PIN is set, the reader must call `VERIFY_PIN (0x40)` within the same NFC session before any spend or sign command (D13). Cards provisioned without a PIN keep tap-and-go behaviour. The PIN session flag is transient (cleared on card deselect / tap end).
+If a PIN is set, the reader must call `VERIFY_PIN (0x40)` within the same NFC session before any spend or sign command (D13). "A PIN is set" includes the blocked state (GET_INFO byte 7 = 2): `VERIFY_PIN` can never succeed there, so every spend and sign command answers `6982` permanently. Cards provisioned without a PIN keep tap-and-go behaviour. The PIN session flag is transient: cleared on card deselect / tap end, and by any failed PIN check (see [Session State](#session-state-transient)).
 
 ### SPEND_PROOF (0x20)
 
@@ -177,8 +182,9 @@ Atomically marks a proof as spent (irreversible) and returns a NUT-11 P2PK Schno
 This is the **core payment operation**.
 
 **PIN:** if a PIN is set, `VERIFY_PIN` must precede this command in the same
-session (D13). The gate runs *before* the slot burn, so a wrong or missing PIN
-never consumes a proof.
+session (D13). A blocked PIN counts as set, and refuses for good. The gate runs
+*before* the slot burn, so a wrong, missing or blocked PIN never consumes a
+proof.
 
 | Field | Value |
 |-------|-------|
@@ -198,7 +204,7 @@ never consumes a proof.
 | 6985 | Proof already spent — double-spend blocked |
 | 6A88 | Slot is empty |
 | 6A83 | Slot index out of range |
-| 6982 | PIN set but not verified in this session |
+| 6982 | PIN set (or blocked) and not verified in this session; permanent once the PIN is blocked |
 | 6F00 | Signing failed (hardware error) |
 
 **Note on message construction:** The reader computes
@@ -224,7 +230,8 @@ Signs any 32-byte message with the card private key **without** consuming a proo
 
 **PIN:** gated like `SPEND_PROOF` (D13) — the signature is a spend
 authorisation under the card's key, so an unverified session must not be able
-to mint one. `6982` when a PIN is set and unverified in this session.
+to mint one. `6982` when a PIN is set (or blocked) and unverified in this
+session.
 
 | Field | Value |
 |-------|-------|
@@ -241,13 +248,14 @@ to mint one. `6982` when a PIN is set and unverified in this session.
 
 | SW | Meaning |
 |----|---------|
+| 6982 | PIN set (or blocked) and not verified in this session; permanent once the PIN is blocked |
 | 6F00 | Signing failed |
 
 ---
 
 ## Category 0x3x — Write (PIN required if PIN is set)
 
-If PIN is set, the reader must call `VERIFY_PIN (0x40)` within the same NFC session before calling write commands. The PIN session flag is transient (cleared on card deselect / tap end).
+If PIN is set, the reader must call `VERIFY_PIN (0x40)` within the same NFC session before calling write commands. "PIN is set" includes the blocked state (GET_INFO byte 7 = 2), in which every write command answers `6982` permanently. The PIN session flag is transient: cleared on card deselect / tap end, and by any failed PIN check (see [Session State](#session-state-transient)).
 
 ### LOAD_PROOF (0x30)
 
@@ -268,7 +276,8 @@ Stores a new proof in the next available empty slot. Used during card top-up (fu
 
 | SW | Meaning |
 |----|---------|
-| 6982 | Security condition not satisfied (PIN required but not verified) |
+| 6982 | Security condition not satisfied (PIN set or blocked, and not verified in this session) |
+| 6986 | Card locked (`LOCK_CARD`) — writes disabled |
 | 6A84 | No space — all slots occupied |
 
 ---
@@ -290,7 +299,8 @@ Garbage-collects all spent proof slots, freeing them for new proofs. Called afte
 
 | SW | Meaning |
 |----|---------|
-| 6982 | Security condition not satisfied |
+| 6982 | Security condition not satisfied (PIN set or blocked, and not verified in this session) |
+| 6986 | Card locked (`LOCK_CARD`) — writes disabled |
 
 ---
 
@@ -298,7 +308,7 @@ Garbage-collects all spent proof slots, freeing them for new proofs. Called afte
 
 ### VERIFY_PIN (0x40)
 
-Verifies the provisioning PIN. On success, sets a transient session flag that permits write operations for the remainder of this NFC tap. On failure, decrements the retry counter.
+Verifies the provisioning PIN. On success, sets a transient session flag that permits the PIN-gated commands (spend, sign, write) for the remainder of this NFC tap, and resets the retry counter. On failure, decrements the retry counter and clears the session flag: a session that had verified is no longer authenticated, as with `OwnerPIN.check`.
 
 | Field | Value |
 |-------|-------|
@@ -313,15 +323,15 @@ Verifies the provisioning PIN. On success, sets a transient session flag that pe
 
 | SW | Meaning |
 |----|---------|
-| 63 CX | Wrong PIN — X retries remaining (e.g. `63 C2` = 2 retries left) |
-| 6983 | PIN blocked — max retries exhausted; card locked |
+| 63 CX | Wrong PIN — X retries remaining (e.g. `63 C2` = 2 retries left); the session's verification ends |
+| 6983 | PIN blocked — max retries exhausted, GET_INFO byte 7 now 2. Answered by the try that exhausts the counter (not `63 C0`) and by every `VERIFY_PIN` after it; there is no unblock path |
 | 6984 | PIN not set (use SET_PIN first) |
 
 ---
 
 ### SET_PIN (0x41)
 
-Sets the provisioning PIN. May only be called **once** (during card personalization). Subsequent PIN changes use `CHANGE_PIN`. If called when PIN is already set, returns `6985`.
+Sets the provisioning PIN. May only be called **once** (during card personalization). Subsequent PIN changes use `CHANGE_PIN`. If called when PIN is already set, returns `6985` — and a blocked PIN counts as set, so `SET_PIN` can never re-key a blocked card.
 
 | Field | Value |
 |-------|-------|
@@ -336,7 +346,8 @@ Sets the provisioning PIN. May only be called **once** (during card personalizat
 
 | SW | Meaning |
 |----|---------|
-| 6985 | PIN already set — use CHANGE_PIN |
+| 6985 | PIN already set (or blocked) — use CHANGE_PIN |
+| 6986 | Card locked (`LOCK_CARD`) |
 | 6700 | Wrong data length (PIN must be 4–8 bytes) |
 
 ---
@@ -344,6 +355,14 @@ Sets the provisioning PIN. May only be called **once** (during card personalizat
 ### CHANGE_PIN (0x42)
 
 Changes the PIN. Requires the current PIN to be verified first in this session.
+
+The card checks the current PIN in the data field again. A wrong one costs a
+try and answers `63CX`, exactly as `VERIFY_PIN` does, and it ends the
+session's verification: the next `CHANGE_PIN` answers `6982` until
+`VERIFY_PIN` succeeds again, and that success resets the counter. So
+`CHANGE_PIN` cannot run the counter down on its own; `6983` is listed below
+because it shares `VERIFY_PIN`'s failure handling, and a reader should handle
+it the same way.
 
 | Field | Value |
 |-------|-------|
@@ -358,7 +377,10 @@ Changes the PIN. Requires the current PIN to be verified first in this session.
 
 | SW | Meaning |
 |----|---------|
-| 6982 | Current PIN not verified |
+| 6982 | Current PIN not verified in this session (always the case once the PIN is blocked, or after a failed check) |
+| 63 CX | Wrong current PIN — X retries remaining; the session's verification ends |
+| 6983 | PIN blocked — tries exhausted, GET_INFO byte 7 now 2 |
+| 6986 | Card locked (`LOCK_CARD`) |
 | 6700 | Wrong data length |
 
 ---
@@ -367,7 +389,7 @@ Changes the PIN. Requires the current PIN to be verified first in this session.
 
 ### LOCK_CARD (0x50)
 
-Permanently disables all write operations. Useful for lost/stolen card mitigation if the card is recovered. **Irreversible.** Requires PIN.
+Permanently disables all write operations. Useful for lost/stolen card mitigation if the card is recovered. **Irreversible.** Requires PIN when one is set; a blocked PIN counts as set, so a blocked card cannot be locked.
 
 | Field | Value |
 |-------|-------|
@@ -380,7 +402,7 @@ Permanently disables all write operations. Useful for lost/stolen card mitigatio
 
 | SW | Meaning |
 |----|---------|
-| 6982 | PIN not verified |
+| 6982 | PIN set (or blocked) and not verified in this session |
 | 6985 | Card already locked |
 
 ---
@@ -390,12 +412,13 @@ Permanently disables all write operations. Useful for lost/stolen card mitigatio
 | SW | Meaning |
 |----|---------|
 | 90 00 | Success |
-| 63 CX | Wrong PIN, X retries remaining |
+| 63 CX | Wrong PIN, X retries remaining (the session's verification ends) |
 | 67 00 | Wrong length (Lc/Le) |
-| 69 82 | Security condition not satisfied (PIN required) |
-| 69 83 | Authentication method blocked (PIN locked) |
+| 69 82 | Security condition not satisfied (PIN set or blocked, and not verified in this session) |
+| 69 83 | Authentication method blocked (PIN blocked, GET_INFO byte 7 = 2) |
 | 69 84 | Referenced data not usable (PIN not set) |
-| 69 85 | Conditions not satisfied (already spent / already set) |
+| 69 85 | Conditions not satisfied (already spent / already set / card already locked) |
+| 69 86 | Command not allowed (card locked by `LOCK_CARD` — writes disabled) |
 | 6A 83 | Record not found (slot out of range) |
 | 6A 84 | Not enough memory (no empty slots) |
 | 6A 88 | Referenced data not found (slot empty) |
@@ -437,7 +460,7 @@ The following flags are held in transient RAM and cleared on card deselect:
 
 | Flag | Set by | Cleared by |
 |------|--------|-----------|
-| `pin_verified` | VERIFY_PIN (success) | Deselect / tap end |
+| `pin_verified` | VERIFY_PIN (success) | Deselect / tap end / any failed PIN check (VERIFY_PIN or CHANGE_PIN) |
 
 ---
 
