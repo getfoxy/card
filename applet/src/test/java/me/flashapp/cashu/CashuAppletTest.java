@@ -1223,5 +1223,92 @@ class CashuAppletTest {
         assertEquals(SW_OK, resp.getSW());
         assertEquals(64, resp.getData().length);
     }
+
+    // =========================================================================
+    // ENG-615 — a blocked PIN must keep gating, not stop gating
+    // =========================================================================
+
+    @Test @Order(24)
+    @DisplayName("a blocked PIN still gates every PIN-gated command (ENG-615)")
+    void testBlockedPinStillGatesEveryCommand() {
+        assertEquals(SW_OK, loadProof1().getSW());
+        personalise();
+
+        // Exhaust the three tries. Before the fix this left pinState at 2,
+        // which `requirePinIfSet` did not recognise as "a PIN exists" — so a
+        // thief who failed three times got a card that spent without asking.
+        for (int i = 0; i < 2; i++) {
+            transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, WRONG_PIN, 0, WRONG_PIN.length));
+        }
+        ResponseAPDU last = transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, WRONG_PIN, 0, WRONG_PIN.length));
+        assertEquals(SW_PIN_BLOCKED, last.getSW(), "third wrong PIN blocks the card");
+        byte[] info = transmit(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)).getData();
+        assertEquals(2, info[7] & 0xFF, "GET_INFO reports the PIN as blocked");
+
+        // Every gated command must now refuse — and SPEND_PROOF must refuse
+        // before it burns.
+        assertEquals(SW_SECURITY_NOT_SATIS,
+            transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, spendMessage(), 0, 32, 64)).getSW(),
+            "SPEND_PROOF on a blocked card");
+        assertEquals(0x01, transmit(new CommandAPDU(CLA, INS_GET_PROOF, 0, 0, 78)).getData()[0] & 0xFF,
+            "the slot is intact: the gate ran before the burn");
+        assertEquals(SW_SECURITY_NOT_SATIS,
+            transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, spendMessage(), 0, 32, 64)).getSW(),
+            "SIGN_ARBITRARY on a blocked card");
+        assertEquals(SW_SECURITY_NOT_SATIS,
+            transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_1, 0, PROOF_1.length, 1)).getSW(),
+            "LOAD_PROOF on a blocked card");
+        assertEquals(SW_SECURITY_NOT_SATIS,
+            transmit(new CommandAPDU(CLA, INS_CLEAR_SPENT, 0, 0, 1)).getSW(),
+            "CLEAR_SPENT on a blocked card");
+        assertEquals(SW_SECURITY_NOT_SATIS,
+            transmit(new CommandAPDU(CLA, INS_LOCK_CARD, 0, 0xDE)).getSW(),
+            "LOCK_CARD on a blocked card");
+
+        // Reads stay open: the holder can still see what is stranded.
+        assertEquals(SW_OK, transmit(new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4)).getSW());
+    }
+
+    @Test @Order(25)
+    @DisplayName("exhausting the tries through CHANGE_PIN blocks the card the same way (ENG-615)")
+    void testChangePinExhaustionBlocksTheCard() {
+        personalise();
+        assertEquals(SW_OK, transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length)).getSW());
+
+        // A verified session, then three CHANGE_PINs that each carry the
+        // wrong current PIN. Before the fix this path decremented the counter
+        // without ever setting pinState, leaving GET_INFO saying "set" on a
+        // card that could no longer verify anything.
+        byte[] data = new byte[1 + WRONG_PIN.length + NEW_PIN.length];
+        data[0] = (byte) WRONG_PIN.length;
+        System.arraycopy(WRONG_PIN, 0, data, 1, WRONG_PIN.length);
+        System.arraycopy(NEW_PIN, 0, data, 1 + WRONG_PIN.length, NEW_PIN.length);
+
+        assertEquals(0x63C2, transmit(new CommandAPDU(CLA, INS_CHANGE_PIN, 0, 0, data)).getSW());
+        assertEquals(0x63C1, transmit(new CommandAPDU(CLA, INS_CHANGE_PIN, 0, 0, data)).getSW());
+        assertEquals(SW_PIN_BLOCKED, transmit(new CommandAPDU(CLA, INS_CHANGE_PIN, 0, 0, data)).getSW(),
+            "the last wrong current PIN blocks, not just 63C0");
+
+        byte[] info = transmit(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)).getData();
+        assertEquals(2, info[7] & 0xFF, "GET_INFO reports the PIN as blocked");
+        assertEquals(SW_PIN_BLOCKED,
+            transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length)).getSW(),
+            "even the right PIN is refused once blocked");
+
+        // This session proved the PIN before the card blocked, and stays
+        // verified until deselect — the honest holder who fumbled a PIN
+        // change keeps the tap they already authenticated. What must not
+        // happen is the next session getting in: re-SELECT clears the
+        // CLEAR_ON_DESELECT flag, and the gate has to hold from then on.
+        assertEquals(SW_OK,
+            transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, spendMessage(), 0, 32, 64)).getSW(),
+            "the already-verified session is still authenticated");
+        assertEquals(SW_OK,
+            transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR))).getSW(),
+            "re-SELECT starts a new session");
+        assertEquals(SW_SECURITY_NOT_SATIS,
+            transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, spendMessage(), 0, 32, 64)).getSW(),
+            "and the gate holds for every session after that");
+    }
 }
 

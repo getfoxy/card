@@ -250,6 +250,17 @@ this profile — a blocked card is replaced at re-provisioning. An
 `UNBLOCK_PIN` command gated by a provisioning PUK is the designated follow-up
 **before volume issuance**; do not ship consumer cards at scale without it.
 
+*Correction (ENG-615, after v0.2.0):* "dead" was not what the applet did. The
+gate checked `pinState == 1`, and a blocked card has `pinState == 2`, so
+exhausting the tries **removed** the gate: every PIN-gated command opened up
+to whoever held the card, while `VERIFY_PIN` and `GET_INFO` kept reporting it
+blocked. `CHANGE_PIN` had the mirror bug — its failed checks decremented the
+counter without ever setting `pinState`, leaving a card that reported "set"
+but could never verify. Both are fixed: the gate fires whenever a PIN exists
+in any state, and one helper owns the blocked transition for every PIN check.
+Cards flashed with v0.2.0 need the CAP reinstalled to pick this up; there is
+no proof-preserving upgrade, so sweep first.
+
 Provisioning: POS cards are personalised with a PIN by default
 (`cardctl set-pin` during personalisation; `fund-card --pin` when the funding
 tool gains it). The merchant terminal prompts for the PIN only when

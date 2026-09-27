@@ -87,16 +87,20 @@ Full reference: [`spec/APDU.md`](spec/APDU.md).
 | `B0` | `12` | GET_PROOF_COUNT | — | Count of non-empty slots |
 | `B0` | `13` | GET_PROOF | — | Full proof at a slot index |
 | `B0` | `14` | GET_SLOT_STATUS | — | One status byte per slot |
-| `B0` | `20` | SPEND_PROOF | — | Mark spent + return 64-byte signature |
-| `B0` | `21` | SIGN_ARBITRARY | — | Sign 32 bytes, consuming no proof |
+| `B0` | `20` | SPEND_PROOF | ✔ (if set) | Mark spent + return 64-byte signature |
+| `B0` | `21` | SIGN_ARBITRARY | ✔ (if set) | Sign 32 bytes, consuming no proof |
 | `B0` | `30` | LOAD_PROOF | ✔ | Store a proof in the next free slot |
 | `B0` | `31` | CLEAR_SPENT | ✔ | Reclaim spent slots |
 | `B0` | `40`–`42` | VERIFY/SET/CHANGE_PIN | — / ✔ | PIN management |
 | `B0` | `50` | LOCK_CARD | ✔ | Irreversibly disable writes |
 
-**Spending requires no PIN.** That is bearer semantics and the design's sharpest
-edge — a hostile reader in range can drain a card. See
-[D12](docs/DECISIONS.md#d12).
+**Spending is PIN-gated once a PIN is set** (D13, v0.2.0): `SPEND_PROOF`,
+`SIGN_ARBITRARY`, `LOAD_PROOF`, `CLEAR_SPENT` and `LOCK_CARD` answer `6982`
+until `VERIFY_PIN` succeeds in the same session. A card ships with **no PIN**,
+and until one is set it has bearer semantics — a hostile reader in range can
+drain it — so setting a PIN is the holder's first job. Three wrong tries block
+the card for good: there is no unblock path in this profile (see D13). See
+[D13](docs/DECISIONS.md#d13); D12 records the earlier no-PIN design.
 
 **AID:** package `D2 76 00 00 85 01 02`, applet `…02 01`.
 

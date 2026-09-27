@@ -514,16 +514,28 @@ public class CashuApplet extends Applet {
 
         byte[] buf = apdu.getBuffer();
         boolean ok = pin.check(buf, ISO7816.OFFSET_CDATA, (byte) pinLen);
-        if (!ok) {
-            byte remaining = pin.getTriesRemaining();
-            if (remaining == 0) {
-                pinState[0] = (byte) 2;
-                ISOException.throwIt(SW_PIN_BLOCKED);
-            }
-            short sw = (short)(0x63C0 | (remaining & 0x0F));
-            ISOException.throwIt(sw);
-        }
+        if (!ok) failPinCheck();
         pinVerifiedFlag[0] = (byte) 1;
+    }
+
+    /**
+     * A PIN check failed. Report the tries left as 63CX, or, when the last
+     * try just went, move the card to the blocked state and report 6983.
+     *
+     * The blocked transition lives here and nowhere else so that every
+     * command that checks the PIN (VERIFY_PIN, CHANGE_PIN) blocks the card
+     * the same way. Before this helper CHANGE_PIN exhausted the OwnerPIN
+     * without ever setting pinState, leaving GET_INFO reporting "set" on a
+     * card that could no longer verify (ENG-615).
+     */
+    private void failPinCheck() {
+        byte remaining = pin.getTriesRemaining();
+        if (remaining == 0) {
+            pinState[0] = (byte) 2;
+            ISOException.throwIt(SW_PIN_BLOCKED);
+        }
+        short sw = (short)(0x63C0 | (remaining & 0x0F));
+        ISOException.throwIt(sw);
     }
 
     private void processSetPin(APDU apdu) {
@@ -553,11 +565,7 @@ public class CashuApplet extends Applet {
         if (newLen < PIN_MIN_LEN || newLen > PIN_MAX_LEN) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
 
         boolean ok = pin.check(buf, off, oldLen);
-        if (!ok) {
-            byte remaining = pin.getTriesRemaining();
-            short sw = (short)(0x63C0 | (remaining & 0x0F));
-            ISOException.throwIt(sw);
-        }
+        if (!ok) failPinCheck();
         off += oldLen;
         pin.update(buf, off, (byte) newLen);
     }
@@ -584,8 +592,15 @@ public class CashuApplet extends Applet {
         if (cardLocked[0] == (byte) 1) ISOException.throwIt(ISO7816.SW_COMMAND_NOT_ALLOWED);
     }
 
+    /**
+     * D13 gate. Fires whenever a PIN exists and this session has not verified
+     * it — and "exists" includes the blocked state (pinState 2), from which
+     * VERIFY_PIN can never succeed. The earlier form checked `pinState == 1`,
+     * so three wrong guesses turned the card into a no-PIN bearer card:
+     * every gated command opened up the moment the PIN was blocked (ENG-615).
+     */
     private void requirePinIfSet() {
-        if (pinState[0] == (byte) 1 && pinVerifiedFlag[0] != (byte) 1) {
+        if (pinState[0] != (byte) 0 && pinVerifiedFlag[0] != (byte) 1) {
             ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
         }
     }
