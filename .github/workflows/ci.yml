@@ -129,6 +129,13 @@ jobs:
           path: .javacard-sdks
           persist-credentials: false
 
+      # The CAP tracked in the repo is the one docs/HARDWARE_DEPLOYMENT.md tells
+      # operators to install, by sha256. The build writes to the same path, so
+      # move the tracked one aside first: the CAP the next steps look at is then
+      # this commit's source, freshly converted, or nothing at all.
+      - name: Set the tracked CAP aside
+        run: mv applet/target/cashu-javacard-0.1.0.cap "$RUNNER_TEMP/tracked.cap"
+
       # 3.0.5 is the floor: SchnorrHW needs ALG_EC_SVDP_DH_PLAIN_XY, which does
       # not exist in 3.0.4.
       - name: Convert CAP
@@ -139,6 +146,29 @@ jobs:
           cap=applet/target/cashu-javacard-0.1.0.cap
           test -s "$cap" || { echo "::error::$cap was not produced"; exit 1; }
           ls -l "$cap"
+
+      # Nothing else ties the tracked CAP to the source: a fixed applet once sat
+      # next to the vulnerable 0.2 CAP (939cf24a) it replaced, and every suite
+      # stayed green. The converter writes a creation time into
+      # META-INF/MANIFEST.MF, so the two files never hash alike, but with this
+      # kit every other entry is byte-identical. Compare those, then require the
+      # deployment guide to publish the tracked CAP's hash.
+      - name: Tracked CAP matches the source and the deployment guide
+        run: |
+          tracked="$RUNNER_TEMP/tracked.cap"
+          mkdir "$RUNNER_TEMP/tracked" "$RUNNER_TEMP/built"
+          unzip -q "$tracked" -d "$RUNNER_TEMP/tracked"
+          unzip -q applet/target/cashu-javacard-0.1.0.cap -d "$RUNNER_TEMP/built"
+          diff -r -x MANIFEST.MF "$RUNNER_TEMP/tracked" "$RUNNER_TEMP/built" || {
+            echo "::error::the tracked CAP was not built from this source: run ant cap, commit applet/target/cashu-javacard-0.1.0.cap, and publish its sha256 in docs/HARDWARE_DEPLOYMENT.md"
+            exit 1
+          }
+          sha=$(sha256sum "$tracked" | cut -c1-64)
+          grep -q "$sha" docs/HARDWARE_DEPLOYMENT.md || {
+            echo "::error::docs/HARDWARE_DEPLOYMENT.md does not publish the tracked CAP's sha256 $sha"
+            exit 1
+          }
+          echo "tracked CAP $sha matches this source in every entry but META-INF/MANIFEST.MF"
 
       - name: Upload CAP
         uses: actions/upload-artifact@v5

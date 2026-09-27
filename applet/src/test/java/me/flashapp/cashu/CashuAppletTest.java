@@ -1289,6 +1289,13 @@ class CashuAppletTest {
 
         // Reads stay open: the holder can still see what is stranded.
         assertEquals(SW_OK, transmit(new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4)).getSW());
+
+        // The sequence a thief actually sends: VERIFY_PIN on the blocked card
+        // (6983), then the gated command. VERIFY_PIN answers a blocked card
+        // before its PIN check, so a session flag written on that early path
+        // would open every gate while the card still reports itself blocked.
+        // Checking the gate only before these attempts cannot see that.
+        assertGatedCommandsRefuse("after SET_PIN, CHANGE_PIN and VERIFY_PIN attempts on a blocked card");
     }
 
     @Test @Order(25)
@@ -1340,6 +1347,7 @@ class CashuAppletTest {
             "CHANGE_PIN in the new session");
         assertEquals(SW_PIN_BLOCKED, verify(TEST_PIN), "the old PIN is refused");
         assertEquals(SW_PIN_BLOCKED, verify(NEW_PIN), "and the new one was never installed");
+        assertGatedCommandsRefuse("after VERIFY_PIN attempts on a blocked card, in a new session");
     }
 
     @Test @Order(26)
@@ -1381,6 +1389,7 @@ class CashuAppletTest {
             "GET_INFO reports the PIN as blocked");
         assertGatedCommandsRefuse("in the session the card was blocked from");
         assertEquals(SW_PIN_BLOCKED, verify(TEST_PIN), "and the right PIN cannot re-open it");
+        assertGatedCommandsRefuse("after the right PIN was refused on the blocked card");
     }
 
     // -------------------------------------------------------------------------

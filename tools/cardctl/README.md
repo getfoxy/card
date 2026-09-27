@@ -63,6 +63,13 @@ PASS  SIGN_ARBITRARY + BIP-340 verify [1/3]
 All 11 checks passed on physical hardware.
 ```
 
+On a card with a PIN set, pass `--pin`: spend and sign are PIN-gated (D13),
+so the signing rounds need a verified session. A card whose PIN is blocked
+(`GET_INFO` byte 7 = 2) fails `selftest` before any signing round, since no PIN
+can verify on it again. On applet 0.3 and later that means the balance is
+stranded; on 0.1 and 0.2 it means the gate is open (ENG-615), so sweep the
+balance and reinstall the CAP.
+
 ## Loading the applet
 
 `cardctl` talks to an applet that is already installed. To install it, build the
@@ -87,7 +94,7 @@ reader is the more reliable way to install, leaving NFC for tap testing.
 | Command | What it does |
 |---|---|
 | `readers` | list PC/SC readers |
-| `selftest [--rounds N]` | full hardware check incl. BIP-340 verification |
+| `selftest [--rounds N] [--pin P]` | full hardware check incl. BIP-340 verification |
 | `info` | version, slot counts, capabilities, PIN state, balance |
 | `pubkey` | 33-byte compressed public key |
 | `balance` | sum of unspent proof amounts |

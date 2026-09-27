@@ -13,10 +13,12 @@ Run:  python3 -m pytest test_apdu.py -q     (or: python3 test_apdu.py)
 
 import contextlib
 import io
+import secrets
 import sys
 import traceback
 import types
 
+import bip340
 import cardctl
 
 
@@ -483,12 +485,179 @@ def test_cmd_proof_prints_the_full_keyset_id_and_the_nonce():
     assert "4242" in printed, printed
 
 
+# ── selftest against a model of the applet's PIN gate ────────────────────────
+# selftest decides its next APDU from the last answer, so a list of canned
+# responses cannot drive it. These tests run the real command against a small
+# model of the applet instead: GET_INFO's PIN state, VERIFY_PIN's counter and
+# the gate on SIGN_ARBITRARY. The model signs for real (BIP-340), so a selftest
+# that reaches the signing rounds on a card it should have stopped at shows up
+# as a pass, not as a garbage signature that fails for the wrong reason.
+
+_CARD_SECKEY = 0x1F0E2D3C4B5A69788796A5B4C3D2E1F00112233445566778899AABBCCDDEEFF0
+
+
+def _bip340_sign(seckey: int, msg: bytes) -> bytes:
+    """BIP-340 signing with fresh aux randomness, standing in for the card."""
+    n = bip340.N
+    pub = bip340._point_mul(bip340.G, seckey)
+    d = seckey if pub[1] % 2 == 0 else n - seckey
+    px = pub[0].to_bytes(32, "big")
+    aux = bip340.tagged_hash("BIP0340/aux", secrets.token_bytes(32))
+    t = (d ^ int.from_bytes(aux, "big")).to_bytes(32, "big")
+    k0 = int.from_bytes(bip340.tagged_hash("BIP0340/nonce", t + px + msg), "big") % n
+    r = bip340._point_mul(bip340.G, k0)
+    k = k0 if r[1] % 2 == 0 else n - k0
+    rx = r[0].to_bytes(32, "big")
+    e = int.from_bytes(bip340.tagged_hash("BIP0340/challenge", rx + px + msg), "big") % n
+    return rx + ((k + e * d) % n).to_bytes(32, "big")
+
+
+class FakeApplet:
+    """
+    A PC/SC connection answering like the applet's PIN gate.
+
+    `pin_state` is GET_INFO byte 7 (0 unset, 1 set, 2 blocked). `gate` picks
+    the rule SIGN_ARBITRARY is gated by: "0.3" refuses whenever a PIN exists
+    and the session is unverified; "0.2" is the ENG-615 rule, `pinState == 1`,
+    which opens the moment the PIN is blocked.
+    """
+
+    def __init__(self, version=(0, 3), pin_state=1, pin=b"1234", gate="0.3"):
+        self.version = bytes(version)
+        self.pin_state = pin_state
+        self.pin = pin
+        self.tries = 3 if pin_state == 1 else 0
+        self.verified = False
+        self.gate = gate
+        self.sent = []
+        pub = bip340._point_mul(bip340.G, _CARD_SECKEY)
+        self.pubkey = bytes([2 | (pub[1] & 1)]) + pub[0].to_bytes(32, "big")
+
+    def connect(self):
+        pass
+
+    @property
+    def ins_sent(self):
+        """INS of every APDU after SELECT, in order."""
+        return [apdu[1] for apdu in self.sent if apdu[:2] != b"\x00\xA4"]
+
+    def transmit(self, apdu):
+        apdu = bytes(apdu)
+        self.sent.append(apdu)
+        body, sw = self._answer(apdu)
+        return list(body), sw >> 8, sw & 0xFF
+
+    def _answer(self, apdu):
+        if apdu[:2] == b"\x00\xA4":
+            return self.version, 0x9000
+        ins = apdu[1]
+        if ins == cardctl.INS_GET_INFO:
+            return self.version + bytes([32, 0, 0, 32, 0x07, self.pin_state]), 0x9000
+        if ins == cardctl.INS_GET_PUBKEY:
+            return self.pubkey, 0x9000
+        if ins == cardctl.INS_GET_BALANCE:
+            return (21).to_bytes(4, "big"), 0x9000
+        if ins == cardctl.INS_GET_SLOT_STATUS:
+            return bytes(32), 0x9000
+        if ins == cardctl.INS_VERIFY_PIN:
+            if self.pin_state == 0:
+                return b"", 0x6984
+            if self.tries == 0:
+                return b"", 0x6983
+            if apdu[5:5 + apdu[4]] == self.pin:
+                self.verified, self.tries = True, 3
+                return b"", 0x9000
+            self.verified, self.tries = False, self.tries - 1
+            if self.tries == 0:
+                self.pin_state = 2
+                return b"", 0x6983
+            return b"", 0x63C0 | self.tries
+        if ins == cardctl.INS_SIGN_ARBITRARY:
+            has_pin = self.pin_state != 0 if self.gate == "0.3" else self.pin_state == 1
+            if has_pin and not self.verified:
+                return b"", 0x6982
+            return _bip340_sign(_CARD_SECKEY, apdu[5:37]), 0x9000
+        return b"", 0x6D00
+
+
+def run_selftest(applet, *flags):
+    """Run `cardctl selftest <flags>` against `applet`; (exit code, stdout)."""
+    card = cardctl.Card.__new__(cardctl.Card)
+    card.connection = applet
+    card.verbose = False
+    card.reader = "fake"
+    args = cardctl.build_parser().parse_args(["selftest", *flags])
+    real = cardctl.Card
+    cardctl.Card = lambda *a, **kw: card
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            rc = args.func(args)
+    finally:
+        cardctl.Card = real
+    return rc, buf.getvalue()
+
+
+def test_selftest_verifies_a_set_pin_before_signing_and_passes():
+    """The path the blocked-PIN branch must not swallow: a set PIN is verified
+    before the first signing round, and every signature off the card verifies.
+    Also proves the model signs for real, which the tests below rely on."""
+    applet = FakeApplet(pin_state=1)
+    rc, out = run_selftest(applet, "--pin", "1234")
+    assert rc == 0, out
+    assert "All 11 checks passed" in out, out
+    ins = applet.ins_sent
+    assert cardctl.INS_VERIFY_PIN in ins, ins
+    assert ins.index(cardctl.INS_VERIFY_PIN) < ins.index(cardctl.INS_SIGN_ARBITRARY), ins
+
+
+def test_selftest_stops_at_a_blocked_pin_before_any_signing_round():
+    """
+    GET_INFO byte 7 = 2 is a PIN that exists and can never verify, never "no
+    PIN" (spec/APDU.md, GET_INFO). selftest used to handle it exactly like 0:
+    `selftest --pin 1234` dropped the PIN without a word, passed six checks,
+    then died on SIGN_ARBITRARY's 6982, which pointed the operator at a PIN
+    that can never verify. It must fail the card, say why, and sign nothing.
+    """
+    applet = FakeApplet(pin_state=2)
+    rc, out = run_selftest(applet, "--pin", "1234")
+    assert rc == 1, out
+    assert cardctl.INS_SIGN_ARBITRARY not in applet.ins_sent, "a signing round ran on a blocked card"
+    assert cardctl.INS_VERIFY_PIN not in applet.ins_sent, "VERIFY_PIN cannot succeed on a blocked card"
+    assert "FAIL  PIN state" in out, out
+    assert "balance stranded (SECURITY-MODEL #14)" in out, out
+    assert "1 check(s) FAILED: PIN state" in out, out
+    # The reads still ran, so the operator sees the balance at stake.
+    for ins in (cardctl.INS_GET_PUBKEY, cardctl.INS_GET_BALANCE, cardctl.INS_GET_SLOT_STATUS):
+        assert ins in applet.ins_sent, f"INS {ins:02X} was not sent"
+
+
+def test_selftest_fails_a_blocked_card_below_0_3_whose_gate_is_open():
+    """
+    On 0.1 and 0.2 a blocked PIN removed the gate (ENG-615). The old selftest
+    skipped VERIFY_PIN, SIGN_ARBITRARY signed without a PIN, and the card
+    passed every check: a card anyone could spend, reported healthy. It must
+    fail, and name the fix, which is the opposite of a 0.3 card's: the balance
+    is not stranded, so sweep it and reinstall.
+    """
+    applet = FakeApplet(version=(0, 2), pin_state=2, gate="0.2")
+    rc, out = run_selftest(applet)
+    assert rc == 1, out
+    assert cardctl.INS_SIGN_ARBITRARY not in applet.ins_sent
+    assert "applet 0.2" in out and "ENG-615" in out and "Sweep the balance" in out, out
+    assert "stranded" not in out, out
+
+
 # ── error handling ───────────────────────────────────────────────────────────
 def test_status_words_are_translated():
     assert "already spent" in cardctl.describe_sw(0x6985)
     assert "slot is empty" in cardctl.describe_sw(0x6A88)
     assert "2 retries remaining" in cardctl.describe_sw(0x63C2)
     assert "0 retries remaining" in cardctl.describe_sw(0x63C0)
+    # A write to a card locked by LOCK_CARD (spec/APDU.md, LOAD_PROOF and the
+    # error summary). It used to read "unknown status word".
+    assert "LOCK_CARD" in cardctl.describe_sw(0x6986)
+    assert "blocked" in cardctl.describe_sw(0x6982)
 
 
 def test_non_9000_raises_carderror_with_context():

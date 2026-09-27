@@ -83,13 +83,32 @@ gp --list
 The CAP tracked in this repo is **applet version 0.3**, sha256
 `958a8baa1050909cb241c47bff4cde7f4752b48f441614b35bda0d02cec30dda`. A CAP you
 build yourself hashes differently even from identical source, because the
-converter writes a creation timestamp into the manifest; for your own build,
-check the version `SELECT` returns after installing instead (below).
+converter writes a creation timestamp into `META-INF/MANIFEST.MF`. Every other
+entry is byte-identical when built with JDK 17 and the kit CI pins
+(`jc305u4_kit` at `oracle_javacard_sdks` commit `6a75ec0d`), and CI checks
+exactly that on every push. So before installing your own build, compare every
+entry except `META-INF/MANIFEST.MF` against the tracked CAP:
 
-**Never install a version 0.2 CAP** (the tracked one was sha256
-`939cf24a…`). It carries ENG-615: once the PIN is blocked, it stops gating
-spends. A card whose `SELECT` answers `00 02` needs reinstalling — sweep its
-balance first (see [Upgrade](#upgrade--re-personalise)).
+```bash
+# From applet/, after `ant cap` has overwritten target/cashu-javacard-0.1.0.cap
+git show HEAD:applet/target/cashu-javacard-0.1.0.cap > /tmp/tracked.cap
+rm -rf /tmp/cap-tracked /tmp/cap-built
+unzip -q /tmp/tracked.cap -d /tmp/cap-tracked
+unzip -q target/cashu-javacard-0.1.0.cap -d /tmp/cap-built
+diff -r -x MANIFEST.MF /tmp/cap-tracked /tmp/cap-built && echo "same CAP as the tracked one"
+```
+
+Any output from `diff` means the two CAPs differ; do not install. After
+installing, `SELECT` must answer `00 03` (below).
+
+**Never install a CAP below version 0.3.** Every 0.1 and 0.2 build carries
+ENG-615: its gate checks `pinState == 1`, so once the PIN is blocked,
+`LOAD_PROOF`, `CLEAR_SPENT` and `LOCK_CARD` stop asking for it, and so do
+`SPEND_PROOF` and `SIGN_ARBITRARY` on builds that gate them (0.1 builds from
+before D13 gate no spend at all). The last tracked 0.2 CAP was sha256
+`939cf24a…`. A card whose `SELECT` answers anything below `00 03` (`00 01` or
+`00 02`) needs reinstalling — sweep its balance first (see
+[Upgrade](#upgrade--re-personalise)).
 
 ```bash
 # Install CashuApplet.cap onto the card
@@ -110,7 +129,7 @@ gp --list
 gp --apdu 00A4040007D2760000850102
 
 # Response: 0003 9000  (applet version 0.3 + SW_OK = applet responding)
-# 0002 here is the ENG-615 build: sweep the card, then reinstall.
+# Anything below 0003 (0001 or 0002) is an ENG-615 build: sweep the card, then reinstall.
 
 # GET_INFO (INS 0x01)
 gp --apdu B0010000

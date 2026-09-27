@@ -99,15 +99,17 @@ The gate does not cover a card with **no PIN**. Cards ship without one, and
 until one is set a reader in range can drain the card. Setting a PIN is the
 holder's first job.
 
-**The blocked state had its own bug (ENG-615).** On applet 0.2 the gate checked
-`pinState == 1`, and a blocked card has `pinState == 2`, so three wrong PINs
-*removed* the gate: the card reported itself blocked and spent without asking.
-A failed PIN check also left a verified session verified, so the session that
-blocked the card could keep spending. Applet 0.3 gates whenever a PIN exists in
-any state, and a failed check ends the session's verification, the way
-`OwnerPIN.check` resets its own validated flag. The 0.3 behaviour is verified
-in jCardSim only; it has not yet run on silicon. A card whose `SELECT` answers
-`00 02` runs the vulnerable build and needs the CAP reinstalled. Sweep it
+**The blocked state had its own bug (ENG-615).** Every build before applet 0.3
+gated on `pinState == 1`, and a blocked card has `pinState == 2`, so three
+wrong PINs *removed* the gate: the card reported itself blocked and spent
+without asking (0.1 builds from before D13 gate no spend at all, and their
+write gate opened the same way). A failed PIN check also left a verified
+session verified, so the session that blocked the card could keep spending.
+Applet 0.3 gates whenever a PIN exists in any state, and a failed check ends
+the session's verification, the way `OwnerPIN.check` resets its own validated
+flag. The 0.3 behaviour is verified in jCardSim only; it has not yet run on
+silicon. A card whose `SELECT` answers anything below `00 03` (`00 01` or
+`00 02`) runs a vulnerable build and needs the CAP reinstalled. Sweep it
 first: a reinstall regenerates the key the proofs are locked to.
 
 **A blocked card strands its balance (#14).** `VERIFY_PIN` is unauthenticated,
@@ -128,11 +130,30 @@ issuance.
 - BIP-340 signatures verify against an independent verifier and the spec's own vectors
 - Modular arithmetic matches `BigInteger` across random and edge inputs
 - Slot lifecycle, PIN gating, APDU encodings
+- The blocked PIN (applet 0.3): every gated command refuses, before and after
+  further PIN attempts, and a failed PIN check ends the session
 - DLEQ verification, including the tagging attack it exists to catch
 - NUT-11 witness checks: wrong key, wrong proof, corrupted signature, `n_sigs`
 
-**Not tested, because no card has run this yet:**
-- Any behaviour on physical silicon
+**Run on silicon** (NXP JCOP4 J3R180, 2026-09-22/23, recorded in the
+[hardware report](HARDWARE_TEST_REPORT_2026-09-22.j3r180.md); applet 0.1, then
+0.2 for the D13 probes):
+- `cardctl selftest`: card signatures verify under BIP-340, and two signatures
+  over the same message use different nonces
+- Load, spend, swap and NUT-05 melt against the project mint, and a spend from
+  the merchant terminal
+- `SET_PIN`, `VERIFY_PIN` (wrong, then right) and `CHANGE_PIN` with the right
+  current PIN
+- The unverified-session gate: `LOAD_PROOF` and `CLEAR_SPENT` refuse on 0.1,
+  `SPEND_PROOF` refuses on 0.2
+
+An earlier card, a J3R452 on applet 0.1, ran the read and sign path on
+2026-09-01 ([its report](HARDWARE_TEST_REPORT_2026-09-01.j3r452.md)).
+
+**Not yet run on silicon:**
+- A blocked PIN on any build: neither ENG-615 nor its 0.3 fix (the
+  blocked-state gate and the failed-check session rule) has run on a card
+- `LOCK_CARD`, deliberately not run on a card holding value
 - EEPROM wear and lifetime
 - Tear-off and power-glitch behaviour
 - Timing/side-channel characteristics of the hand-rolled modular arithmetic

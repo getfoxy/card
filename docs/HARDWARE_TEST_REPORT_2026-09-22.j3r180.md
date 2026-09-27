@@ -254,8 +254,10 @@ burn, so an unverified session learns nothing and consumes nothing.
 > blocked, so they hold for that case; the blocked case was not exercised.
 > **Do not install the 939cf24a CAP.** The fix is applet version 0.3 (`SELECT`
 > answers `00 03`; tracked CAP sha256 `958a8baa…`), verified in jCardSim and not
-> yet run on this card. A card answering `00 02` runs the vulnerable build:
-> sweep it, then reinstall.
+> yet run on this card. A card answering anything below `00 03` (`00 01` or
+> `00 02`) runs a vulnerable build: sweep it, then reinstall. That includes the
+> version 0.1 CAP this report opens with (`c529006f…`), which predates D13: it
+> gates no spend at all, and its write gate has the same `pinState == 1` check.
 
 ## Field-hardening ledger — POS integration (2026-09-23/24)
 

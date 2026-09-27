@@ -265,9 +265,11 @@ every PIN check; and a failed check ends the session's verification, as
 `CHANGE_PIN` can no longer exhaust the counter: it needs a verified session,
 and the `VERIFY_PIN` that opens one resets the counter.
 
-The fix changes wire behaviour, so the applet version moved to 0.3. Cards
-reporting applet version 0.2 (`SELECT` answers `00 02`) need the CAP
-reinstalled. There is no proof-preserving upgrade, so sweep first: the
+The fix changes wire behaviour, so the applet version moved to 0.3. Every 0.1
+and 0.2 build has the same `pinState == 1` gate on `LOAD_PROOF`, `CLEAR_SPENT`
+and `LOCK_CARD`, and 0.1 builds from before D13 gate no spend at all, so a card
+whose `SELECT` answers anything below `00 03` (`00 01` or `00 02`) needs the
+CAP reinstalled. There is no proof-preserving upgrade, so sweep first: the
 reinstall regenerates the card key.
 
 "Dead" also means **stranded**. Nothing but the card key can sign for the
