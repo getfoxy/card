@@ -54,7 +54,7 @@ nonce that is a pure function of `(d, msg)` lets a fault injector recover the
 private key from two signatures).
 
 ```
-PASS  SELECT applet  — version 0.1
+PASS  SELECT applet  — version 0.3
 PASS  GET_INFO  — v0.1, 32 slots, PIN unset
 PASS  Schnorr capability advertised  — caps=0x03
 PASS  GET_PUBKEY well-formed  — 02a1b2c3d4e5f60718…  (33 bytes)
@@ -64,11 +64,14 @@ All 11 checks passed on physical hardware.
 ```
 
 On a card with a PIN set, pass `--pin`: spend and sign are PIN-gated (D13),
-so the signing rounds need a verified session. A card whose PIN is blocked
-(`GET_INFO` byte 7 = 2) fails `selftest` before any signing round, since no PIN
-can verify on it again. On applet 0.3 and later that means the balance is
-stranded; on 0.1 and 0.2 it means the gate is open (ENG-615), so sweep the
-balance and reinstall the CAP.
+so the signing rounds need a verified session.
+
+Every card below applet 0.3 fails `selftest` at `SELECT applet`, blocked or
+not. Those builds gate with `pinState == 1`, so three wrong `VERIFY_PIN`s from
+any reader in range switch the PIN check off (ENG-615): sweep the balance and
+reinstall the CAP. A card whose PIN is blocked (`GET_INFO` byte 7 = 2) also
+fails before any signing round, since no PIN can verify on it again; on 0.3
+and later that means the balance is stranded.
 
 ## Loading the applet
 

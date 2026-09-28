@@ -101,8 +101,11 @@ diff -r -x MANIFEST.MF /tmp/cap-tracked /tmp/cap-built && echo "same CAP as the 
 Any output from `diff` means the two CAPs differ; do not install. After
 installing, `SELECT` must answer `00 03` (below).
 
-**Never install a CAP below version 0.3.** Every 0.1 and 0.2 build carries
-ENG-615: its gate checks `pinState == 1`, so once the PIN is blocked,
+**Install only a CAP that matches the tracked one** (sha256 `958a8baa…`, or the
+entry comparison above). The file name and the CAP's package version read 0.1
+on every build (`applet/build.xml` pins the package version), so neither can
+tell a fixed build from a vulnerable one; only the applet version `SELECT`
+answers after install can. Every 0.1 and 0.2 applet build carries ENG-615: its gate checks `pinState == 1`, so once the PIN is blocked,
 `LOAD_PROOF`, `CLEAR_SPENT` and `LOCK_CARD` stop asking for it, and so do
 `SPEND_PROOF` and `SIGN_ARBITRARY` on builds that gate them (0.1 builds from
 before D13 gate no spend at all). The last tracked 0.2 CAP was sha256

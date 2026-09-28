@@ -648,6 +648,38 @@ def test_selftest_fails_a_blocked_card_below_0_3_whose_gate_is_open():
     assert "stranded" not in out, out
 
 
+def test_selftest_fails_every_build_below_0_3_blocked_or_not():
+    """
+    A 0.1 or 0.2 card whose PIN is set but not yet blocked is three wrong
+    VERIFY_PINs away from an open gate (ENG-615): any reader in range can block
+    the PIN and then spend without it. selftest used to pass such a card as
+    healthy, because its only version check ran once the PIN was already
+    blocked, after the attacker's three APDUs. The rollout says every card
+    below 0.3 is swept and reinstalled, so selftest must fail each of them.
+    """
+    for version in ((0, 1), (0, 2)):
+        for pin_state in (0, 1):
+            applet = FakeApplet(version=version, pin_state=pin_state, gate="0.2")
+            flags = ("--pin", "1234") if pin_state == 1 else ()
+            rc, out = run_selftest(applet, *flags)
+            label = f"applet {version[0]}.{version[1]}, pin_state {pin_state}"
+            assert rc == 1, f"{label}\n{out}"
+            assert "FAIL  SELECT applet" in out, f"{label}\n{out}"
+            assert f"applet {version[0]}.{version[1]} is an ENG-615 build" in out, f"{label}\n{out}"
+            assert "checks passed" not in out, f"{label}\n{out}"
+
+
+def test_select_verdict_passes_only_a_known_fixed_version():
+    assert cardctl._select_verdict(bytes([0, 3])) == (True, "version 0.3")
+    assert cardctl._select_verdict(bytes([1, 0]))[0] is True
+    for version in (bytes([0, 1]), bytes([0, 2])):
+        ok, detail = cardctl._select_verdict(version)
+        assert ok is False and "ENG-615" in detail, detail
+    # No version at all cannot be told apart from an ENG-615 build.
+    ok, detail = cardctl._select_verdict(b"")
+    assert ok is False and "no applet version" in detail, detail
+
+
 # ── error handling ───────────────────────────────────────────────────────────
 def test_status_words_are_translated():
     assert "already spent" in cardctl.describe_sw(0x6985)

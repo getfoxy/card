@@ -1000,7 +1000,7 @@ def cmd_selftest(args) -> int:
     print(f"reader: {card.reader}\n")
 
     version = card.select()
-    record("SELECT applet", True, f"version {version[0]}.{version[1]}" if len(version) >= 2 else "")
+    record("SELECT applet", *_select_verdict(version))
 
     info = card.get_info()
     record("GET_INFO", True,
@@ -1091,6 +1091,26 @@ def cmd_selftest(args) -> int:
 
     rc = verdict()
     return rc if all_sigs_ok else 1
+
+
+def _select_verdict(version: bytes) -> Tuple[bool, str]:
+    """
+    Whether the applet version SELECT answered is a build that keeps its gate.
+
+    Every 0.1 and 0.2 build gates with `pinState == 1` (ENG-615), so its PIN
+    is three unauthenticated VERIFY_PINs away from switching off, from any
+    reader in range, whether or not it is blocked yet. selftest fails such a
+    card outright rather than only once the PIN is already blocked. A card
+    that answers SELECT with no version cannot be told apart from one of them.
+    """
+    if len(version) < 2:
+        return False, ("SELECT returned no applet version, so an ENG-615 build "
+                       "cannot be told apart from a fixed one")
+    ver = tuple(version[:2])
+    if ver < (0, 3):
+        return False, (f"applet {ver[0]}.{ver[1]} is an ENG-615 build: sweep the "
+                       f"balance, then reinstall the 0.3 CAP (docs/HARDWARE_DEPLOYMENT.md)")
+    return True, f"version {ver[0]}.{ver[1]}"
 
 
 def _blocked_pin_detail(version: bytes) -> str:
