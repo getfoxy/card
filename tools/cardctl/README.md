@@ -72,9 +72,10 @@ from any reader in range switch the PIN check off (ENG-615). A 0.3 card may run
 the build `main` tracked before the ENG-620 fix, which writes a slot's status
 byte before its data ([D14](../../docs/DECISIONS.md#d14)), and nothing on the
 card tells it apart from another 0.3 build. Either way, sweep the balance and
-reinstall the CAP. A card whose PIN is blocked (`GET_INFO` byte 7 = 2) also
-fails before any signing round, since no PIN can verify on it again; on 0.3
-and later that means the balance is stranded.
+reinstall the 0.4 CAP, except that a 0.3 card whose PIN is blocked cannot be
+swept. A card whose PIN is blocked (`GET_INFO` byte 7 = 2) also fails before
+any signing round, since no PIN can verify on it again; on 0.3 and later that
+means the balance is stranded (SECURITY-MODEL #14).
 
 ## Loading the applet
 

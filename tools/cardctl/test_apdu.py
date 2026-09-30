@@ -675,8 +675,9 @@ def test_selftest_fails_every_0_3_card_blocked_or_not():
     before its data (ENG-620, D14), and nothing on an installed card tells it
     apart from a 0.3 build with the fix: SELECT's version is all the card
     reports about its build. selftest passed every 0.3 card as healthy. It
-    must fail each one, with or without a PIN, and name the fix: sweep, then
-    reinstall the 0.4 CAP.
+    must fail each one, with or without a PIN, and name the fix: reinstall the
+    0.4 CAP, sweeping first unless the PIN is blocked. A blocked 0.3 card cannot
+    spend (its balance is stranded), so it is never told to sweep outright.
     """
     for pin_state in (0, 1, 2):
         applet = FakeApplet(version=(0, 3), pin_state=pin_state)
@@ -687,7 +688,11 @@ def test_selftest_fails_every_0_3_card_blocked_or_not():
         assert "FAIL  SELECT applet" in out, f"{label}\n{out}"
         assert "applet 0.3 may carry ENG-620" in out, f"{label}\n{out}"
         assert "reinstall the 0.4 CAP" in out, f"{label}\n{out}"
+        assert "unless its PIN is blocked" in out, f"{label}\n{out}"
         assert "checks passed" not in out, f"{label}\n{out}"
+        if pin_state == 2:
+            assert "sweep the balance, then" not in out.lower(), f"{label}\n{out}"
+            assert "stranded" in out, f"{label}\n{out}"
 
 
 def test_select_verdict_passes_only_a_known_fixed_version():

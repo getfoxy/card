@@ -1167,8 +1167,9 @@ def _select_verdict(version: bytes) -> Tuple[bool, str]:
     if ver < (0, 4):
         return False, (f"applet {ver[0]}.{ver[1]} may carry ENG-620 (a card pulled "
                        f"mid-LOAD_PROOF can show a phantom proof), and SELECT cannot "
-                       f"tell its builds apart: sweep the balance, then reinstall the "
-                       f"0.4 CAP (docs/HARDWARE_DEPLOYMENT.md)")
+                       f"tell its builds apart: sweep the balance unless its PIN is "
+                       f"blocked (then it is stranded, SECURITY-MODEL #14), and reinstall "
+                       f"the 0.4 CAP (docs/HARDWARE_DEPLOYMENT.md)")
     return True, f"version {ver[0]}.{ver[1]}"
 
 
