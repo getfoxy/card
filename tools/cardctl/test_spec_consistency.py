@@ -990,6 +990,38 @@ def test_pin_length_ranges_match_the_applet():
         )
 
 
+def test_every_documented_status_word_is_translated_by_cardctl():
+    """
+    cardctl turns a status word into the sentence an operator reads at the
+    reader, from a table kept by hand. APDU.md documents `6986` (a write to a
+    card locked by LOCK_CARD) in its error tables, and the table had no entry
+    for it, so that failure read "unknown status word". Every status word an
+    APDU.md table documents must translate, and every translation must be for
+    a status word the spec documents.
+    """
+    documented = {
+        first + second for first, second in
+        re.findall(r"^\| (6[0-9A-F]|90) ?([0-9A-F]{2}|CX) \|", _apdu_text(), re.M)
+    }
+    # Guard the parse itself: a table reformat that matches nothing must fail
+    # here, not pass by checking an empty set.
+    assert {"9000", "63CX", "6982", "6983", "6986", "6A88"} <= documented, sorted(documented)
+
+    for sw in sorted(documented):
+        if sw == "63CX":
+            for tries in range(4):
+                assert f"{tries} retries remaining" in cardctl.describe_sw(0x63C0 | tries)
+            continue
+        assert cardctl.describe_sw(int(sw, 16)) != "unknown status word", (
+            f"APDU.md documents {sw}, and cardctl.describe_sw has no translation for it"
+        )
+
+    undocumented = {f"{sw:04X}" for sw in cardctl.SW_MEANINGS} - documented
+    assert not undocumented, (
+        f"cardctl translates status words APDU.md does not document: {sorted(undocumented)}"
+    )
+
+
 if __name__ == "__main__":
     import types
 

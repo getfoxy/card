@@ -80,6 +80,39 @@ gp --list
 
 ## Install
 
+The CAP tracked in this repo is **applet version 0.3**, sha256
+`958a8baa1050909cb241c47bff4cde7f4752b48f441614b35bda0d02cec30dda`. A CAP you
+build yourself hashes differently even from identical source, because the
+converter writes a creation timestamp into `META-INF/MANIFEST.MF`. Every other
+entry is byte-identical when built with JDK 17 and the kit CI pins
+(`jc305u4_kit` at `oracle_javacard_sdks` commit `6a75ec0d`), and CI checks
+exactly that on every push. So before installing your own build, compare every
+entry except `META-INF/MANIFEST.MF` against the tracked CAP:
+
+```bash
+# From applet/, after `ant cap` has overwritten target/cashu-javacard-0.1.0.cap
+git show HEAD:applet/target/cashu-javacard-0.1.0.cap > /tmp/tracked.cap
+rm -rf /tmp/cap-tracked /tmp/cap-built
+unzip -q /tmp/tracked.cap -d /tmp/cap-tracked
+unzip -q target/cashu-javacard-0.1.0.cap -d /tmp/cap-built
+diff -r -x MANIFEST.MF /tmp/cap-tracked /tmp/cap-built && echo "same CAP as the tracked one"
+```
+
+Any output from `diff` means the two CAPs differ; do not install. After
+installing, `SELECT` must answer `00 03` (below).
+
+**Install only a CAP that matches the tracked one** (sha256 `958a8baa…`, or the
+entry comparison above). The file name and the CAP's package version read 0.1
+on every build (`applet/build.xml` pins the package version), so neither can
+tell a fixed build from a vulnerable one; only the applet version `SELECT`
+answers after install can. Every 0.1 and 0.2 applet build carries ENG-615: its gate checks `pinState == 1`, so once the PIN is blocked,
+`LOAD_PROOF`, `CLEAR_SPENT` and `LOCK_CARD` stop asking for it, and so do
+`SPEND_PROOF` and `SIGN_ARBITRARY` on builds that gate them (0.1 builds from
+before D13 gate no spend at all). The last tracked 0.2 CAP was sha256
+`939cf24a…`. A card whose `SELECT` answers anything below `00 03` (`00 01` or
+`00 02`) needs reinstalling — sweep its balance first (see
+[Upgrade](#upgrade--re-personalise)).
+
 ```bash
 # Install CashuApplet.cap onto the card
 gp --install target/cashu-javacard-0.1.0.cap
@@ -98,13 +131,14 @@ gp --list
 # SELECT the applet (sends SELECT APDU with our AID)
 gp --apdu 00A4040007D2760000850102
 
-# Response: 0000 9000  (version 0.0 + SW_OK = applet responding)
+# Response: 0003 9000  (applet version 0.3 + SW_OK = applet responding)
+# Anything below 0003 (0001 or 0002) is an ENG-615 build: sweep the card, then reinstall.
 
 # GET_INFO (INS 0x01)
 gp --apdu B0010000
 
-# Response: 00 01 20 00 00 20 07 00
-#   v0.1 | 32 slots | 0 unspent | 0 spent | 32 empty | caps=0x07 | PIN unset
+# Response: 00 03 20 00 00 20 07 00
+#   v0.3 | 32 slots | 0 unspent | 0 spent | 32 empty | caps=0x07 | PIN unset
 # SW: 9000
 
 # GET_PUBKEY (INS 0x10)
@@ -131,7 +165,10 @@ gp --install target/cashu-javacard-0.1.0.cap
 ## Upgrade / re-personalise
 
 The applet has no OTA upgrade path — delete and reinstall to upgrade.
-All proof data and the card keypair are wiped on delete.
+All proof data and the card keypair are wiped on delete, and the proofs are
+P2PK-locked to that keypair, so **sweep the balance before deleting**. The
+v0.2 reinstall on the J3R180 stranded 5 sat this way (see the
+[hardware test report](HARDWARE_TEST_REPORT_2026-09-22.j3r180.md)).
 
 For production cards, use a secure messaging channel (SCP02/SCP03) with the card's default keys. Contact the card vendor for production key ceremonies.
 

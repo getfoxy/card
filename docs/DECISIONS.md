@@ -250,10 +250,39 @@ this profile — a blocked card is replaced at re-provisioning. An
 `UNBLOCK_PIN` command gated by a provisioning PUK is the designated follow-up
 **before volume issuance**; do not ship consumer cards at scale without it.
 
+*Correction (ENG-615, after v0.2.0):* "dead" was not what the applet did. The
+gate checked `pinState == 1`, and a blocked card has `pinState == 2`, so
+exhausting the tries **removed** the gate: every PIN-gated command opened up
+to whoever held the card, while `VERIFY_PIN` and `GET_INFO` kept reporting it
+blocked. `CHANGE_PIN` had the mirror bug — its failed checks decremented the
+counter without ever setting `pinState`, leaving a card that reported "set"
+but could never verify. And no failed check ended the session, so a session
+that had verified stayed verified through later wrong PINs, including the
+ones that blocked the card. All three are fixed in applet 0.3: the gate fires
+whenever a PIN exists in any state; one helper owns the blocked transition for
+every PIN check; and a failed check ends the session's verification, as
+`OwnerPIN.check` does for its own validated flag. That last rule also means
+`CHANGE_PIN` can no longer exhaust the counter: it needs a verified session,
+and the `VERIFY_PIN` that opens one resets the counter.
+
+The fix changes wire behaviour, so the applet version moved to 0.3. Every 0.1
+and 0.2 build has the same `pinState == 1` gate on `LOAD_PROOF`, `CLEAR_SPENT`
+and `LOCK_CARD`, and 0.1 builds from before D13 gate no spend at all, so a card
+whose `SELECT` answers anything below `00 03` (`00 01` or `00 02`) needs the
+CAP reinstalled. There is no proof-preserving upgrade, so sweep first: the
+reinstall regenerates the card key.
+
+"Dead" also means **stranded**. Nothing but the card key can sign for the
+card's P2PK-locked proofs, so a blocked card's balance is unrecoverable, and
+`VERIFY_PIN` is unauthenticated: any reader in range can block a card with
+three APDUs ([`SECURITY-MODEL.md`](SECURITY-MODEL.md) #14). That loss is what
+`UNBLOCK_PIN` + PUK (ENG-617) has to remove.
+
 Provisioning: POS cards are personalised with a PIN by default
 (`cardctl set-pin` during personalisation; `fund-card --pin` when the funding
 tool gains it). The merchant terminal prompts for the PIN only when
-`GET_INFO.pinState` reports `set`.
+`GET_INFO.pinState` reports `set`, and refuses a card reporting `locked` (2)
+outright: nothing can spend from it.
 
 ---
 

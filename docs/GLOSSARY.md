@@ -146,4 +146,5 @@ USD backend.
 holds it. The entire product thesis ([`VISION.md`](VISION.md)).
 
 **Profile B / B+** — NUT-XX's offline bearer profile, and its PIN-gated variant.
-**B+ is specified but not implemented.**
+**B+ is implemented:** applet 0.2 added the PIN gate (D13), and 0.3 keeps it
+closed once the PIN is blocked (ENG-615).

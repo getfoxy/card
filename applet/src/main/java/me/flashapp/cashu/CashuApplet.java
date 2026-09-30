@@ -38,9 +38,15 @@ public class CashuApplet extends Applet {
 
     // -------------------------------------------------------------------------
     // Applet version
+    //
+    // Moves with every wire-visible behaviour change, because it is the only
+    // non-destructive way to tell two builds apart in the field. 0.3 is the
+    // ENG-615 fix: on 0.2 a blocked PIN stopped gating; on 0.3 it gates for
+    // good, and a failed PIN check (VERIFY_PIN or CHANGE_PIN) ends the
+    // session's authentication.
     // -------------------------------------------------------------------------
     static final byte VERSION_MAJOR = (byte) 0x00;
-    static final byte VERSION_MINOR = (byte) 0x02;
+    static final byte VERSION_MINOR = (byte) 0x03;
 
     // -------------------------------------------------------------------------
     // APDU instruction bytes
@@ -190,7 +196,10 @@ public class CashuApplet extends Applet {
     // Transient state (RAM, cleared on deselect)
     // -------------------------------------------------------------------------
 
-    /** Set to 0x01 after successful VERIFY_PIN; cleared on deselect */
+    /**
+     * Set to 0x01 after a successful VERIFY_PIN. Cleared on deselect, and by
+     * any failed PIN check (see failPinCheck).
+     */
     private byte[] pinVerifiedFlag;
 
     // -------------------------------------------------------------------------
@@ -408,7 +417,7 @@ public class CashuApplet extends Applet {
     }
 
     // -------------------------------------------------------------------------
-    // Category 0x2x — Spend commands (no PIN — bearer)
+    // Category 0x2x — Spend commands (PIN-gated when a PIN is set or blocked, D13)
     // -------------------------------------------------------------------------
 
     private void processSpendProof(APDU apdu) {
@@ -514,16 +523,43 @@ public class CashuApplet extends Applet {
 
         byte[] buf = apdu.getBuffer();
         boolean ok = pin.check(buf, ISO7816.OFFSET_CDATA, (byte) pinLen);
-        if (!ok) {
-            byte remaining = pin.getTriesRemaining();
-            if (remaining == 0) {
-                pinState[0] = (byte) 2;
-                ISOException.throwIt(SW_PIN_BLOCKED);
-            }
-            short sw = (short)(0x63C0 | (remaining & 0x0F));
-            ISOException.throwIt(sw);
-        }
+        if (!ok) failPinCheck();
         pinVerifiedFlag[0] = (byte) 1;
+    }
+
+    /**
+     * A PIN check failed. End this session's authentication, then report the
+     * tries left as 63CX, or, when the last try just went, move the card to
+     * the blocked state and report 6983.
+     *
+     * The session ends first because that is what OwnerPIN.check does to its
+     * own validated flag: a failed check resets it before anything else. The
+     * applet gates on pinVerifiedFlag rather than on pin.isValidated(), so it
+     * has to do the same by hand. Without it a session that verified and then
+     * failed stayed verified, which let a card report itself blocked (GET_INFO
+     * byte 7 = 2, VERIFY_PIN 6983) while it still signed and spent for that
+     * session. The write is to a CLEAR_ON_DESELECT transient, so it allocates
+     * nothing and touches no EEPROM (D10).
+     *
+     * The blocked transition lives here and nowhere else so that every
+     * command that checks the PIN (VERIFY_PIN, CHANGE_PIN) blocks the card
+     * the same way. Before this helper CHANGE_PIN exhausted the OwnerPIN
+     * without ever setting pinState, leaving GET_INFO reporting "set" on a
+     * card that could no longer verify (ENG-615). With the session ending
+     * here, CHANGE_PIN can no longer be the exhausting try at all: it needs a
+     * verified session, and the successful VERIFY_PIN that opens one resets
+     * the counter. Sharing the helper keeps the two paths from drifting apart
+     * again if that ever changes.
+     */
+    private void failPinCheck() {
+        pinVerifiedFlag[0] = (byte) 0;
+        byte remaining = pin.getTriesRemaining();
+        if (remaining == 0) {
+            pinState[0] = (byte) 2;
+            ISOException.throwIt(SW_PIN_BLOCKED);
+        }
+        short sw = (short)(0x63C0 | (remaining & 0x0F));
+        ISOException.throwIt(sw);
     }
 
     private void processSetPin(APDU apdu) {
@@ -553,11 +589,7 @@ public class CashuApplet extends Applet {
         if (newLen < PIN_MIN_LEN || newLen > PIN_MAX_LEN) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
 
         boolean ok = pin.check(buf, off, oldLen);
-        if (!ok) {
-            byte remaining = pin.getTriesRemaining();
-            short sw = (short)(0x63C0 | (remaining & 0x0F));
-            ISOException.throwIt(sw);
-        }
+        if (!ok) failPinCheck();
         off += oldLen;
         pin.update(buf, off, (byte) newLen);
     }
@@ -584,8 +616,15 @@ public class CashuApplet extends Applet {
         if (cardLocked[0] == (byte) 1) ISOException.throwIt(ISO7816.SW_COMMAND_NOT_ALLOWED);
     }
 
+    /**
+     * D13 gate. Fires whenever a PIN exists and this session has not verified
+     * it — and "exists" includes the blocked state (pinState 2), from which
+     * VERIFY_PIN can never succeed. The earlier form checked `pinState == 1`,
+     * so three wrong guesses turned the card into a no-PIN bearer card:
+     * every gated command opened up the moment the PIN was blocked (ENG-615).
+     */
     private void requirePinIfSet() {
-        if (pinState[0] == (byte) 1 && pinVerifiedFlag[0] != (byte) 1) {
+        if (pinState[0] != (byte) 0 && pinVerifiedFlag[0] != (byte) 1) {
             ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
         }
     }

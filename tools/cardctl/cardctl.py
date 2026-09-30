@@ -74,10 +74,11 @@ MAX_SLOT_AMOUNT = 2 ** 32
 SW_MEANINGS = {
     0x9000: "success",
     0x6700: "wrong length",
-    0x6982: "security condition not satisfied (PIN required but not verified)",
+    0x6982: "security condition not satisfied (PIN set or blocked, and not verified in this session)",
     0x6983: "PIN blocked — retries exhausted",
     0x6984: "PIN not set",
-    0x6985: "conditions not satisfied (already spent / PIN already set / card locked)",
+    0x6985: "conditions not satisfied (already spent / PIN already set or blocked / card already locked)",
+    0x6986: "card locked by LOCK_CARD — writes disabled",
     0x6A83: "slot index out of range",
     0x6A84: "no space — all slots occupied",
     0x6A88: "slot is empty",
@@ -999,7 +1000,7 @@ def cmd_selftest(args) -> int:
     print(f"reader: {card.reader}\n")
 
     version = card.select()
-    record("SELECT applet", True, f"version {version[0]}.{version[1]}" if len(version) >= 2 else "")
+    record("SELECT applet", *_select_verdict(version))
 
     info = card.get_info()
     record("GET_INFO", True,
@@ -1007,9 +1008,17 @@ def cmd_selftest(args) -> int:
     record("Schnorr capability advertised", info["schnorr"],
            f"caps=0x{info['caps_raw']:02X}")
 
-    # D13: spend/sign are PIN-gated when set, so selftest must verify inside
-    # this session or every signature check below would 6982.
-    if info["pin_state"] == "set":
+    # D13: spend/sign are PIN-gated whenever a PIN exists, so selftest must
+    # verify inside this session or every signature check below would 6982.
+    # GET_INFO byte 7 = 2 is a PIN that exists and can never verify again
+    # (spec/APDU.md, GET_INFO), not "no PIN". Reading it like 0 skipped
+    # VERIFY_PIN, then either died on a 6982 that blamed the PIN (0.3) or,
+    # through the open ENG-615 gate of a 0.1/0.2 build, passed a card that
+    # anyone in range could spend.
+    pin_blocked = info["pin_state"] == "locked"
+    if pin_blocked:
+        record("PIN state", False, _blocked_pin_detail(version))
+    elif info["pin_state"] == "set":
         if getattr(args, "pin", None):
             try:
                 card.verify_pin(args.pin.encode())
@@ -1046,6 +1055,21 @@ def cmd_selftest(args) -> int:
     record("GET_SLOT_STATUS", len(status) == info["max_slots"],
            f"{len(status)} status bytes")
 
+    def verdict() -> int:
+        failed = [n for n, ok, _ in results if not ok]
+        print()
+        if failed:
+            print(f"{len(failed)} check(s) FAILED: {', '.join(failed)}")
+            return 1
+        print(f"All {len(results)} checks passed on physical hardware.")
+        return 0
+
+    if pin_blocked:
+        # Nothing below can run: no VERIFY_PIN succeeds on a blocked card, so
+        # the signing rounds have no session to sign in. The reads above still
+        # ran, so the operator sees the balance at stake.
+        return verdict()
+
     # The whole point: does a signature off this card verify against BIP-340?
     all_sigs_ok = True
     for i in range(args.rounds):
@@ -1065,15 +1089,48 @@ def cmd_selftest(args) -> int:
         record("fresh nonce across identical messages", s1[:32] != s2[:32],
                "R reused — aux randomness is not working" if s1[:32] == s2[:32] else "")
 
-    failed = [n for n, ok, _ in results if not ok]
-    print()
-    if failed:
-        print(f"{len(failed)} check(s) FAILED: {', '.join(failed)}")
-        return 1
-    print(f"All {len(results)} checks passed on physical hardware.")
-    if not all_sigs_ok:
-        return 1
-    return 0
+    rc = verdict()
+    return rc if all_sigs_ok else 1
+
+
+def _select_verdict(version: bytes) -> Tuple[bool, str]:
+    """
+    Whether the applet version SELECT answered is a build that keeps its gate.
+
+    Every 0.1 and 0.2 build gates with `pinState == 1` (ENG-615), so its PIN
+    is three unauthenticated VERIFY_PINs away from switching off, from any
+    reader in range, whether or not it is blocked yet. selftest fails such a
+    card outright rather than only once the PIN is already blocked. A card
+    that answers SELECT with no version cannot be told apart from one of them.
+    """
+    if len(version) < 2:
+        return False, ("SELECT returned no applet version, so an ENG-615 build "
+                       "cannot be told apart from a fixed one")
+    ver = tuple(version[:2])
+    if ver < (0, 3):
+        return False, (f"applet {ver[0]}.{ver[1]} is an ENG-615 build: sweep the "
+                       f"balance, then reinstall the 0.3 CAP (docs/HARDWARE_DEPLOYMENT.md)")
+    return True, f"version {ver[0]}.{ver[1]}"
+
+
+def _blocked_pin_detail(version: bytes) -> str:
+    """
+    What a blocked PIN (GET_INFO byte 7 = 2) means on the card in hand.
+
+    Two opposite things, told apart by the applet version SELECT answered.
+    From 0.3 the gate holds for good, so the balance is stranded: nothing but
+    the card key can sign for its P2PK-locked proofs. Every 0.1 and 0.2 build
+    checked `pinState == 1`, so on those the block *removed* the gate (ENG-615)
+    and anyone in range can spend; the balance can still be swept, and the
+    card has to be reinstalled.
+    """
+    ver = tuple(version[:2])
+    if len(ver) == 2 and ver < (0, 3):
+        return (f"blocked (GET_INFO byte 7 = 2) on applet {ver[0]}.{ver[1]}, a build "
+                f"that stops gating once the PIN is blocked (ENG-615): anyone in "
+                f"range can spend it. Sweep the balance, then reinstall the CAP")
+    return ("blocked (GET_INFO byte 7 = 2): spend/sign refuse for good, balance "
+            "stranded (SECURITY-MODEL #14)")
 
 
 # ── argument parsing ──────────────────────────────────────────────────────────

@@ -54,7 +54,7 @@ nonce that is a pure function of `(d, msg)` lets a fault injector recover the
 private key from two signatures).
 
 ```
-PASS  SELECT applet  — version 0.1
+PASS  SELECT applet  — version 0.3
 PASS  GET_INFO  — v0.1, 32 slots, PIN unset
 PASS  Schnorr capability advertised  — caps=0x03
 PASS  GET_PUBKEY well-formed  — 02a1b2c3d4e5f60718…  (33 bytes)
@@ -62,6 +62,16 @@ PASS  SIGN_ARBITRARY + BIP-340 verify [1/3]
 ...
 All 11 checks passed on physical hardware.
 ```
+
+On a card with a PIN set, pass `--pin`: spend and sign are PIN-gated (D13),
+so the signing rounds need a verified session.
+
+Every card below applet 0.3 fails `selftest` at `SELECT applet`, blocked or
+not. Those builds gate with `pinState == 1`, so three wrong `VERIFY_PIN`s from
+any reader in range switch the PIN check off (ENG-615): sweep the balance and
+reinstall the CAP. A card whose PIN is blocked (`GET_INFO` byte 7 = 2) also
+fails before any signing round, since no PIN can verify on it again; on 0.3
+and later that means the balance is stranded.
 
 ## Loading the applet
 
@@ -87,7 +97,7 @@ reader is the more reliable way to install, leaving NFC for tap testing.
 | Command | What it does |
 |---|---|
 | `readers` | list PC/SC readers |
-| `selftest [--rounds N]` | full hardware check incl. BIP-340 verification |
+| `selftest [--rounds N] [--pin P]` | full hardware check incl. BIP-340 verification |
 | `info` | version, slot counts, capabilities, PIN state, balance |
 | `pubkey` | 33-byte compressed public key |
 | `balance` | sum of unspent proof amounts |

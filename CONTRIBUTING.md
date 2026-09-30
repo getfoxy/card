@@ -98,7 +98,12 @@ ant -f applet/build.xml cap
 ```
 
 CI runs the applet suite on JDK 11 and 17, the `cardctl` suite on Python 3.11
-and 3.13, and the CAP conversion, on every push.
+and 3.13, and the CAP conversion, on every push. The conversion is also
+compared with the CAP tracked at `applet/target/cashu-javacard-0.1.0.cap`: every
+entry but `META-INF/MANIFEST.MF` must match, and
+[`docs/HARDWARE_DEPLOYMENT.md`](docs/HARDWARE_DEPLOYMENT.md) must publish the
+tracked CAP's sha256. So a change to the applet source ships with the rebuilt
+CAP (JDK 17, `jc305u4_kit`) and its new hash in that guide.
 
 ## Key design principles
 
