@@ -172,6 +172,11 @@ Four things the format insists on, all because a card file is bearer money:
 
 `dump` validates the document it assembled before writing it, so a mistake like
 `dump --mint "$UNSET_VAR"` fails loudly instead of leaving an unloadable backup.
+The one exception is a spent slot whose data is not a proof, which is what a
+card pulled mid-`CLEAR_SPENT` leaves: `dump` skips it with a warning on stderr
+(`half-cleared by an interrupted CLEAR_SPENT; run clear-spent`, once the card's
+other spent slots have settled) and writes the rest. An unspent slot that fails
+still refuses the whole dump.
 
 ## Tests
 

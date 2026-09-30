@@ -129,6 +129,10 @@ Returns a 1-byte count of total proof slots that are non-empty (unspent + spent)
 
 Returns full proof data at a given slot index. Slot must be non-empty.
 
+A spent slot is returned as the card holds it, and that is not always a proof:
+a card pulled mid-`CLEAR_SPENT` leaves a slot that still reads `02` with some
+of its data zeroed (see [CLEAR_SPENT](#clear_spent-0x31)).
+
 | Field | Value |
 |-------|-------|
 | CLA | B0 |
@@ -311,7 +315,13 @@ Garbage-collects all spent proof slots, freeing them for new proofs. Called afte
 
 **Write order.** Each spent slot's data is zeroed, then the slot is marked
 empty (D14). A tear leaves a slot still spent, which the next `CLEAR_SPENT`
-frees.
+frees. Until then `GET_PROOF` returns the slot with status `02` and some fields
+zeroed; the fill is not atomic, so which of them are zeroed is not defined. Once
+`CLEAR_SPENT` has touched a spent slot, its data is not a proof. Only the zeroed
+bytes set such a slot apart, so a reader that uses a spent slot's data checks it
+first. `cardctl dump` skips a spent slot that fails the card file's slot checks
+([`CARD-FILE.md`](CARD-FILE.md#slot)); a tear that zeroed only keyset bytes
+passes them.
 
 ---
 

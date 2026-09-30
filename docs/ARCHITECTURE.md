@@ -162,10 +162,13 @@ Two honest caveats:
 
 1. **This is a status byte, not a counter.** Earlier documentation called it a
    "non-resettable hardware spend counter", which overstates it.
-2. **Tear-off behaviour is unanalysed.** The write is not wrapped in a
-   `JCSystem` transaction, so what happens if the card is pulled from the field
-   between the status write and the signature has not been characterised on
-   hardware. Flagged in [`SECURITY-MODEL.md`](SECURITY-MODEL.md).
+2. **Tear-off is analysed, not yet tested on hardware.** No slot write is
+   wrapped in a `JCSystem` transaction. Every slot write changes the data first
+   and the status byte last, and `SPEND_PROOF` writes only the status byte,
+   before it signs ([D14](DECISIONS.md#d14)). A card pulled between the burn and
+   the signature keeps the burn and loses the signature; flash-pos re-derives it
+   with `SIGN_ARBITRARY`. No card has been pulled mid-write on purpose: see
+   [`SECURITY-MODEL.md`](SECURITY-MODEL.md) #11.
 
 ## The two flows
 

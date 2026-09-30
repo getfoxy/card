@@ -109,11 +109,16 @@ answers after install can. Every 0.1 and 0.2 applet build carries ENG-615: its g
 `LOAD_PROOF`, `CLEAR_SPENT` and `LOCK_CARD` stop asking for it, and so do
 `SPEND_PROOF` and `SIGN_ARBITRARY` on builds that gate them (0.1 builds from
 before D13 gate no spend at all). The last tracked 0.2 CAP was sha256
-`939cf24a…`. An earlier 0.3 build (`958a8baa…`, the ENG-615 fix
-before ENG-620's slot write order, [D14](DECISIONS.md#d14)) was never released;
-it answers `00 03` too, so only its hash tells it apart: don't install it. A card whose `SELECT` answers anything below `00 03` (`00 01` or
+`939cf24a…`. A card whose `SELECT` answers anything below `00 03` (`00 01` or
 `00 02`) needs reinstalling — sweep its balance first (see
 [Upgrade](#upgrade--re-personalise)).
+
+The version cannot catch one 0.3 build: sha256 `958a8baa…`, the ENG-615 fix
+before ENG-620's slot write order ([D14](DECISIONS.md#d14)). It was `main`'s
+tracked CAP from `f889934` (merged 2026-09-30) until the ENG-620 fix replaced
+it; no release carries it. It answers `00 03` too, and nothing on an installed
+card tells it apart from this build, so don't install it. A card installed from
+`main` in that window carries ENG-620: sweep its balance and reinstall.
 
 ```bash
 # Install CashuApplet.cap onto the card

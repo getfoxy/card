@@ -292,34 +292,48 @@ A proof slot is `status ‖ keyset ‖ amount ‖ nonce ‖ C`, and every reader
 the status byte: `GET_BALANCE` sums the UNSPENT slots and `SPEND_PROOF` signs
 for them. So every write to a slot changes its data first and its status byte
 last, as a single byte, which the JCRE writes atomically. A card that leaves
-the field mid-write leaves the slot in its old state, never a new status over
-old bytes:
+the field mid-write leaves the slot with its old status, never a new status
+over old bytes:
 
 - `LOAD_PROOF` copies the proof (`Util.arrayCopy`, atomic into persistent
   memory), then sets UNSPENT. Torn before the commit, the slot is still EMPTY:
   no command reads it, and the next `LOAD_PROOF` overwrites it.
 - `CLEAR_SPENT` zeroes a spent slot's data, then sets EMPTY. Torn mid-fill (the
   fill is not atomic), the slot is still SPENT: never counted or signed for, and
-  the next `CLEAR_SPENT` finishes it. An EMPTY slot never holds a spent proof's
-  bytes.
+  the next `CLEAR_SPENT` finishes it. Until then `GET_PROOF` still returns it,
+  with some fields zeroed, and its data is not a proof: see
+  [`spec/APDU.md`](../spec/APDU.md#clear_spent-0x31) for what a reader
+  checks. An EMPTY slot never holds a spent proof's bytes.
 - `SPEND_PROOF` writes only the status byte ([D7](#d7)).
 
-**Rejected:** a `JCSystem` transaction around each write. It gives the same
-guarantee at the price of a second EEPROM write per byte through the commit
-buffer, and a dependency on that buffer's size; the order needs neither.
+**Rejected:** a `JCSystem` transaction around each write. The order alone gives
+the guarantee, and a transaction around the old handlers would not have given
+it: the old `CLEAR_SPENT` filled the whole slot, status byte included, with
+`Util.arrayFillNonAtomic`, which does not use the transaction facility even
+while a transaction is in progress. Torn inside a transaction as outside one,
+that fill could leave an EMPTY status over a spent proof's bytes, the state
+ENG-620's resurrection starts from. A transactional clear needs `Util.arrayFill`
+(JC 3.0.5) in its place. Nor does the order keep `LOAD_PROOF` off the commit
+buffer: its `Util.arrayCopy` is atomic into persistent memory and subject to the
+same commit capacity a transaction uses (it can throw `TransactionException`).
+The order does not rely on that atomicity, since a torn copy leaves the slot
+EMPTY whatever its bytes hold, so `Util.arrayCopyNonAtomic` would be as safe
+there.
 
 *Found after v0.2.0 (ENG-620):* `LOAD_PROOF` set UNSPENT before it copied the
 proof, and `CLEAR_SPENT` zero-filled from the status byte. A tear between
 `LOAD_PROOF`'s two writes left an UNSPENT slot over the slot's old bytes:
-usually zeros, a phantom proof of amount 0 that no command could clear; after a
-torn `CLEAR_SPENT` of the same slot, a spent proof's keyset, amount and C, which
+usually zeros, a phantom proof of amount 0 that `CLEAR_SPENT` would not free
+(it frees only SPENT slots) until a `SPEND_PROOF` burned it; after a torn
+`CLEAR_SPENT` of the same slot, a spent proof's keyset, amount and C, which
 `GET_BALANCE` counted and an offline terminal could accept and never settle.
 
 jCardSim cannot tear a write, so `SlotWriteOrderTest` scans the source for the
 order, as D10's allocation rule is scanned, and sets the torn states directly to
-show they are harmless. Nothing a reader sends or receives changes, so the
-applet version does not: builds are told apart by the tracked CAP's sha256
-([`HARDWARE_DEPLOYMENT.md`](HARDWARE_DEPLOYMENT.md#install)).
+show what every command then does. Outside a torn write nothing a reader sends
+or receives changes, and the one 0.3 build with the old order (`958a8baa…`) was
+never released, so the applet version stays 0.3: builds are told apart by the
+tracked CAP's sha256 ([`HARDWARE_DEPLOYMENT.md`](HARDWARE_DEPLOYMENT.md#install)).
 
 ---
 

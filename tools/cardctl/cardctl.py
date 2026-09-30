@@ -848,12 +848,16 @@ def cmd_load_file(args) -> int:
 
 
 def cmd_dump(args) -> int:
-    """Write every non-empty slot to a card file for the mint side to redeem."""
+    """
+    Write every non-empty slot to a card file for the mint side to redeem,
+    except a spent slot whose data is no longer a proof (half-cleared).
+    """
     card = connect(args)
     pubkey = card.get_pubkey()
     statuses = card.get_slot_status()
 
     slots = []
+    half_cleared = []
     for index, status in enumerate(statuses):
         if status == 0x00:
             continue
@@ -874,7 +878,7 @@ def cmd_dump(args) -> int:
         if args.unspent_only and status != 0x01:
             continue
         p = card.get_proof(index)
-        slots.append({
+        entry = {
             "keysetId": p["keyset_id"],
             "amount": p["amount"],
             "nonce": _hex(p["nonce"]),
@@ -884,15 +888,56 @@ def cmd_dump(args) -> int:
             # side gets N indistinguishable proofs, and a reload resurrects the
             # spent ones as spendable. See spec/CARD-FILE.md.
             "spent": p["status"] == "spent",
-        })
+        }
+        if entry["spent"]:
+            # CLEAR_SPENT zeroes a spent slot's data before it marks the slot
+            # empty (D14), and the fill is not atomic, so a card pulled
+            # mid-CLEAR_SPENT leaves the slot spent with any part of its data
+            # zeroed. GET_PROOF still returns it, but its bytes are no longer a
+            # proof (spec/APDU.md, CLEAR_SPENT): an amount of 0, or a C that is
+            # no longer a point, would make the round-trip check below refuse
+            # the whole card over a slot the operator was already clearing.
+            # Skip it and say so. A spent slot that fails for another reason (a
+            # placeholder C from `load` without --c, a denomination an older
+            # cardctl allowed) cannot be redeemed either, so skipping it loses
+            # nothing. A tear that zeroed only keyset bytes passes the check,
+            # and that slot is kept. Spent slots only: an unspent slot that
+            # fails is money, and still refuses the dump.
+            try:
+                _slot_from_json(entry, index)
+            except SystemExit as exc:
+                reason = str(exc)
+                if reason.startswith(f"slot {index}: "):
+                    reason = reason[len(f"slot {index}: "):]
+                half_cleared.append(index)
+                # CLEAR_SPENT frees every spent slot on the card, so the advice
+                # waits for the rest of them to settle: a spent slot is owed
+                # until the mint has seen its proof.
+                print(
+                    f"slot {index}: skipped: spent, and its data is not a proof "
+                    f"({reason}); most likely half-cleared by an interrupted "
+                    f"CLEAR_SPENT; run clear-spent to free it once every other "
+                    f"spent slot in this dump has settled at the mint. "
+                    f"`cardctl proof {index}` prints what is left of it.",
+                    file=sys.stderr,
+                )
+                continue
+        slots.append(entry)
 
+    note = f"dumped by cardctl from {len(slots)} slot(s)"
+    if half_cleared:
+        note += (
+            f"; skipped spent slot(s) {', '.join(str(i) for i in half_cleared)}, "
+            f"whose data is not a proof (most likely half-cleared by an "
+            f"interrupted CLEAR_SPENT)"
+        )
     doc = {
         "version": CARD_FILE_VERSION,
         "mint": args.mint,
         "unit": args.unit,
         "cardPubkey": _hex(pubkey),
         "slots": slots,
-        "note": f"dumped by cardctl from {len(slots)} slot(s)",
+        "note": note,
     }
 
     # Never emit a document this module would refuse to read back. `dump --mint

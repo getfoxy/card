@@ -109,10 +109,11 @@ are asserted by `test_card_file.py` (`test_normalises_hex_case`,
 ### Why `spent` is required and not defaulted
 
 A spent slot is still *owed* until it settles at the mint, so a dump keeps it —
-dropping it loses money. But the redeemer has to be able to tell the two kinds
-apart, and a card cannot: `LOAD_PROOF` has no spent bit, so a spent proof
-written back onto a card comes back as unspent and inflates the balance with
-money that is already gone.
+dropping it loses money (the one exception, a slot whose data is no longer a
+proof, is under [Writers validate too](#writers-validate-too)). But the
+redeemer has to be able to tell the two kinds apart, and a card cannot:
+`LOAD_PROOF` has no spent bit, so a spent proof written back onto a card comes
+back as unspent and inflates the balance with money that is already gone.
 
 Defaulting a missing `spent` to `false` reintroduces exactly that. A file
 written by an implementation that does not know about the field is not a file
@@ -165,3 +166,10 @@ Additive-looking changes still require a bump, because "field absent" and
 what its own reader refuses turns one schema into two behaviours — and the file
 it produced is the card's only off-card record, so the discrepancy is found
 long after the card has moved on.
+
+One kind of spent slot is left out rather than refused. A card pulled
+mid-`CLEAR_SPENT` leaves a slot that still reads spent with some of its fields
+zeroed ([`APDU.md`](APDU.md#clear_spent-0x31)), and those bytes are not a
+proof. `cardctl dump` skips a spent slot that fails the slot checks above,
+names it on stderr and in `note`, and writes the rest of the card. An unspent
+slot that fails still refuses the whole dump: it may be the money.

@@ -304,7 +304,7 @@ class SlotWriteOrderTest {
     }
 
     @Test
-    @DisplayName("a CLEAR_SPENT torn mid-slot leaves it spent: never counted or signed for, and the next CLEAR_SPENT finishes it")
+    @DisplayName("a CLEAR_SPENT torn mid-slot leaves it spent: never counted or signed for, still answered by GET_PROOF with fields zeroed, and the next CLEAR_SPENT finishes it")
     void aTornClearLeavesTheSlotSpent() throws Exception {
         freshCard();
         assertEquals(CashuAppletTest.SW_OK, load(CashuAppletTest.PROOF_1).getSW());
@@ -316,6 +316,19 @@ class SlotWriteOrderTest {
         assertEquals(2, statuses()[0]);
         assertEquals(0, balance());
         assertEquals(0x6985, spend(0).getSW(), "a spent slot is never signed for again");
+
+        // Unlike the empty slot a torn LOAD_PROOF leaves, this one is still
+        // read: GET_PROOF returns it as a spent slot whose fields are partly
+        // zeroed, and its data is no longer a proof (spec/APDU.md, CLEAR_SPENT).
+        // A reader has to check a spent slot's data before it trusts it;
+        // cardctl dump skips one that fails.
+        ResponseAPDU halfCleared = proofAt(0);
+        assertEquals(CashuAppletTest.SW_OK, halfCleared.getSW());
+        byte[] read = halfCleared.getData();
+        assertEquals(78, read.length);
+        assertEquals(2, read[0], "a half-cleared slot still reads as spent");
+        assertArrayEquals(new byte[4], Arrays.copyOfRange(read, 9, 13),
+            "the amount GET_PROOF reports is the zeroed one, not the proof's");
 
         ResponseAPDU cleared = clearSpent();
         assertEquals(CashuAppletTest.SW_OK, cleared.getSW());

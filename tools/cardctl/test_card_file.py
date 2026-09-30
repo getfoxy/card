@@ -582,20 +582,25 @@ class _DumpCard:
         return self._slots[index]
 
 
-def _run_dump(extra=(), mint="https://forge.flashapp.me") -> str:
-    """Run cmd_dump against the fake card. Returns everything it printed."""
+def _run_dump_on(card, extra=(), mint="https://forge.flashapp.me") -> tuple:
+    """Run cmd_dump against `card`. Returns (stdout, stderr)."""
     real = cardctl.connect
-    cardctl.connect = lambda a: _DumpCard()
-    out = io.StringIO()
-    real_stdout = sys.stdout
-    sys.stdout = out
+    cardctl.connect = lambda a: card
+    out, err = io.StringIO(), io.StringIO()
+    real_stdout, real_stderr = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = out, err
     try:
         args = cardctl.build_parser().parse_args(["dump", "--mint", mint, *extra])
         assert args.func(args) == 0
     finally:
-        sys.stdout = real_stdout
+        sys.stdout, sys.stderr = real_stdout, real_stderr
         cardctl.connect = real
-    return out.getvalue()
+    return out.getvalue(), err.getvalue()
+
+
+def _run_dump(extra=(), mint="https://forge.flashapp.me") -> str:
+    """Run cmd_dump against the fake card. Returns everything it printed."""
+    return _run_dump_on(_DumpCard(), extra, mint)[0]
 
 
 def _dump(out=None, **kwargs) -> dict:
@@ -804,6 +809,125 @@ def test_dump_refuses_a_status_byte_it_does_not_recognise():
                 assert not path.exists(), "dump left a file behind after refusing"
     finally:
         cardctl.connect = real
+
+
+# ── dump on a card pulled mid-CLEAR_SPENT ────────────────────────────────────
+
+class _HalfClearedCard(_DumpCard):
+    """
+    _DumpCard after a CLEAR_SPENT torn mid-fill (D14): slot 1 is still spent,
+    with part of its data zeroed.
+    """
+
+    def __init__(self, **torn):
+        super().__init__()
+        self._slots[1] = dict(self._slots[1], **torn)
+
+
+# What CLEAR_SPENT can leave in slot 1 when the card goes mid-fill. The fill is
+# not atomic, so any part of the 77 bytes may be zeroed.
+_TORN_CLEARS = {
+    "all 77 bytes": dict(keyset_id="00" * 8, amount=0, nonce=bytes(32), c=bytes(33)),
+    "up to mid-nonce": dict(keyset_id="00" * 8, amount=0,
+                            nonce=bytes(20) + bytes(range(52, 64))),
+    "the amount alone": dict(amount=0),
+    "C's prefix alone": dict(c=b"\x00" + bytes.fromhex(C_POINT2)[1:]),
+}
+
+
+def test_dump_skips_a_spent_slot_an_interrupted_clear_spent_half_cleared():
+    """
+    CLEAR_SPENT zeroes a spent slot's data before it marks the slot empty
+    (D14), and the fill is not atomic, so a card pulled mid-CLEAR_SPENT leaves
+    a slot that is still spent with part of its data zeroed. GET_PROOF returns
+    it like any spent slot, but its bytes are not a proof, and the round-trip
+    check used to refuse the whole card over them: `dump` wrote nothing, and
+    the unspent money beside the slot got no record. It is skipped with a
+    warning on stderr, so the JSON on stdout stays clean.
+    """
+    for what, torn in _TORN_CLEARS.items():
+        printed, warned = _run_dump_on(_HalfClearedCard(**torn))
+        doc = json.loads(printed)
+        assert [(s["amount"], s["spent"]) for s in doc["slots"]] == [(8, False)], (
+            what, doc["slots"])
+        assert "slot 1: skipped" in warned, (what, warned)
+        assert "half-cleared by an interrupted CLEAR_SPENT; run clear-spent" in warned, (
+            what, warned)
+        assert "cardctl proof 1" in warned, (what, warned)
+        assert "skipped spent slot(s) 1" in doc["note"], (what, doc["note"])
+        parsed = cardctl.read_card_file(_write(doc))
+        assert [s["amount"] for s in parsed["slots"]] == [8], what
+
+
+def test_dump_out_writes_the_rest_of_a_half_cleared_card():
+    """The --out branch, which operators actually use, skips it the same way."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "card1.json"
+        printed, warned = _run_dump_on(_HalfClearedCard(amount=0),
+                                       extra=["--out", str(path)])
+        assert "wrote 1 slot(s)" in printed, printed
+        assert "half-cleared by an interrupted CLEAR_SPENT; run clear-spent" in warned, warned
+        parsed = cardctl.read_card_file(str(path))
+        assert [(s["amount"], s["spent"]) for s in parsed["slots"]] == [(8, False)]
+
+
+def test_dump_skips_two_half_cleared_slots_without_calling_them_duplicates():
+    """
+    Two slots zeroed alike share a nonce of 32 zero bytes. Kept, they would
+    trip the duplicate-nonce check and refuse the card; skipped, neither
+    reaches it.
+    """
+    class _TwoHalfCleared(_DumpCard):
+        def __init__(self):
+            super().__init__()
+            zeroed = dict(self._slots[1], keyset_id="00" * 8, amount=0,
+                          nonce=bytes(32), c=bytes(33))
+            self._slots = [self._slots[0], zeroed, dict(zeroed)]
+
+        def get_slot_status(self):
+            return bytes([0x01, 0x02, 0x02] + [0x00] * 29)
+
+    printed, warned = _run_dump_on(_TwoHalfCleared())
+    doc = json.loads(printed)
+    assert [s["amount"] for s in doc["slots"]] == [8], doc["slots"]
+    assert "slot 1: skipped" in warned and "slot 2: skipped" in warned, warned
+    assert "skipped spent slot(s) 1, 2" in doc["note"], doc["note"]
+
+
+def test_dump_never_skips_an_unspent_slot_that_is_not_a_proof():
+    """
+    Only a spent slot is skipped. CLEAR_SPENT never touches an unspent one, so
+    an unspent slot whose data is not a proof got there some other way, and it
+    may be the money: the dump still refuses, and writes nothing.
+    """
+    class _BadUnspentCard(_DumpCard):
+        def __init__(self):
+            super().__init__()
+            self._slots[0] = dict(self._slots[0], amount=0)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "card1.json"
+        try:
+            _run_dump_on(_BadUnspentCard(), extra=["--out", str(path)])
+        except SystemExit as exc:
+            assert "could not read back" in str(exc), str(exc)
+            assert "slot 0" in str(exc), str(exc)
+        else:
+            raise AssertionError("dump skipped an unspent slot instead of refusing the card")
+        assert not path.exists(), "dump left a file behind after refusing"
+
+
+def test_dump_cannot_tell_a_tear_that_zeroed_only_the_keyset_id():
+    """
+    The limit of the check, pinned so the docs cannot overstate it. A v0 keyset
+    id starts with 00 anyway, so zeroing any of its bytes leaves an id that
+    parses, and the status byte does not mark a half-cleared slot. Such a slot
+    is written as spent, with an id no mint has (spec/APDU.md, CLEAR_SPENT).
+    """
+    printed, warned = _run_dump_on(_HalfClearedCard(keyset_id="00" * 8))
+    doc = json.loads(printed)
+    assert [(s["keysetId"], s["spent"]) for s in doc["slots"]][1] == ("00" * 8, True)
+    assert warned == "", warned
 
 
 # ── load-file ────────────────────────────────────────────────────────────────
