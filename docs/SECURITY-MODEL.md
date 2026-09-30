@@ -29,7 +29,7 @@ get around it rather than through it.
 | 8 | Mint insolvency | **Monitored, not prevented** | The mint is trusted for solvency. See below. |
 | 9 | Malicious terminal | **Partially** | Cannot forge proofs or spend them elsewhere. Can lie about the amount, or take the tap and never settle — ordinary merchant risk. |
 | 10 | Fault injection to recover the key | **Mitigated** | Aux randomness in the nonce prevents the two-signatures-same-`k` recovery. See [D9](DECISIONS.md#d9). |
-| 11 | Tear-off during spend | ⚠️ **Unanalysed** | The status write is not in a `JCSystem` transaction. Untested on hardware. |
+| 11 | Tear-off (card pulled mid-write) | **Yes, by write order**; not yet on silicon | Every slot write changes the data first and commits the status byte last, as a single byte the JCRE writes atomically ([D14](DECISIONS.md#d14)). A torn `LOAD_PROOF` leaves the slot empty and a torn `CLEAR_SPENT` leaves it spent; neither can be read as a proof. `SPEND_PROOF` writes only the status byte, before it signs ([D7](DECISIONS.md#d7)): a tear after the burn loses that signature, which flash-pos re-derives with `SIGN_ARBITRARY` (`resignWitness`). The order is enforced by a source scan and the torn states are tested in jCardSim; no card has been pulled mid-write. |
 | 12 | Counterfeit physical cards | **Not a concern** | Value is bound to the chip's key. A look-alike with no valid chip holds nothing. |
 | 13 | Supply-chain / pre-personalised cards | ⚠️ **Unaddressed** | Nothing currently attests that a card's key was generated on-card by an untampered applet. |
 | 14 | Hostile reader blocks the PIN (3 unauthenticated APDUs), balance unrecoverable | ❌ **No** | `VERIFY_PIN` needs no authentication, so three wrong PINs from any reader in NFC range block the card. Once blocked, nothing can sign for its proofs: they are P2PK-locked to the card key with only a `sigflag` tag (no refund key, no locktime; [D5](DECISIONS.md#d5)'s recovery proposal is unmerged), and a reinstall regenerates the key. The balance is gone. Mitigations: small balances, a shielded sleeve, and `UNBLOCK_PIN` + PUK (ENG-617) before volume issuance. See below. |
@@ -155,7 +155,10 @@ An earlier card, a J3R452 on applet 0.1, ran the read and sign path on
   blocked-state gate and the failed-check session rule) has run on a card
 - `LOCK_CARD`, deliberately not run on a card holding value
 - EEPROM wear and lifetime
-- Tear-off and power-glitch behaviour
+- A card pulled mid-write: the slot write order ([D14](DECISIONS.md#d14)) is
+  scanned in the source and its torn states tested in jCardSim, but no card
+  has been torn on purpose; power glitches short of a clean tear are
+  unanalysed
 - Timing/side-channel characteristics of the hand-rolled modular arithmetic
 - RF range, and whether a drain attack is practical at distance
 
@@ -170,7 +173,9 @@ a few hundred taps. Treat simulator results accordingly — see
 1. **`UNBLOCK_PIN` + PUK** (ENG-617, #14) — today three unauthenticated APDUs
    strand a card's balance for good. Blocks volume issuance
    ([D13](DECISIONS.md#d13)).
-2. **Tear-off analysis** (#11) — needs hardware.
+2. **Tear-off on silicon** (#11) — the write order is analysed and enforced
+   ([D14](DECISIONS.md#d14)); pulling a card mid-`LOAD_PROOF` and
+   mid-`CLEAR_SPENT` on hardware is still owed.
 3. **Recovery** (#3) — [PR #4](https://github.com/lnflash/cashu-javacard/pull/4)
    is the live proposal; see [D5](DECISIONS.md#d5) for the flaw to fix first.
 4. **Card attestation** (#13) — no proof a key was generated on-card by genuine

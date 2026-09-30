@@ -81,7 +81,7 @@ gp --list
 ## Install
 
 The CAP tracked in this repo is **applet version 0.3**, sha256
-`958a8baa1050909cb241c47bff4cde7f4752b48f441614b35bda0d02cec30dda`. A CAP you
+`75a7007d98c3f239d778b581315273f5e6925feaa9de20c33c10adfcfab8b6f2`. A CAP you
 build yourself hashes differently even from identical source, because the
 converter writes a creation timestamp into `META-INF/MANIFEST.MF`. Every other
 entry is byte-identical when built with JDK 17 and the kit CI pins
@@ -101,7 +101,7 @@ diff -r -x MANIFEST.MF /tmp/cap-tracked /tmp/cap-built && echo "same CAP as the 
 Any output from `diff` means the two CAPs differ; do not install. After
 installing, `SELECT` must answer `00 03` (below).
 
-**Install only a CAP that matches the tracked one** (sha256 `958a8baa…`, or the
+**Install only a CAP that matches the tracked one** (sha256 `75a7007d…`, or the
 entry comparison above). The file name and the CAP's package version read 0.1
 on every build (`applet/build.xml` pins the package version), so neither can
 tell a fixed build from a vulnerable one; only the applet version `SELECT`
@@ -109,7 +109,9 @@ answers after install can. Every 0.1 and 0.2 applet build carries ENG-615: its g
 `LOAD_PROOF`, `CLEAR_SPENT` and `LOCK_CARD` stop asking for it, and so do
 `SPEND_PROOF` and `SIGN_ARBITRARY` on builds that gate them (0.1 builds from
 before D13 gate no spend at all). The last tracked 0.2 CAP was sha256
-`939cf24a…`. A card whose `SELECT` answers anything below `00 03` (`00 01` or
+`939cf24a…`. An earlier 0.3 build (`958a8baa…`, the ENG-615 fix
+before ENG-620's slot write order, [D14](DECISIONS.md#d14)) was never released;
+it answers `00 03` too, so only its hash tells it apart: don't install it. A card whose `SELECT` answers anything below `00 03` (`00 01` or
 `00 02`) needs reinstalling — sweep its balance first (see
 [Upgrade](#upgrade--re-personalise)).
 

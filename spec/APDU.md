@@ -280,6 +280,13 @@ Stores a new proof in the next available empty slot. Used during card top-up (fu
 | 6986 | Card locked (`LOCK_CARD`) — writes disabled |
 | 6A84 | No space — all slots occupied |
 
+**Write order.** The card stores the 77 bytes, then marks the slot unspent
+(D14). A card that leaves the field mid-command leaves the slot empty or
+holding the whole proof, never part of one marked unspent. The card does not
+check for duplicates, so after a `LOAD_PROOF` whose answer was lost the proof
+may or may not be on the card: read the slots (`GET_SLOT_STATUS`, `GET_PROOF`)
+before sending it again.
+
 ---
 
 ### CLEAR_SPENT (0x31)
@@ -301,6 +308,10 @@ Garbage-collects all spent proof slots, freeing them for new proofs. Called afte
 |----|---------|
 | 6982 | Security condition not satisfied (PIN set or blocked, and not verified in this session) |
 | 6986 | Card locked (`LOCK_CARD`) — writes disabled |
+
+**Write order.** Each spent slot's data is zeroed, then the slot is marked
+empty (D14). A tear leaves a slot still spent, which the next `CLEAR_SPENT`
+frees.
 
 ---
 
