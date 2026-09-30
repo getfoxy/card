@@ -80,8 +80,8 @@ gp --list
 
 ## Install
 
-The CAP tracked in this repo is **applet version 0.3**, sha256
-`75a7007d98c3f239d778b581315273f5e6925feaa9de20c33c10adfcfab8b6f2`. A CAP you
+The CAP tracked in this repo is **applet version 0.4**, sha256
+`d2947b9f907e707ee584c056ea9bdf589fe8d8360868a9784b675d9b5e3aa605`. A CAP you
 build yourself hashes differently even from identical source, because the
 converter writes a creation timestamp into `META-INF/MANIFEST.MF`. Every other
 entry is byte-identical when built with JDK 17 and the kit CI pins
@@ -99,9 +99,9 @@ diff -r -x MANIFEST.MF /tmp/cap-tracked /tmp/cap-built && echo "same CAP as the 
 ```
 
 Any output from `diff` means the two CAPs differ; do not install. After
-installing, `SELECT` must answer `00 03` (below).
+installing, `SELECT` must answer `00 04` (below).
 
-**Install only a CAP that matches the tracked one** (sha256 `75a7007d…`, or the
+**Install only a CAP that matches the tracked one** (sha256 `d2947b9f…`, or the
 entry comparison above). The file name and the CAP's package version read 0.1
 on every build (`applet/build.xml` pins the package version), so neither can
 tell a fixed build from a vulnerable one; only the applet version `SELECT`
@@ -109,16 +109,17 @@ answers after install can. Every 0.1 and 0.2 applet build carries ENG-615: its g
 `LOAD_PROOF`, `CLEAR_SPENT` and `LOCK_CARD` stop asking for it, and so do
 `SPEND_PROOF` and `SIGN_ARBITRARY` on builds that gate them (0.1 builds from
 before D13 gate no spend at all). The last tracked 0.2 CAP was sha256
-`939cf24a…`. A card whose `SELECT` answers anything below `00 03` (`00 01` or
-`00 02`) needs reinstalling — sweep its balance first (see
+`939cf24a…`. A card whose `SELECT` answers anything below `00 04` (`00 01`,
+`00 02` or `00 03`) needs reinstalling — sweep its balance first (see
 [Upgrade](#upgrade--re-personalise)).
 
-The version cannot catch one 0.3 build: sha256 `958a8baa…`, the ENG-615 fix
-before ENG-620's slot write order ([D14](DECISIONS.md#d14)). It was `main`'s
-tracked CAP from `f889934` (merged 2026-09-30) until the ENG-620 fix replaced
-it; no release carries it. It answers `00 03` too, and nothing on an installed
-card tells it apart from this build, so don't install it. A card installed from
-`main` in that window carries ENG-620: sweep its balance and reinstall.
+A card answering `00 03` has the ENG-615 fix but may still carry ENG-620: a
+card pulled mid-`LOAD_PROOF` can show a phantom proof ([D14](DECISIONS.md#d14)).
+`main` tracked a 0.3 CAP with the old slot write order, sha256 `958a8baa…`,
+from `f889934` (merged 2026-09-30) until the ENG-620 fix replaced it; no
+release carries it. Nothing on an installed card tells it apart from a 0.3
+build with the fix, which is why the fix moved the applet version to 0.4.
+Don't install `958a8baa…` or any other 0.3 CAP.
 
 ```bash
 # Install CashuApplet.cap onto the card
@@ -138,14 +139,14 @@ gp --list
 # SELECT the applet (sends SELECT APDU with our AID)
 gp --apdu 00A4040007D2760000850102
 
-# Response: 0003 9000  (applet version 0.3 + SW_OK = applet responding)
-# Anything below 0003 (0001 or 0002) is an ENG-615 build: sweep the card, then reinstall.
+# Response: 0004 9000  (applet version 0.4 + SW_OK = applet responding)
+# Anything below 0004 (0001, 0002 or 0003) may carry ENG-615 or ENG-620: sweep the card, then reinstall.
 
 # GET_INFO (INS 0x01)
 gp --apdu B0010000
 
-# Response: 00 03 20 00 00 20 07 00
-#   v0.3 | 32 slots | 0 unspent | 0 spent | 32 empty | caps=0x07 | PIN unset
+# Response: 00 04 20 00 00 20 07 00
+#   v0.4 | 32 slots | 0 unspent | 0 spent | 32 empty | caps=0x07 | PIN unset
 # SW: 9000
 
 # GET_PUBKEY (INS 0x10)

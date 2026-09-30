@@ -270,7 +270,8 @@ and 0.2 build has the same `pinState == 1` gate on `LOAD_PROOF`, `CLEAR_SPENT`
 and `LOCK_CARD`, and 0.1 builds from before D13 gate no spend at all, so a card
 whose `SELECT` answers anything below `00 03` (`00 01` or `00 02`) needs the
 CAP reinstalled. There is no proof-preserving upgrade, so sweep first: the
-reinstall regenerates the card key.
+reinstall regenerates the card key. [D14](#d14) later moved that floor to
+`00 04`.
 
 "Dead" also means **stranded**. Nothing but the card key can sign for the
 card's P2PK-locked proofs, so a blocked card's balance is unrecoverable, and
@@ -330,10 +331,19 @@ usually zeros, a phantom proof of amount 0 that `CLEAR_SPENT` would not free
 
 jCardSim cannot tear a write, so `SlotWriteOrderTest` scans the source for the
 order, as D10's allocation rule is scanned, and sets the torn states directly to
-show what every command then does. Outside a torn write nothing a reader sends
-or receives changes, and the one 0.3 build with the old order (`958a8baa…`) was
-never released, so the applet version stays 0.3: builds are told apart by the
-tracked CAP's sha256 ([`HARDWARE_DEPLOYMENT.md`](HARDWARE_DEPLOYMENT.md#install)).
+show what every command then does.
+
+Outside a torn write nothing a reader sends or receives changes, but the applet
+version moved to 0.4 anyway. No release carries the one 0.3 build with the old
+order (`958a8baa…`), but it was `main`'s tracked CAP from `f889934` until this
+fix, and whether a card was installed from it in that window could not be
+confirmed. `SELECT`'s version is the only thing an installed card reports about
+its build, so the 0.3 builds cannot be told apart: a card answering `00 03` may
+run the old order. Keeping 0.3 and telling builds apart by the tracked CAP's
+sha256 was rejected for that reason: the hash says which CAP to install, not
+which one a card already runs. A card whose `SELECT` answers anything below
+`00 04` needs the CAP reinstalled (sweep it first), and `cardctl selftest`
+fails it ([`HARDWARE_DEPLOYMENT.md`](HARDWARE_DEPLOYMENT.md#install)).
 
 ---
 

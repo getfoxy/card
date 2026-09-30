@@ -39,14 +39,18 @@ public class CashuApplet extends Applet {
     // -------------------------------------------------------------------------
     // Applet version
     //
-    // Moves with every wire-visible behaviour change, because it is the only
-    // non-destructive way to tell two builds apart in the field. 0.3 is the
-    // ENG-615 fix: on 0.2 a blocked PIN stopped gating; on 0.3 it gates for
-    // good, and a failed PIN check (VERIFY_PIN or CHANGE_PIN) ends the
-    // session's authentication.
+    // Moves with every wire-visible behaviour change, and with every fix that
+    // a card in the field has to be told apart by, because it is the only
+    // non-destructive way to tell two builds apart. 0.3 is the ENG-615 fix:
+    // on 0.2 a blocked PIN stopped gating; on 0.3 it gates for good, and a
+    // failed PIN check (VERIFY_PIN or CHANGE_PIN) ends the session's
+    // authentication. 0.4 is the ENG-620 fix (D14): every slot write commits
+    // the status byte last. Nothing on the wire changes outside a torn write,
+    // but main tracked a 0.3 CAP with the old order, and SELECT's version is
+    // all an installed card reports about its build.
     // -------------------------------------------------------------------------
     static final byte VERSION_MAJOR = (byte) 0x00;
-    static final byte VERSION_MINOR = (byte) 0x03;
+    static final byte VERSION_MINOR = (byte) 0x04;
 
     // -------------------------------------------------------------------------
     // APDU instruction bytes

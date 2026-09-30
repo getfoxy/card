@@ -106,10 +106,13 @@ send those three tries (threat #14 in the
 [D13](docs/DECISIONS.md#d13); D12 records the earlier no-PIN design.
 
 Every applet build before 0.3 stopped gating once the PIN was blocked (ENG-615,
-fixed in 0.3), and 0.1 builds from before D13 gate no spend at all. A card
-whose `SELECT` answers anything below `00 03` (`00 01` or `00 02`) needs the
-CAP reinstalled; sweep its balance first, because the reinstall regenerates
-the card key.
+fixed in 0.3), and 0.1 builds from before D13 gate no spend at all. Builds
+before 0.4 may write a slot's status byte before its data, so a card pulled
+mid-write can show a phantom proof (ENG-620, fixed in 0.4,
+[D14](docs/DECISIONS.md#d14)); `main` tracked a 0.3 build that does. A card
+whose `SELECT` answers anything below `00 04` (`00 01`, `00 02` or `00 03`)
+needs the CAP reinstalled; sweep its balance first, because the reinstall
+regenerates the card key.
 
 **AID:** package `D2 76 00 00 85 01 02`, applet `…02 01`.
 

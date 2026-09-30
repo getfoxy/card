@@ -850,7 +850,8 @@ def cmd_load_file(args) -> int:
 def cmd_dump(args) -> int:
     """
     Write every non-empty slot to a card file for the mint side to redeem,
-    except a spent slot whose data is no longer a proof (half-cleared).
+    except a spent slot whose data fails the slot checks (most likely
+    half-cleared by an interrupted CLEAR_SPENT).
     """
     card = connect(args)
     pubkey = card.get_pubkey()
@@ -900,9 +901,11 @@ def cmd_dump(args) -> int:
             # Skip it and say so. A spent slot that fails for another reason (a
             # placeholder C from `load` without --c, a denomination an older
             # cardctl allowed) cannot be redeemed either, so skipping it loses
-            # nothing. A tear that zeroed only keyset bytes passes the check,
-            # and that slot is kept. Spent slots only: an unspent slot that
-            # fails is money, and still refuses the dump.
+            # nothing. The slot checks catch a zeroed amount and a C that is
+            # no longer a point. A tear that zeroed only keyset or nonce bytes,
+            # or part of C whose x still lands on the curve, passes them, and
+            # dump writes that slot as spent. Spent slots only: an unspent slot
+            # that fails is money, and still refuses the dump.
             try:
                 _slot_from_json(entry, index)
             except SystemExit as exc:
@@ -1057,7 +1060,7 @@ def cmd_selftest(args) -> int:
     # verify inside this session or every signature check below would 6982.
     # GET_INFO byte 7 = 2 is a PIN that exists and can never verify again
     # (spec/APDU.md, GET_INFO), not "no PIN". Reading it like 0 skipped
-    # VERIFY_PIN, then either died on a 6982 that blamed the PIN (0.3) or,
+    # VERIFY_PIN, then either died on a 6982 that blamed the PIN (0.3 on) or,
     # through the open ENG-615 gate of a 0.1/0.2 build, passed a card that
     # anyone in range could spend.
     pin_blocked = info["pin_state"] == "locked"
@@ -1140,21 +1143,32 @@ def cmd_selftest(args) -> int:
 
 def _select_verdict(version: bytes) -> Tuple[bool, str]:
     """
-    Whether the applet version SELECT answered is a build that keeps its gate.
+    Whether the applet version SELECT answered is a build selftest can pass.
 
     Every 0.1 and 0.2 build gates with `pinState == 1` (ENG-615), so its PIN
     is three unauthenticated VERIFY_PINs away from switching off, from any
     reader in range, whether or not it is blocked yet. selftest fails such a
-    card outright rather than only once the PIN is already blocked. A card
-    that answers SELECT with no version cannot be told apart from one of them.
+    card outright rather than only once the PIN is already blocked.
+
+    0.3 fixed the gate, but `main` tracked a 0.3 CAP (958a8baa…) that still
+    wrote a slot's status byte before its data (ENG-620, D14), so a card
+    pulled mid-LOAD_PROOF could show a phantom proof. Nothing on an installed
+    card tells that build apart from another 0.3 build, so every 0.3 card
+    fails too; 0.4 is the fix. A card that answers SELECT with no version
+    cannot be told apart from any of them.
     """
     if len(version) < 2:
-        return False, ("SELECT returned no applet version, so an ENG-615 build "
-                       "cannot be told apart from a fixed one")
+        return False, ("SELECT returned no applet version, so an ENG-615 or ENG-620 "
+                       "build cannot be told apart from a fixed one")
     ver = tuple(version[:2])
     if ver < (0, 3):
         return False, (f"applet {ver[0]}.{ver[1]} is an ENG-615 build: sweep the "
-                       f"balance, then reinstall the 0.3 CAP (docs/HARDWARE_DEPLOYMENT.md)")
+                       f"balance, then reinstall the 0.4 CAP (docs/HARDWARE_DEPLOYMENT.md)")
+    if ver < (0, 4):
+        return False, (f"applet {ver[0]}.{ver[1]} may carry ENG-620 (a card pulled "
+                       f"mid-LOAD_PROOF can show a phantom proof), and SELECT cannot "
+                       f"tell its builds apart: sweep the balance, then reinstall the "
+                       f"0.4 CAP (docs/HARDWARE_DEPLOYMENT.md)")
     return True, f"version {ver[0]}.{ver[1]}"
 
 

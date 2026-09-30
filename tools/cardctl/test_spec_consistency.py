@@ -39,6 +39,10 @@ Three artefacts have to agree, so all three are read here:
     needed — because the applet is the copy that actually writes EEPROM, and a
     symmetric offset change there would otherwise pass every suite in the repo.
 
+One more document is read for one value: docs/HARDWARE_DEPLOYMENT.md, for the
+applet version a good card answers `SELECT` with, which the applet and
+`cardctl selftest`'s floor must share with it.
+
 Runs with no card, no reader and no pyscard.
 """
 import pathlib
@@ -56,6 +60,7 @@ APPLET_JAVA = (
     pathlib.Path(__file__).resolve().parents[2]
     / "applet" / "src" / "main" / "java" / "me" / "flashapp" / "cashu" / "CashuApplet.java"
 )
+DEPLOYMENT_MD = pathlib.Path(__file__).resolve().parents[2] / "docs" / "HARDWARE_DEPLOYMENT.md"
 
 # The field names used to compare descriptions written in three different
 # houses ("Keyset ID — the NUT-02 id…", "8-byte keyset_id (raw)",
@@ -987,6 +992,63 @@ def test_pin_length_ranges_match_the_applet():
         assert (low, high) == (limits["PIN_MIN_LEN"], limits["PIN_MAX_LEN"]), (
             f"{name} documents Lc {low:02d}–{high:02d}, applet enforces "
             f"{limits['PIN_MIN_LEN']}–{limits['PIN_MAX_LEN']}"
+        )
+
+
+def test_the_applet_version_is_the_one_the_guide_and_selftest_expect():
+    """
+    SELECT's applet version is all an installed card reports about its build,
+    so three copies of it have to agree: the applet's, the one the deployment
+    guide tells an operator a good card answers, and `cardctl selftest`'s
+    floor. `main` once tracked a 0.3 CAP with the old slot write order while a
+    0.3 build with the fix answered SELECT alike (ENG-620, D14). The version
+    moved to 0.4 so the two could be told apart, which only helps if the guide
+    and the floor moved with it: a guide still saying `00 03` passes the card
+    the bump exists to catch.
+
+    The floor is the tracked version because every build below it is one a
+    card is reinstalled from (D13, D14). A version bump that leaves the floor
+    where it was has to say why, here.
+    """
+    version = dict(re.findall(
+        r"static final byte VERSION_(MAJOR|MINOR)\s*=\s*\(byte\)\s*0x([0-9A-Fa-f]{2})",
+        APPLET_JAVA.read_text(encoding="utf-8"),
+    ))
+    assert set(version) == {"MAJOR", "MINOR"}, (
+        f"could not scrape the applet version from {APPLET_JAVA.name}"
+    )
+    major, minor = int(version["MAJOR"], 16), int(version["MINOR"], 16)
+
+    guide = DEPLOYMENT_MD.read_text(encoding="utf-8")
+    tracked = re.search(r"The CAP tracked in this repo is \*\*applet version (\d+)\.(\d+)\*\*", guide)
+    assert tracked, f"{DEPLOYMENT_MD.name} no longer names the tracked CAP's applet version"
+    assert (int(tracked.group(1)), int(tracked.group(2))) == (major, minor), (
+        f"{DEPLOYMENT_MD.name} tracks applet {tracked.group(1)}.{tracked.group(2)}, "
+        f"{APPLET_JAVA.name} is {major}.{minor}"
+    )
+    # Every SELECT and GET_INFO answer the guide shows for a good card: the
+    # install rule, the SELECT response (`MMmm 9000`) and GET_INFO's 8 bytes.
+    answers = re.findall(r"`SELECT` must answer `([0-9A-F]{2}) ([0-9A-F]{2})`", guide)
+    answers += re.findall(r"^# Response: ([0-9A-F]{2})([0-9A-F]{2}) 9000\b", guide, re.M)
+    answers += re.findall(
+        r"^# Response: ([0-9A-F]{2}) ([0-9A-F]{2})(?: [0-9A-F]{2}){6}\s*$", guide, re.M)
+    assert len(answers) == 3, (
+        f"expected the guide's three version answers (the install rule, SELECT and "
+        f"GET_INFO), found {answers}"
+    )
+    for hi, lo in answers:
+        assert (int(hi, 16), int(lo, 16)) == (major, minor), (
+            f"{DEPLOYMENT_MD.name} shows a good card answering {hi} {lo}, the applet "
+            f"answers {major:02X} {minor:02X}"
+        )
+
+    ok, detail = cardctl._select_verdict(bytes([major, minor]))
+    assert ok, f"selftest fails the applet this repo builds: {detail}"
+    if minor:
+        ok, detail = cardctl._select_verdict(bytes([major, minor - 1]))
+        assert not ok, (
+            f"selftest passes applet {major}.{minor - 1}, below the tracked "
+            f"{major}.{minor}: {detail}"
         )
 
 

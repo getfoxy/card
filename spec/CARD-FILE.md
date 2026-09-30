@@ -109,8 +109,8 @@ are asserted by `test_card_file.py` (`test_normalises_hex_case`,
 ### Why `spent` is required and not defaulted
 
 A spent slot is still *owed* until it settles at the mint, so a dump keeps it —
-dropping it loses money (the one exception, a slot whose data is no longer a
-proof, is under [Writers validate too](#writers-validate-too)). But the
+dropping it loses money (the one exception, a spent slot whose data fails the
+slot checks, is under [Writers validate too](#writers-validate-too)). But the
 redeemer has to be able to tell the two kinds apart, and a card cannot:
 `LOAD_PROOF` has no spent bit, so a spent proof written back onto a card comes
 back as unspent and inflates the balance with money that is already gone.
@@ -171,5 +171,8 @@ One kind of spent slot is left out rather than refused. A card pulled
 mid-`CLEAR_SPENT` leaves a slot that still reads spent with some of its fields
 zeroed ([`APDU.md`](APDU.md#clear_spent-0x31)), and those bytes are not a
 proof. `cardctl dump` skips a spent slot that fails the slot checks above,
-names it on stderr and in `note`, and writes the rest of the card. An unspent
-slot that fails still refuses the whole dump: it may be the money.
+names it on stderr and in `note`, and writes the rest of the card. The slot
+checks catch a zeroed amount and a `C` that is no longer a point. A tear that
+zeroed only keyset or nonce bytes, or part of `C` whose x still lands on the
+curve, passes them, and `dump` writes that slot as spent. An unspent slot that
+fails still refuses the whole dump: it may be the money.

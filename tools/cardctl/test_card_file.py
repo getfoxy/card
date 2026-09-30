@@ -37,6 +37,7 @@ import cardctl
 HERE = pathlib.Path(__file__).resolve().parent
 FIXTURE = HERE / "testdata" / "card-file-v1.json"
 SPEC = HERE.parents[1] / "spec" / "CARD-FILE.md"
+APDU_SPEC = HERE.parents[1] / "spec" / "APDU.md"
 
 CARD_PUBKEY = "032994631ef9a4ba5b0db2f44b4d0d8a4b0eec49bed16091c23c171a8c553a03da"
 OTHER_PUBKEY = "02" + "11" * 32
@@ -919,7 +920,7 @@ def test_dump_never_skips_an_unspent_slot_that_is_not_a_proof():
 
 def test_dump_cannot_tell_a_tear_that_zeroed_only_the_keyset_id():
     """
-    The limit of the check, pinned so the docs cannot overstate it. A v0 keyset
+    One limit of the check, pinned so the docs cannot overstate it. A v0 keyset
     id starts with 00 anyway, so zeroing any of its bytes leaves an id that
     parses, and the status byte does not mark a half-cleared slot. Such a slot
     is written as spent, with an id no mint has (spec/APDU.md, CLEAR_SPENT).
@@ -928,6 +929,53 @@ def test_dump_cannot_tell_a_tear_that_zeroed_only_the_keyset_id():
     doc = json.loads(printed)
     assert [(s["keysetId"], s["spent"]) for s in doc["slots"]][1] == ("00" * 8, True)
     assert warned == "", warned
+
+
+def test_dump_cannot_tell_a_tear_that_zeroed_only_nonce_bytes():
+    """
+    The second limit. The slot checks look at a nonce's length only, and which
+    bytes a torn CLEAR_SPENT zeroed is not defined (spec/APDU.md,
+    CLEAR_SPENT), so a tear that zeroed half the nonce passes them. The slot is
+    written as spent, with a nonce no proof has, and nothing on stderr says so.
+    """
+    nonce = bytes(16) + _DumpCard()._slots[1]["nonce"][16:]
+    printed, warned = _run_dump_on(_HalfClearedCard(nonce=nonce))
+    doc = json.loads(printed)
+    assert [(s["nonce"], s["spent"]) for s in doc["slots"]][1] == (cardctl._hex(nonce), True)
+    assert warned == "", warned
+
+
+def test_dump_cannot_tell_a_tear_that_left_C_on_the_curve():
+    """
+    The third. The slot checks catch a C that is no longer a point, but zeroing
+    part of x can land on another point: zeroing this C from byte 2 on, which
+    leaves the prefix and x's first byte, does. The slot is written as spent,
+    with a C the mint never signed, and nothing on stderr says so.
+    """
+    c = bytes.fromhex(C_POINT2)[:2] + bytes(31)
+    assert bip340.lift_x(int.from_bytes(c[1:], "big")) is not None, "the cut left the curve"
+    printed, warned = _run_dump_on(_HalfClearedCard(c=c))
+    doc = json.loads(printed)
+    assert [(s["C"], s["spent"]) for s in doc["slots"]][1] == (cardctl._hex(c), True)
+    assert warned == "", warned
+
+
+def test_the_docs_name_every_tear_the_slot_checks_let_through():
+    """
+    The three tests above pin what the slot checks miss; this pins the docs to
+    them. APDU.md tells a reader to check a spent slot's data before trusting
+    it, and a reader who copies these checks into another implementation
+    trusts them to miss only what the docs say they miss. The docs once named
+    one miss of the three.
+    """
+    for path in (APDU_SPEC, SPEC, HERE / "README.md"):
+        text = " ".join(path.read_text(encoding="utf-8").split())
+        for said in (
+            "The slot checks catch a zeroed amount and a `C` that is no longer a point.",
+            "A tear that zeroed only keyset or nonce bytes, or part of `C` whose x still "
+            "lands on the curve, passes them, and `dump` writes that slot as spent.",
+        ):
+            assert said in text, f"{path.name} no longer says: {said}"
 
 
 # ── load-file ────────────────────────────────────────────────────────────────
