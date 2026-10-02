@@ -84,15 +84,20 @@ A recoverable card is a card whose funds exist somewhere other than the card,
 which contradicts D2. It also means the recovery secret becomes the real
 credential and the chip stops being the security boundary.
 
-**This is the most-questioned decision, and the open counter-proposal is good.**
-[PR #4](https://github.com/lnflash/cashu-javacard/pull/4) proposes using NUT-11's
+**This is the most-questioned decision, and the counter-proposal is good.**
+[PR #4](https://github.com/lnflash/cashu-javacard/pull/4) proposed using NUT-11's
 existing `refund` + `locktime` tags so a lost card's proofs can be swept to a
 recovery key after a timeout — no applet key changes, no seed. It is the right
-shape. It is not merged because of a specific flaw: in NUT-11, once locktime
-passes the *card's own key stops being valid*, so a short locktime silently
-converts the card into a brick; and the card cannot enforce a timeout because
-JavaCard has no clock, so a merchant would accept a tap that the mint later
-refuses.
+shape. It was closed unmerged on 2026-10-02, because it was written before
+v0.2.0 and no longer applies, and because of a specific flaw: in NUT-11, once
+locktime passes the *card's own key stops being valid*, so a short locktime
+silently converts the card into a brick; and the card cannot enforce a timeout
+because JavaCard has no clock, so a merchant would accept a tap that the mint
+later refuses.
+
+Since 0.3, a card whose PIN is blocked strands its balance too
+([SECURITY-MODEL](SECURITY-MODEL.md) #14), so a refund path would rescue a
+blocked card as well as a lost one.
 
 If you want to solve recovery, start from that PR and that objection.
 
