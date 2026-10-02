@@ -39,14 +39,18 @@ public class CashuApplet extends Applet {
     // -------------------------------------------------------------------------
     // Applet version
     //
-    // Moves with every wire-visible behaviour change, because it is the only
-    // non-destructive way to tell two builds apart in the field. 0.3 is the
-    // ENG-615 fix: on 0.2 a blocked PIN stopped gating; on 0.3 it gates for
-    // good, and a failed PIN check (VERIFY_PIN or CHANGE_PIN) ends the
-    // session's authentication.
+    // Moves with every wire-visible behaviour change, and with every fix that
+    // a card in the field has to be told apart by, because it is the only
+    // non-destructive way to tell two builds apart. 0.3 is the ENG-615 fix:
+    // on 0.2 a blocked PIN stopped gating; on 0.3 it gates for good, and a
+    // failed PIN check (VERIFY_PIN or CHANGE_PIN) ends the session's
+    // authentication. 0.4 is the ENG-620 fix (D14): every slot write commits
+    // the status byte last. Nothing on the wire changes outside a torn write,
+    // but main tracked a 0.3 CAP with the old order, and SELECT's version is
+    // all an installed card reports about its build.
     // -------------------------------------------------------------------------
     static final byte VERSION_MAJOR = (byte) 0x00;
-    static final byte VERSION_MINOR = (byte) 0x03;
+    static final byte VERSION_MINOR = (byte) 0x04;
 
     // -------------------------------------------------------------------------
     // APDU instruction bytes
@@ -484,8 +488,14 @@ public class CashuApplet extends Applet {
 
         byte[] buf = apdu.getBuffer();
         short base = (short)(slot * PROOF_SIZE);
-        proofStorage[(short)(base + PROOF_STATUS_OFFSET)] = STATUS_UNSPENT;
+        // The status byte is the slot's commit, written last (D14, ENG-620).
+        // Util.arrayCopy into persistent memory is atomic, and so is a single
+        // byte write, but the pair is not: with the status first, a card
+        // pulled between them left a slot marked UNSPENT over whatever it held
+        // before. Data first, a tear leaves the slot EMPTY with the new bytes
+        // in it, which no read looks at and the next LOAD_PROOF overwrites.
         Util.arrayCopy(buf, ISO7816.OFFSET_CDATA, proofStorage, (short)(base + PROOF_KEYSET_OFFSET), PROOF_DATA_LEN);
+        proofStorage[(short)(base + PROOF_STATUS_OFFSET)] = STATUS_UNSPENT;
 
         buf[0] = (byte) slot;
         apdu.setOutgoingAndSend((short) 0, (short) 1);
@@ -500,7 +510,13 @@ public class CashuApplet extends Applet {
         for (short i = 0; i < MAX_PROOFS; i++) {
             short base = (short)(i * PROOF_SIZE);
             if (proofStorage[(short)(base + PROOF_STATUS_OFFSET)] == STATUS_SPENT) {
-                Util.arrayFillNonAtomic(proofStorage, base, PROOF_SIZE, (byte) 0);
+                // Data first, status last (D14, ENG-620). The fill is not
+                // atomic, so a tear mid-fill leaves a SPENT slot with some of
+                // its bytes zeroed: never counted or signed for, and finished
+                // by the next CLEAR_SPENT. An EMPTY slot never holds a spent
+                // proof's bytes for a torn LOAD_PROOF to resurrect.
+                Util.arrayFillNonAtomic(proofStorage, (short)(base + PROOF_KEYSET_OFFSET), PROOF_DATA_LEN, (byte) 0);
+                proofStorage[(short)(base + PROOF_STATUS_OFFSET)] = STATUS_EMPTY;
                 freed++;
             }
         }

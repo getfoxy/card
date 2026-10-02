@@ -517,12 +517,12 @@ class FakeApplet:
     A PC/SC connection answering like the applet's PIN gate.
 
     `pin_state` is GET_INFO byte 7 (0 unset, 1 set, 2 blocked). `gate` picks
-    the rule SIGN_ARBITRARY is gated by: "0.3" refuses whenever a PIN exists
-    and the session is unverified; "0.2" is the ENG-615 rule, `pinState == 1`,
-    which opens the moment the PIN is blocked.
+    the rule SIGN_ARBITRARY is gated by: "0.3" (the rule from applet 0.3 on)
+    refuses whenever a PIN exists and the session is unverified; "0.2" is the
+    ENG-615 rule, `pinState == 1`, which opens the moment the PIN is blocked.
     """
 
-    def __init__(self, version=(0, 3), pin_state=1, pin=b"1234", gate="0.3"):
+    def __init__(self, version=(0, 4), pin_state=1, pin=b"1234", gate="0.3"):
         self.version = bytes(version)
         self.pin_state = pin_state
         self.pin = pin
@@ -669,13 +669,44 @@ def test_selftest_fails_every_build_below_0_3_blocked_or_not():
             assert "checks passed" not in out, f"{label}\n{out}"
 
 
+def test_selftest_fails_every_0_3_card_blocked_or_not():
+    """
+    `main` tracked a 0.3 CAP (958a8baa…) that still wrote a slot's status byte
+    before its data (ENG-620, D14), and nothing on an installed card tells it
+    apart from a 0.3 build with the fix: SELECT's version is all the card
+    reports about its build. selftest passed every 0.3 card as healthy. It
+    must fail each one, with or without a PIN, and name the fix: reinstall the
+    0.4 CAP, sweeping first unless the PIN is blocked. A blocked 0.3 card cannot
+    spend (its balance is stranded), so it is never told to sweep outright.
+    """
+    for pin_state in (0, 1, 2):
+        applet = FakeApplet(version=(0, 3), pin_state=pin_state)
+        flags = ("--pin", "1234") if pin_state == 1 else ()
+        rc, out = run_selftest(applet, *flags)
+        label = f"applet 0.3, pin_state {pin_state}"
+        assert rc == 1, f"{label}\n{out}"
+        assert "FAIL  SELECT applet" in out, f"{label}\n{out}"
+        assert "applet 0.3 may carry ENG-620" in out, f"{label}\n{out}"
+        assert "reinstall the 0.4 CAP" in out, f"{label}\n{out}"
+        assert "unless its PIN is blocked" in out, f"{label}\n{out}"
+        assert "checks passed" not in out, f"{label}\n{out}"
+        if pin_state == 2:
+            assert "sweep the balance, then" not in out.lower(), f"{label}\n{out}"
+            assert "stranded" in out, f"{label}\n{out}"
+
+
 def test_select_verdict_passes_only_a_known_fixed_version():
-    assert cardctl._select_verdict(bytes([0, 3])) == (True, "version 0.3")
+    assert cardctl._select_verdict(bytes([0, 4])) == (True, "version 0.4")
     assert cardctl._select_verdict(bytes([1, 0]))[0] is True
     for version in (bytes([0, 1]), bytes([0, 2])):
         ok, detail = cardctl._select_verdict(version)
         assert ok is False and "ENG-615" in detail, detail
-    # No version at all cannot be told apart from an ENG-615 build.
+        assert "reinstall the 0.4 CAP" in detail, detail
+    # 0.3 has the ENG-615 fix, but SELECT cannot tell the build main tracked
+    # with the old slot write order (ENG-620) from one with the fix.
+    ok, detail = cardctl._select_verdict(bytes([0, 3]))
+    assert ok is False and "ENG-620" in detail and "reinstall the 0.4 CAP" in detail, detail
+    # No version at all cannot be told apart from an ENG-615 or ENG-620 build.
     ok, detail = cardctl._select_verdict(b"")
     assert ok is False and "no applet version" in detail, detail
 

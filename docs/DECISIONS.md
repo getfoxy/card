@@ -4,7 +4,7 @@ Each entry records a call that was made, what was rejected, and why. If you are
 about to change one of these, read the entry first — most were made against a
 real alternative, and several were made *after* getting it wrong once.
 
-Anchors are stable (`#d1` … `#d12`); other docs link to them.
+Anchors are stable (`#d1` … `#d14`); other docs link to them.
 
 ---
 
@@ -270,7 +270,8 @@ and 0.2 build has the same `pinState == 1` gate on `LOAD_PROOF`, `CLEAR_SPENT`
 and `LOCK_CARD`, and 0.1 builds from before D13 gate no spend at all, so a card
 whose `SELECT` answers anything below `00 03` (`00 01` or `00 02`) needs the
 CAP reinstalled. There is no proof-preserving upgrade, so sweep first: the
-reinstall regenerates the card key.
+reinstall regenerates the card key. [D14](#d14) later moved that floor to
+`00 04`.
 
 "Dead" also means **stranded**. Nothing but the card key can sign for the
 card's P2PK-locked proofs, so a blocked card's balance is unrecoverable, and
@@ -283,6 +284,66 @@ Provisioning: POS cards are personalised with a PIN by default
 tool gains it). The merchant terminal prompts for the PIN only when
 `GET_INFO.pinState` reports `set`, and refuses a card reporting `locked` (2)
 outright: nothing can spend from it.
+
+---
+
+## <a id="d14"></a>D14 — A slot's status byte is its commit, written last
+
+A proof slot is `status ‖ keyset ‖ amount ‖ nonce ‖ C`, and every reader trusts
+the status byte: `GET_BALANCE` sums the UNSPENT slots and `SPEND_PROOF` signs
+for them. So every write to a slot changes its data first and its status byte
+last, as a single byte, which the JCRE writes atomically. A card that leaves
+the field mid-write leaves the slot with its old status, never a new status
+over old bytes:
+
+- `LOAD_PROOF` copies the proof (`Util.arrayCopy`, atomic into persistent
+  memory), then sets UNSPENT. Torn before the commit, the slot is still EMPTY:
+  no command reads it, and the next `LOAD_PROOF` overwrites it.
+- `CLEAR_SPENT` zeroes a spent slot's data, then sets EMPTY. Torn mid-fill (the
+  fill is not atomic), the slot is still SPENT: never counted or signed for, and
+  the next `CLEAR_SPENT` finishes it. Until then `GET_PROOF` still returns it,
+  with some fields zeroed, and its data is not a proof: see
+  [`spec/APDU.md`](../spec/APDU.md#clear_spent-0x31) for what a reader
+  checks. An EMPTY slot never holds a spent proof's bytes.
+- `SPEND_PROOF` writes only the status byte ([D7](#d7)).
+
+**Rejected:** a `JCSystem` transaction around each write. The order alone gives
+the guarantee, and a transaction around the old handlers would not have given
+it: the old `CLEAR_SPENT` filled the whole slot, status byte included, with
+`Util.arrayFillNonAtomic`, which does not use the transaction facility even
+while a transaction is in progress. Torn inside a transaction as outside one,
+that fill could leave an EMPTY status over a spent proof's bytes, the state
+ENG-620's resurrection starts from. A transactional clear needs `Util.arrayFill`
+(JC 3.0.5) in its place. Nor does the order keep `LOAD_PROOF` off the commit
+buffer: its `Util.arrayCopy` is atomic into persistent memory and subject to the
+same commit capacity a transaction uses (it can throw `TransactionException`).
+The order does not rely on that atomicity, since a torn copy leaves the slot
+EMPTY whatever its bytes hold, so `Util.arrayCopyNonAtomic` would be as safe
+there.
+
+*Found after v0.2.0 (ENG-620):* `LOAD_PROOF` set UNSPENT before it copied the
+proof, and `CLEAR_SPENT` zero-filled from the status byte. A tear between
+`LOAD_PROOF`'s two writes left an UNSPENT slot over the slot's old bytes:
+usually zeros, a phantom proof of amount 0 that `CLEAR_SPENT` would not free
+(it frees only SPENT slots) until a `SPEND_PROOF` burned it; after a torn
+`CLEAR_SPENT` of the same slot, a spent proof's keyset, amount and C, which
+`GET_BALANCE` counted and an offline terminal could accept and never settle.
+
+jCardSim cannot tear a write, so `SlotWriteOrderTest` scans the source for the
+order, as D10's allocation rule is scanned, and sets the torn states directly to
+show what every command then does.
+
+Outside a torn write nothing a reader sends or receives changes, but the applet
+version moved to 0.4 anyway. No release carries the one 0.3 build with the old
+order (`958a8baa…`), but it was `main`'s tracked CAP from `f889934` until this
+fix, and whether a card was installed from it in that window could not be
+confirmed. `SELECT`'s version is the only thing an installed card reports about
+its build, so the 0.3 builds cannot be told apart: a card answering `00 03` may
+run the old order. Keeping 0.3 and telling builds apart by the tracked CAP's
+sha256 was rejected for that reason: the hash says which CAP to install, not
+which one a card already runs. A card whose `SELECT` answers anything below
+`00 04` needs the CAP reinstalled (sweep it first), and `cardctl selftest`
+fails it ([`HARDWARE_DEPLOYMENT.md`](HARDWARE_DEPLOYMENT.md#install)).
 
 ---
 

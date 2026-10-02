@@ -100,9 +100,10 @@ class CashuAppletTest {
         byte[] data = resp.getData();
         assertEquals(2, data.length, "Version response must be 2 bytes");
         assertEquals(0x00, data[0], "Major version = 0");
-        assertEquals(0x03, data[1],
-            "Minor version = 3 (ENG-615: a blocked PIN keeps gating). A fixed card must not "
-                + "answer SELECT like the vulnerable 0.2 build.");
+        assertEquals(0x04, data[1],
+            "Minor version = 4 (ENG-620: a slot's status byte is written last, D14). A fixed "
+                + "card must not answer SELECT like the 0.3 build main tracked with the old "
+                + "write order, nor like the ENG-615 builds below it.");
     }
 
     // =========================================================================
@@ -117,7 +118,7 @@ class CashuAppletTest {
         byte[] d = resp.getData();
         assertEquals(8, d.length, "GET_INFO must return 8 bytes");
         assertEquals(0x00, d[0] & 0xFF, "major version");
-        assertEquals(0x03, d[1] & 0xFF, "minor version");
+        assertEquals(0x04, d[1] & 0xFF, "minor version");
         assertEquals(MAX_PROOFS, d[2] & 0xFF, "max slots = 32");
         assertEquals(0, d[3] & 0xFF, "unspent = 0 initially");
         assertEquals(0, d[4] & 0xFF, "spent = 0 initially");

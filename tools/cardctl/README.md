@@ -54,9 +54,9 @@ nonce that is a pure function of `(d, msg)` lets a fault injector recover the
 private key from two signatures).
 
 ```
-PASS  SELECT applet  — version 0.3
-PASS  GET_INFO  — v0.1, 32 slots, PIN unset
-PASS  Schnorr capability advertised  — caps=0x03
+PASS  SELECT applet  — version 0.4
+PASS  GET_INFO  — v0.4, 32 slots, PIN unset
+PASS  Schnorr capability advertised  — caps=0x07
 PASS  GET_PUBKEY well-formed  — 02a1b2c3d4e5f60718…  (33 bytes)
 PASS  SIGN_ARBITRARY + BIP-340 verify [1/3]
 ...
@@ -66,12 +66,16 @@ All 11 checks passed on physical hardware.
 On a card with a PIN set, pass `--pin`: spend and sign are PIN-gated (D13),
 so the signing rounds need a verified session.
 
-Every card below applet 0.3 fails `selftest` at `SELECT applet`, blocked or
-not. Those builds gate with `pinState == 1`, so three wrong `VERIFY_PIN`s from
-any reader in range switch the PIN check off (ENG-615): sweep the balance and
-reinstall the CAP. A card whose PIN is blocked (`GET_INFO` byte 7 = 2) also
-fails before any signing round, since no PIN can verify on it again; on 0.3
-and later that means the balance is stranded.
+Every card below applet 0.4 fails `selftest` at `SELECT applet`, blocked or
+not. Builds below 0.3 gate with `pinState == 1`, so three wrong `VERIFY_PIN`s
+from any reader in range switch the PIN check off (ENG-615). A 0.3 card may run
+the build `main` tracked before the ENG-620 fix, which writes a slot's status
+byte before its data ([D14](../../docs/DECISIONS.md#d14)), and nothing on the
+card tells it apart from another 0.3 build. Either way, sweep the balance and
+reinstall the 0.4 CAP, except that a 0.3 card whose PIN is blocked cannot be
+swept. A card whose PIN is blocked (`GET_INFO` byte 7 = 2) also fails before
+any signing round, since no PIN can verify on it again; on 0.3 and later that
+means the balance is stranded (SECURITY-MODEL #14).
 
 ## Loading the applet
 
@@ -172,6 +176,14 @@ Four things the format insists on, all because a card file is bearer money:
 
 `dump` validates the document it assembled before writing it, so a mistake like
 `dump --mint "$UNSET_VAR"` fails loudly instead of leaving an unloadable backup.
+The one exception is a spent slot that fails the slot checks, as a card pulled
+mid-`CLEAR_SPENT` can leave one: `dump` skips it with a warning on stderr
+(`half-cleared by an interrupted CLEAR_SPENT; run clear-spent`, once the card's
+other spent slots have settled) and writes the rest. The slot checks catch a
+zeroed amount and a `C` that is no longer a point. A tear that zeroed only
+keyset or nonce bytes, or part of `C` whose x still lands on the curve, passes
+them, and `dump` writes that slot as spent. An unspent slot that fails still
+refuses the whole dump.
 
 ## Tests
 

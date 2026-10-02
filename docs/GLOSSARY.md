@@ -101,7 +101,9 @@ same code drives both contact and contactless readers.
 corner radius.
 
 **Tear-off** — pulling a card from the field mid-operation. A classic smartcard
-attack, and **unanalysed here** ([`SECURITY-MODEL.md`](SECURITY-MODEL.md)).
+attack. Every slot write here commits its status byte last, so a tear never
+leaves a new status over old bytes ([D14](DECISIONS.md#d14)): analysed and
+tested in jCardSim, not yet on a card ([`SECURITY-MODEL.md`](SECURITY-MODEL.md)).
 
 **jCardSim** — a JavaCard simulator that runs on the JVM. Indispensable, and
 structurally unable to reproduce EEPROM exhaustion or hardware crypto framing —

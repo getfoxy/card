@@ -848,12 +848,17 @@ def cmd_load_file(args) -> int:
 
 
 def cmd_dump(args) -> int:
-    """Write every non-empty slot to a card file for the mint side to redeem."""
+    """
+    Write every non-empty slot to a card file for the mint side to redeem,
+    except a spent slot whose data fails the slot checks (most likely
+    half-cleared by an interrupted CLEAR_SPENT).
+    """
     card = connect(args)
     pubkey = card.get_pubkey()
     statuses = card.get_slot_status()
 
     slots = []
+    half_cleared = []
     for index, status in enumerate(statuses):
         if status == 0x00:
             continue
@@ -874,7 +879,7 @@ def cmd_dump(args) -> int:
         if args.unspent_only and status != 0x01:
             continue
         p = card.get_proof(index)
-        slots.append({
+        entry = {
             "keysetId": p["keyset_id"],
             "amount": p["amount"],
             "nonce": _hex(p["nonce"]),
@@ -884,15 +889,58 @@ def cmd_dump(args) -> int:
             # side gets N indistinguishable proofs, and a reload resurrects the
             # spent ones as spendable. See spec/CARD-FILE.md.
             "spent": p["status"] == "spent",
-        })
+        }
+        if entry["spent"]:
+            # CLEAR_SPENT zeroes a spent slot's data before it marks the slot
+            # empty (D14), and the fill is not atomic, so a card pulled
+            # mid-CLEAR_SPENT leaves the slot spent with any part of its data
+            # zeroed. GET_PROOF still returns it, but its bytes are no longer a
+            # proof (spec/APDU.md, CLEAR_SPENT): an amount of 0, or a C that is
+            # no longer a point, would make the round-trip check below refuse
+            # the whole card over a slot the operator was already clearing.
+            # Skip it and say so. A spent slot that fails for another reason (a
+            # placeholder C from `load` without --c, a denomination an older
+            # cardctl allowed) cannot be redeemed either, so skipping it loses
+            # nothing. The slot checks catch a zeroed amount and a C that is
+            # no longer a point. A tear that zeroed only keyset or nonce bytes,
+            # or part of C whose x still lands on the curve, passes them, and
+            # dump writes that slot as spent. Spent slots only: an unspent slot
+            # that fails is money, and still refuses the dump.
+            try:
+                _slot_from_json(entry, index)
+            except SystemExit as exc:
+                reason = str(exc)
+                if reason.startswith(f"slot {index}: "):
+                    reason = reason[len(f"slot {index}: "):]
+                half_cleared.append(index)
+                # CLEAR_SPENT frees every spent slot on the card, so the advice
+                # waits for the rest of them to settle: a spent slot is owed
+                # until the mint has seen its proof.
+                print(
+                    f"slot {index}: skipped: spent, and its data is not a proof "
+                    f"({reason}); most likely half-cleared by an interrupted "
+                    f"CLEAR_SPENT; run clear-spent to free it once every other "
+                    f"spent slot in this dump has settled at the mint. "
+                    f"`cardctl proof {index}` prints what is left of it.",
+                    file=sys.stderr,
+                )
+                continue
+        slots.append(entry)
 
+    note = f"dumped by cardctl from {len(slots)} slot(s)"
+    if half_cleared:
+        note += (
+            f"; skipped spent slot(s) {', '.join(str(i) for i in half_cleared)}, "
+            f"whose data is not a proof (most likely half-cleared by an "
+            f"interrupted CLEAR_SPENT)"
+        )
     doc = {
         "version": CARD_FILE_VERSION,
         "mint": args.mint,
         "unit": args.unit,
         "cardPubkey": _hex(pubkey),
         "slots": slots,
-        "note": f"dumped by cardctl from {len(slots)} slot(s)",
+        "note": note,
     }
 
     # Never emit a document this module would refuse to read back. `dump --mint
@@ -1012,7 +1060,7 @@ def cmd_selftest(args) -> int:
     # verify inside this session or every signature check below would 6982.
     # GET_INFO byte 7 = 2 is a PIN that exists and can never verify again
     # (spec/APDU.md, GET_INFO), not "no PIN". Reading it like 0 skipped
-    # VERIFY_PIN, then either died on a 6982 that blamed the PIN (0.3) or,
+    # VERIFY_PIN, then either died on a 6982 that blamed the PIN (0.3 on) or,
     # through the open ENG-615 gate of a 0.1/0.2 build, passed a card that
     # anyone in range could spend.
     pin_blocked = info["pin_state"] == "locked"
@@ -1095,21 +1143,33 @@ def cmd_selftest(args) -> int:
 
 def _select_verdict(version: bytes) -> Tuple[bool, str]:
     """
-    Whether the applet version SELECT answered is a build that keeps its gate.
+    Whether the applet version SELECT answered is a build selftest can pass.
 
     Every 0.1 and 0.2 build gates with `pinState == 1` (ENG-615), so its PIN
     is three unauthenticated VERIFY_PINs away from switching off, from any
     reader in range, whether or not it is blocked yet. selftest fails such a
-    card outright rather than only once the PIN is already blocked. A card
-    that answers SELECT with no version cannot be told apart from one of them.
+    card outright rather than only once the PIN is already blocked.
+
+    0.3 fixed the gate, but `main` tracked a 0.3 CAP (958a8baa…) that still
+    wrote a slot's status byte before its data (ENG-620, D14), so a card
+    pulled mid-LOAD_PROOF could show a phantom proof. Nothing on an installed
+    card tells that build apart from another 0.3 build, so every 0.3 card
+    fails too; 0.4 is the fix. A card that answers SELECT with no version
+    cannot be told apart from any of them.
     """
     if len(version) < 2:
-        return False, ("SELECT returned no applet version, so an ENG-615 build "
-                       "cannot be told apart from a fixed one")
+        return False, ("SELECT returned no applet version, so an ENG-615 or ENG-620 "
+                       "build cannot be told apart from a fixed one")
     ver = tuple(version[:2])
     if ver < (0, 3):
         return False, (f"applet {ver[0]}.{ver[1]} is an ENG-615 build: sweep the "
-                       f"balance, then reinstall the 0.3 CAP (docs/HARDWARE_DEPLOYMENT.md)")
+                       f"balance, then reinstall the 0.4 CAP (docs/HARDWARE_DEPLOYMENT.md)")
+    if ver < (0, 4):
+        return False, (f"applet {ver[0]}.{ver[1]} may carry ENG-620 (a card pulled "
+                       f"mid-LOAD_PROOF can show a phantom proof), and SELECT cannot "
+                       f"tell its builds apart: sweep the balance unless its PIN is "
+                       f"blocked (then it is stranded, SECURITY-MODEL #14), and reinstall "
+                       f"the 0.4 CAP (docs/HARDWARE_DEPLOYMENT.md)")
     return True, f"version {ver[0]}.{ver[1]}"
 
 

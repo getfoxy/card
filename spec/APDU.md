@@ -129,6 +129,10 @@ Returns a 1-byte count of total proof slots that are non-empty (unspent + spent)
 
 Returns full proof data at a given slot index. Slot must be non-empty.
 
+A spent slot is returned as the card holds it, and that is not always a proof:
+a card pulled mid-`CLEAR_SPENT` leaves a slot that still reads `02` with some
+of its data zeroed (see [CLEAR_SPENT](#clear_spent-0x31)).
+
 | Field | Value |
 |-------|-------|
 | CLA | B0 |
@@ -280,6 +284,14 @@ Stores a new proof in the next available empty slot. Used during card top-up (fu
 | 6986 | Card locked (`LOCK_CARD`) — writes disabled |
 | 6A84 | No space — all slots occupied |
 
+**Write order.** The card stores the 77 bytes, then marks the slot unspent
+(D14, applet 0.4 and later; a card whose `SELECT` answers below `00 04` may
+mark it first). A card that leaves the field mid-command leaves the slot empty
+or holding the whole proof, never part of one marked unspent. The card does not
+check for duplicates, so after a `LOAD_PROOF` whose answer was lost the proof
+may or may not be on the card: read the slots (`GET_SLOT_STATUS`, `GET_PROOF`)
+before sending it again.
+
 ---
 
 ### CLEAR_SPENT (0x31)
@@ -301,6 +313,18 @@ Garbage-collects all spent proof slots, freeing them for new proofs. Called afte
 |----|---------|
 | 6982 | Security condition not satisfied (PIN set or blocked, and not verified in this session) |
 | 6986 | Card locked (`LOCK_CARD`) — writes disabled |
+
+**Write order.** Each spent slot's data is zeroed, then the slot is marked
+empty (D14, applet 0.4 and later). A tear leaves a slot still spent, which the
+next `CLEAR_SPENT` frees. Until then `GET_PROOF` returns the slot with status
+`02` and some fields zeroed; the fill is not atomic, so which of them are
+zeroed is not defined. Once `CLEAR_SPENT` has touched a spent slot, its data is
+not a proof. Only the zeroed bytes set such a slot apart, so a reader that uses
+a spent slot's data checks it first. `cardctl dump` skips a spent slot that
+fails the card file's slot checks ([`CARD-FILE.md`](CARD-FILE.md#slot)). The
+slot checks catch a zeroed amount and a `C` that is no longer a point. A tear
+that zeroed only keyset or nonce bytes, or part of `C` whose x still lands on
+the curve, passes them, and `dump` writes that slot as spent.
 
 ---
 

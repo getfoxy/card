@@ -423,7 +423,7 @@ class SchnorrHWMathTest {
     }
 
     /** Applet main-source directory, resolved from either module or repo root. */
-    private static java.nio.file.Path mainSourceDir() throws java.io.IOException {
+    static java.nio.file.Path mainSourceDir() throws java.io.IOException {
         String[] candidates = {
             "src/main/java/me/flashapp/cashu",
             "applet/src/main/java/me/flashapp/cashu",
@@ -440,7 +440,7 @@ class SchnorrHWMathTest {
     }
 
     /** Drop comments and char literals so `new` and braces are only ever real code. */
-    private static String stripCommentsAndCharLiterals(String s) {
+    static String stripCommentsAndCharLiterals(String s) {
         StringBuilder out = new StringBuilder(s.length());
         int i = 0;
         while (i < s.length()) {
@@ -466,7 +466,7 @@ class SchnorrHWMathTest {
     }
 
     /** Brace nesting depth at every character index. Class body = 1, method body = 2. */
-    private static int[] braceDepths(String src) {
+    static int[] braceDepths(String src) {
         int[] depth = new int[src.length()];
         int d = 0;
         for (int i = 0; i < src.length(); i++) {
