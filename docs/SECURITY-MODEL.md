@@ -177,8 +177,10 @@ a few hundred taps. Treat simulator results accordingly — see
 2. **Tear-off on silicon** (#11) — the write order is analysed and enforced
    ([D14](DECISIONS.md#d14)); pulling a card mid-`LOAD_PROOF` and
    mid-`CLEAR_SPENT` on hardware is still owed.
-3. **Recovery** (#3) — [PR #4](https://github.com/lnflash/cashu-javacard/pull/4)
-   is the live proposal; see [D5](DECISIONS.md#d5) for the flaw to fix first.
+3. **Recovery** (#3) — [PR #4](https://github.com/lnflash/cashu-javacard/pull/4),
+   closed unmerged, is the starting point; see [D5](DECISIONS.md#d5) for the
+   flaw to fix first. A refund path would also rescue a blocked card's balance
+   (#14).
 4. **Card attestation** (#13) — no proof a key was generated on-card by genuine
    firmware.
 5. **Side-channel review** of `SchnorrHW` — the modular arithmetic was written
