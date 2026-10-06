@@ -237,6 +237,14 @@ shape" and name its flaw. This is that path, with the flaw answered.
   it); an older mint takes the refund key only. The rule above leans on
   neither, so it is right at both.
 
+- **What can be taken back is what the loading phone knows of.** A piece's
+  nonce is random, so the twelve words do not rebuild it: the phone keeps the
+  pieces it loads and the pieces it sees whenever the card is read on it.
+  Change a receiver wrote onto the card since the phone last read it is not
+  known to the phone and does not come back. And if the phone's own data is
+  lost with the card, the words alone bring back nothing of the card. A later
+  version can make the nonces come from the words; this one does not.
+
 A card can be made with no refund key, and is then cash, as upstream's.
 
 ## 7. Foxy: reading the card (Swift)
@@ -280,6 +288,12 @@ A card can be made with no refund key, and is then cash, as upstream's.
    back. If it has gone, keep the change on file and show TAP THE CARD AGAIN.
 7. PAID when step 5 has given this phone its pieces. One history entry, in,
    for the amount, marked as from a card.
+
+As built: steps 3 and 5 are the wallet's ordinary receive of a token whose
+pieces are already signed for, with its own record and recovery, and change
+is a second swap, an ordinary locked send to the card's key, cut by what it
+costs and settled on the payment's entry as any change here is. One swap for
+both would save a sat or two at a mint that charges; it is not built.
 
 ### 8.2 What is this phone's and what is not
 
