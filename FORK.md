@@ -25,6 +25,9 @@ section 4. In short:
 |---|---|
 | `applet/` and its tests | the fork. `mvn -f applet/pom.xml test`, and `ant -f applet/build.xml cap -Djc.sdk=…/jc305u4_kit` |
 | `docs/FOXY-CARD-SPEC.md` | the fork |
+| `docs/FOXY-CARD-SCREENS.md` | the wallet's card screens, as built |
+| `docs/CARD-DESIGNS.md` | the codes of the designs a card's face can have, and how one is added |
+| `docs/FOR-LNFLASH.md` | the note to upstream: what changed, what was found, what has and has not been tested |
 | `spec/`, `README.md`, the other `docs/` | upstream's, describing upstream's wire. Not yet rewritten |
 | `tools/cardctl`, `tools/e2e-*` | upstream's host tools, for upstream's wire. They do not drive this applet |
 | CI | switched off here until the host tools are ported |
@@ -45,8 +48,14 @@ then take it away), `new` and `show` are the others. The app's repository has
 `tests/flashcard-applet.js`, which drives the wallet's flows over the same
 socket from Node.
 
-What it holds lasts as long as the process. It prints each command's
-instruction and status and never its data, because one command is the PIN.
+What it holds lasts as long as the process, and no longer: a card server
+that stops takes its card's contents with it. Stop one by its own process
+number, never by a pattern that could match another, and read it first
+(`ctl.sh <port> show`). Ecash put on a simulated card is not lost with it, as
+long as the card had the simulator's fixed key (`run.sh <port> plain`): a new
+server started the same way is the same card, and the wallet that loaded it
+still holds the token it wrote. It prints each command's instruction and
+status and never its data, because one command is the PIN.
 
 ## When a card arrives
 

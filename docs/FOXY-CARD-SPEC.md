@@ -64,23 +64,30 @@ cards from other issuers, a card without a PIN, units other than sats.
 
 ### 2.2 Menu › Flashcard (the holder's own phone)
 
-1. **TAP CARD.** The iOS sheet; no PIN. The screen then shows:
-   - the balance, as the card says and, with a connection, as the mint says
-     (`2,048 sats · checked with the mint`, or `the card says 2,048; the mint
-     says 1,024 of it is spent`);
-   - the mint it is at, how many pieces, how many places are free;
-   - its state: no PIN yet, PIN set, blocked, locked;
-   - if it can be recovered, until when (see 6).
-2. **SET A PIN**, the first time: typed twice. Nothing can be added to a card
-   with no PIN.
+As built; the screens themselves are in `FOXY-CARD-SCREENS.md`.
+
+1. **FLASHCARD** goes straight to the iOS sheet; no PIN. The screen then
+   shows:
+   - how fresh the mint's word on the card is (`Verified Just Now`; on a
+     phone with no connection, when it last was, for the same pieces);
+   - the mint it is at and its balance;
+   - on the card's face, what is not ordinary: no PIN yet, locked, blocked,
+     or pieces the mint says are spent.
+2. **SET UP THIS CARD**, the first time: a PIN typed twice, and a tap. Nothing
+   can be added to a card with no PIN. Cards are set up as cash for now (6).
 3. **ADD FUNDS.** An amount, the PIN, a tap. The money leaves this phone's
    balance and is on the card when the screen says so. If the card leaves
-   early: `TAP THE CARD AGAIN: 1,000 of 2,000 sats are on it.`
-4. **WITHDRAW.** `Enter PIN to withdraw`, a tap, and everything on the card is
-   in this phone's balance. A part can be asked for instead of all.
+   early the pieces wait for it, and the screen says so until a tap writes
+   them.
+4. **WITHDRAW.** An amount or all of it, the PIN, a tap, and it is in this
+   phone's balance.
 5. **CHANGE PIN.** Old, new, new, a tap.
-6. **TAKE BACK A LOST CARD.** For a card this phone funded that is lost or
-   blocked: after its date, the money comes back with no card (see 6).
+6. **SET LIMIT.** The most one PIN entry may spend (5.3), or none.
+7. **The card's history**: what this phone has done with it. A card keeps no
+   list of its own.
+8. **TAKE BACK A LOST CARD.** For a card this phone funded as recoverable:
+   after its date, the money comes back with no card (see 6). Built, and on
+   no screen while cards are cash.
 
 ## 3. Who is trusted with what
 
@@ -329,15 +336,29 @@ this phone's business, by the road Foxy already has for moving between mints,
 and its cost is shown to the receiver before the card is asked for anything.
 Until then: A DIFFERENT MINT, and nothing is taken.
 
+What is built of this is the holder's side: moving a card itself to another
+mint. A card with nothing on it is told its new mint in one tap (`SET_CARD`,
+which the card refuses while it holds unspent pieces). One with money on it
+takes two: the money comes off into the phone, crosses by Lightning with its
+own fee paid out of it, and goes back on at the new mint. The fee shown before
+the card is touched is the most it can cost; cut short anywhere, the money is
+in the phone and the card is empty and still good. Run against CDK and
+Nutshell with the applet as the card (`tools/live/flashcard-switch.js` in the
+wallet repository). The app has no button for it at present.
+
 ## 9. Foxy: the screens (app)
 
-- Receive: a CARD button beside TAP; the PIN pad with the amount in its
-  title; the cards of 2.1.
-- Menu › Flashcard: one screen, empty until a card is tapped, then the card's
-  state and the buttons of 2.2.
-- The PIN pad is the lock screen's, with its larger keys. A card PIN is 4 to
-  8 digits.
-- Render snapshots for each state; the wording above is the wording.
+`FOXY-CARD-SCREENS.md` lists them as built. In short:
+
+- Receive: a CARD button beside TAP; the PIN pad with what is being paid
+  under its title and on its button; the cards of 2.1.
+- Menu › Flashcard: straight to the tap, then one screen in home's layout:
+  the card, its balance and mint in home's own pill, and four buttons.
+- Amounts are typed on the app's own amount screen. The PIN pad is the lock
+  screen's, with its larger keys. A card PIN is 4 to 8 digits.
+- A card's face is drawn in its design, named by a code of three characters
+  (`CARD-DESIGNS.md`; FL1 today). The card does not yet carry its code.
+- Render snapshots for each state.
 
 ## 10. What it does not protect against
 
