@@ -48,6 +48,30 @@ socket from Node.
 What it holds lasts as long as the process. It prints each command's
 instruction and status and never its data, because one command is the PIN.
 
+## When a card arrives
+
+Not run yet. `docs/HARDWARE_DEPLOYMENT.md` is upstream's guide and its steps
+hold, with this fork's names in place of upstream's:
+
+    ant -q -f applet/build.xml cap -Djc.sdk=$HOME/.javacard/sdks/jc305u4_kit
+    gp --list                                   # the card answers, with its default keys
+    gp --install applet/target/<the cap file>
+    gp --apdu 00A404000AF0464F58594341524401    # SELECT by the applet's name: 0100 9000
+    gp --apdu B0010000                          # GET_INFO: 16 bytes, 9000
+
+    gp --delete F0464F58594341524401            # to take it off again: the applet,
+    gp --delete F0464F585943415244              # then its package
+
+`gp` is GlobalPlatformPro, which is not installed on this Mac yet. A card
+locks itself for good after a run of failed key attempts, so `gp --list` with
+no key given (its default test keys) is tried once, and not again if it
+fails. Upstream's report for the same chip is
+`docs/HARDWARE_TEST_REPORT_2026-09-22.j3r180.md`: its 6F00 on install came from
+a probe in the constructor, which is the first thing to suspect here too.
+
+After that, the phone: Foxy with the NFC entitlement (the app repository's
+`tools/flashcard.entitlements`), MENU, FLASHCARD, TAP CARD.
+
 ## Not public
 
 The spec's section 4 lists weaknesses in upstream 0.4. Upstream asks for those
