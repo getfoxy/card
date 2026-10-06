@@ -588,6 +588,67 @@ class CashuAppletTest {
     }
 
     // =========================================================================
+    // Vectors for the other side of the wire
+    // =========================================================================
+
+    /**
+     * What the card signed, written down for whoever makes the pieces: the
+     * card's key, each piece as it was loaded, the secret text this test says
+     * it is, and the signature the card gave for it. A wallet that builds the
+     * same text from the same fields, and finds the signature good, agrees
+     * with the card byte for byte. Written to target/secret-vectors.json;
+     * spec/vectors/secret.json is one run of it, kept.
+     */
+    @Test
+    @DisplayName("The card's signatures, as vectors for a wallet to check its secrets against")
+    void testWriteVectors() throws Exception {
+        ready();
+        long[] dates = { 0L, 1L, 1700000000L, 1900000000L, 4294967295L };
+        StringBuilder out = new StringBuilder();
+        byte[] key = cardKey();
+        out.append("{\n \"cardKey\": \"").append(toHex(key)).append("\",\n \"refundKey\": \"").append(toHex(REFUND))
+           .append("\",\n \"mint\": \"").append(MINT).append("\",\n \"pieces\": [\n");
+        for (int i = 0; i < dates.length; i++) {
+            long amount = 1L << (i + 3);
+            assertEquals(SW_OK, load(buildProof(KEYSET, amount, 0x40 + 7 * i, dates[i])).getSW());
+            byte[] before = slot(i);
+            ResponseAPDU r = spend(i);
+            assertEquals(SW_OK, r.getSW());
+            byte[] nonce = Arrays.copyOfRange(before, 13, 45);
+            String secret = secretText(nonce, key, dates[i], REFUND);
+            byte[] msg = sha256(secret.getBytes(StandardCharsets.UTF_8));
+            assertTrue(schnorrVerify(extractPubkeyX(key), msg, r.getData()));
+            out.append("  {\"keyset\": \"").append(KEYSET).append("\", \"amount\": ").append(amount)
+               .append(", \"nonce\": \"").append(toHex(nonce))
+               .append("\", \"C\": \"").append(toHex(Arrays.copyOfRange(before, 45, 78)))
+               .append("\", \"date\": ").append(dates[i])
+               .append(",\n   \"slot\": \"").append(toHex(before))
+               .append("\",\n   \"secret\": ").append(jsonString(secret))
+               .append(",\n   \"message\": \"").append(toHex(msg))
+               .append("\",\n   \"signature\": \"").append(toHex(r.getData())).append("\"}")
+               .append(i + 1 < dates.length ? ",\n" : "\n");
+        }
+        // AUTH, for the same reason
+        byte[] reader = hexToBytes("a0a1a2a3a4a5a6a7a8a9aaabacadaeaf");
+        byte[] auth = transmit(new CommandAPDU(CLA, INS_AUTH, 0, 0, reader, 80)).getData();
+        byte[] cardNonce = Arrays.copyOfRange(auth, 0, 16);
+        out.append(" ],\n \"auth\": {\"tag\": \"FoxyCard/auth\", \"readerNonce\": \"").append(toHex(reader))
+           .append("\", \"cardNonce\": \"").append(toHex(cardNonce))
+           .append("\", \"message\": \"").append(toHex(authMessage(reader, cardNonce, key)))
+           .append("\", \"signature\": \"").append(toHex(Arrays.copyOfRange(auth, 16, 80))).append("\"}\n}\n");
+        java.nio.file.Path target = SchnorrHWMathTest.mainSourceDir().toAbsolutePath().normalize();
+        while (target != null && !target.endsWith("applet")) target = target.getParent();
+        assertNotNull(target, "the applet folder");
+        java.nio.file.Files.createDirectories(target.resolve("target"));
+        java.nio.file.Files.write(target.resolve("target").resolve("secret-vectors.json"),
+            out.toString().getBytes(StandardCharsets.UTF_8));
+    }
+
+    static String jsonString(String s) {
+        return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
+    }
+
+    // =========================================================================
     // A locked card
     // =========================================================================
 
