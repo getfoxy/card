@@ -45,19 +45,65 @@ import java.nio.charset.StandardCharsets;
 public final class CardServer {
     static final String APPLET = "F0464F58594341524401";
 
-    private CardSimulator card = fresh();
+    /** "plain" as the second argument: the one key every jCardSim card has, as before `ownKey`. */
+    private static boolean plain = false;
+
+    private CardSimulator card;
     private boolean present = true;
     private int pullAfter = -1;
 
     private static CardSimulator fresh() {
         CardSimulator sim = new CardSimulator();
         sim.installApplet(AIDUtil.create(APPLET), CashuApplet.class);
+        if (!plain) ownKey(sim);
         return sim;
+    }
+
+    /**
+     * A key of this card's own.
+     *
+     * A real card makes its key from the chip's random numbers. jCardSim's key
+     * generator is seeded with nothing, so every card it simulates has the
+     * same key (the applet's own note on initCardKeypair says so). Two
+     * simulated cards are then one card to a phone: it files what it knows by
+     * the card's key, and a card set up at one mint and "another" set up at a
+     * second were told apart by nothing. So the generator the applet's key
+     * pair holds is given a seed from this machine, and the pair is made
+     * again. The applet keeps the same key objects, so nothing else in it
+     * needs to know. Reached by reflection, here and nowhere in the applet.
+     */
+    private static void ownKey(CardSimulator sim) {
+        try {
+            java.lang.reflect.Field rt = com.licel.jcardsim.base.Simulator.class.getDeclaredField("runtime");
+            rt.setAccessible(true);
+            Object runtime = rt.get(sim);
+            java.lang.reflect.Method get = com.licel.jcardsim.base.SimulatorRuntime.class
+                    .getDeclaredMethod("getApplet", javacard.framework.AID.class);
+            get.setAccessible(true);
+            Object applet = get.invoke(runtime, AIDUtil.create(APPLET));
+            java.lang.reflect.Field pairField = CashuApplet.class.getDeclaredField("cardKeyPair");
+            pairField.setAccessible(true);
+            javacard.security.KeyPair pair = (javacard.security.KeyPair) pairField.get(applet);
+            java.lang.reflect.Field implField = javacard.security.KeyPair.class.getDeclaredField("impl");
+            implField.setAccessible(true);
+            Object impl = implField.get(pair);
+            java.lang.reflect.Field rndField = impl.getClass().getDeclaredField("rnd");
+            rndField.setAccessible(true);
+            java.security.SecureRandom rnd = (java.security.SecureRandom) rndField.get(impl);
+            byte[] seed = new byte[32];
+            new java.security.SecureRandom().nextBytes(seed);
+            rnd.setSeed(seed);
+            pair.genKeyPair();
+        } catch (Exception e) {
+            System.out.println("  this card has the simulator's one key: " + e);
+        }
     }
 
     public static void main(String[] args) throws Exception {
         int port = args.length > 0 ? Integer.parseInt(args[0]) : 47431;
+        plain = args.length > 1 && args[1].equals("plain");
         CardServer server = new CardServer();
+        server.card = fresh();
         try (ServerSocket listening = new ServerSocket(port, 8, InetAddress.getLoopbackAddress())) {
             System.out.println("a card is on 127.0.0.1:" + port + " (ctl off | on | pull N | new | show)");
             while (true) {
