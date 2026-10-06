@@ -19,7 +19,7 @@ own class in jCardSim, including with a few real sats at your own mint
 
 1. **SPEND with no message from the reader** (3.2). Is rebuilding the secret
    on the card and hashing it there sound, and affordable on a J3R180? It is a
-   string of about 190 bytes and one SHA-256 for each piece, before the
+   string of 170 to 270 bytes and one SHA-256 for each piece, before the
    signature you already make.
 2. **AUTH** (4). Is a signature over a tagged hash a safe way to prove the
    card holds its key, given that the same key signs spends?
@@ -63,7 +63,7 @@ since, the fault is in our reading.
 | 5 | A reader with the PIN can spend every slot in one tap. By design, but the holder has typed their PIN into somebody else's terminal. | A limit, kept on the card, on what one PIN entry may spend. |
 | 6 | The card does not say which mint its pieces are at (an open question in your notes). | A card record names the mint. |
 | 7 | No DLEQ on the card, so a piece cannot be checked without the mint. | Unchanged. Our receiver is always online and always swaps before saying paid. |
-| 8 | Provisioning leaves the GlobalPlatform keys at the factory values, so anyone with a reader can delete the applet and the money with it. | Not the applet's to fix. Our provisioning steps will change them. |
+| 8 | The deployment guide installs with the card's factory GlobalPlatform keys and does not change them afterwards. A card left on them can have the applet deleted, and the money with it, by anyone with a reader. | Not the applet's to fix. Our provisioning steps will change them. |
 | 9 | In flash-pos, when we read it: an exact payment was shown as paid when the swap had failed, and a proof the mint reported as spent was booked as settled, whoever spent it. | Not our code, and you may have fixed it. Our rule is that paid means the mint has given this phone its own pieces. |
 
 Number 2 and number 3 are the ones that matter most. Together they mean the
