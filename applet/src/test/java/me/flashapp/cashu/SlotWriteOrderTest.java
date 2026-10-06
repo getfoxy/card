@@ -24,7 +24,7 @@ import java.util.regex.Pattern;
 /**
  * ENG-620: a proof slot survives the card leaving the field mid-write.
  *
- * A slot is status[1] ‖ keyset[8] ‖ amount[4] ‖ nonce[32] ‖ C[33], and every
+ * A slot is status[1] ‖ keyset[8] ‖ amount[4] ‖ nonce[32] ‖ C[33] ‖ date[4], and every
  * reader trusts the status byte: GET_BALANCE sums the UNSPENT slots and
  * SPEND_PROOF signs for them. So the status byte is the slot's commit. It is
  * written as a single byte, which the JCRE makes atomic, and only after every
@@ -236,6 +236,12 @@ class SlotWriteOrderTest {
         ResponseAPDU select = sim.transmitCommand(new CommandAPDU(
             0x00, 0xA4, 0x04, 0x00, CashuAppletTest.hexToBytes(CashuAppletTest.AID_STR)));
         assertEquals(CashuAppletTest.SW_OK, select.getSW());
+        // the fork loads nothing without a PIN and a card record
+        assertEquals(CashuAppletTest.SW_OK, send(new CommandAPDU(CLA, CashuAppletTest.INS_SET_PIN, 0, 0, CashuAppletTest.TEST_PIN)).getSW());
+        assertEquals(CashuAppletTest.SW_OK, send(new CommandAPDU(CLA, CashuAppletTest.INS_VERIFY_PIN, 0, 0, CashuAppletTest.TEST_PIN)).getSW());
+        byte[] card = new byte[35 + 1];
+        card[34] = 1; card[35] = 'm';
+        assertEquals(CashuAppletTest.SW_OK, send(new CommandAPDU(CLA, CashuAppletTest.INS_SET_CARD, 0, 0, card)).getSW());
         java.lang.reflect.Field field = CashuApplet.class.getDeclaredField("proofStorage");
         field.setAccessible(true);
         storage = (byte[]) field.get(runtime.appletAt(aid));
@@ -258,7 +264,7 @@ class SlotWriteOrderTest {
     }
 
     private ResponseAPDU proofAt(int slot) {
-        return send(new CommandAPDU(CLA, CashuAppletTest.INS_GET_PROOF, slot, 0, 78));
+        return send(new CommandAPDU(CLA, CashuAppletTest.INS_GET_PROOF, slot, 0, 82));
     }
 
     private long balance() {
@@ -276,7 +282,7 @@ class SlotWriteOrderTest {
     }
 
     private byte[] slotBytes(int slot) {
-        return Arrays.copyOfRange(storage, slot * 78, slot * 78 + 78);
+        return Arrays.copyOfRange(storage, slot * 82, slot * 82 + 82);
     }
 
     @Test
@@ -284,8 +290,8 @@ class SlotWriteOrderTest {
     void aTornLoadLeavesTheSlotEmpty() throws Exception {
         freshCard();
         // What LOAD_PROOF leaves when the card goes between the copy and the
-        // commit: the proof's 77 bytes are in, the status still says EMPTY.
-        System.arraycopy(CashuAppletTest.PROOF_1, 0, storage, 1, 77);
+        // commit: the proof's 81 bytes are in, the status still says EMPTY.
+        System.arraycopy(CashuAppletTest.PROOF_1, 0, storage, 1, 81);
 
         assertEquals(0, statuses()[0]);
         assertEquals(0, balance());
@@ -298,7 +304,7 @@ class SlotWriteOrderTest {
         assertEquals(0, loaded.getData()[0], "the torn slot is the first empty one and is reused");
         byte[] slot = proofAt(0).getData();
         assertEquals(1, slot[0]);
-        assertArrayEquals(CashuAppletTest.PROOF_2, Arrays.copyOfRange(slot, 1, 78),
+        assertArrayEquals(CashuAppletTest.PROOF_2, Arrays.copyOfRange(slot, 1, 82),
             "nothing of the torn load's bytes survives the next one");
         assertEquals(500, balance());
     }
@@ -325,7 +331,7 @@ class SlotWriteOrderTest {
         ResponseAPDU halfCleared = proofAt(0);
         assertEquals(CashuAppletTest.SW_OK, halfCleared.getSW());
         byte[] read = halfCleared.getData();
-        assertEquals(78, read.length);
+        assertEquals(82, read.length);
         assertEquals(2, read[0], "a half-cleared slot still reads as spent");
         assertArrayEquals(new byte[4], Arrays.copyOfRange(read, 9, 13),
             "the amount GET_PROOF reports is the zeroed one, not the proof's");
@@ -333,7 +339,7 @@ class SlotWriteOrderTest {
         ResponseAPDU cleared = clearSpent();
         assertEquals(CashuAppletTest.SW_OK, cleared.getSW());
         assertEquals(1, cleared.getData()[0]);
-        assertArrayEquals(new byte[78], slotBytes(0));
+        assertArrayEquals(new byte[82], slotBytes(0));
     }
 
     @Test
@@ -347,7 +353,7 @@ class SlotWriteOrderTest {
 
         ResponseAPDU cleared = clearSpent();
         assertEquals(1, cleared.getData()[0]);
-        assertArrayEquals(new byte[78], slotBytes(0));
+        assertArrayEquals(new byte[82], slotBytes(0));
         assertArrayEquals(unspent, slotBytes(1));
         assertEquals(500, balance());
     }

@@ -12,23 +12,44 @@ import javacardx.crypto.*;
  * spend counters. Provides secp256k1 signing for NUT-11 P2PK spending
  * conditions.
  *
- * AID: D2 76 00 00 85 01 02
+ * This is the Foxy fork (docs/FOXY-CARD-SPEC.md). It is not compatible on
+ * the wire with upstream cashu-javacard, and has an AID of its own so the two
+ * cannot be mistaken for each other:
+ *
+ * AID: F0 46 4F 58 59 43 41 52 44   ("FOXYCARD" after a proprietary F0)
  *
  * Command set:
- *   0x01  GET_INFO         — version, capabilities, slot stats
+ *   0x01  GET_INFO         — version, format, slot stats, PIN state, tries, limit
  *   0x10  GET_PUBKEY       — 33-byte compressed secp256k1 card pubkey
  *   0x11  GET_BALANCE      — sum of unspent proof amounts (uint32)
  *   0x12  GET_PROOF_COUNT  — count of non-empty slots
- *   0x13  GET_PROOF        — full proof data at slot index
+ *   0x13  GET_PROOF        — full proof data at slot index, with its date
  *   0x14  GET_SLOT_STATUS  — bulk 1-byte status for all slots
- *   0x20  SPEND_PROOF      — mark spent + return NUT-11 Schnorr signature
- *   0x21  SIGN_ARBITRARY   — sign 32-byte message (no proof consumed)
- *   0x30  LOAD_PROOF       — store new proof (PIN required if set)
+ *   0x15  AUTH             — prove this is the card: sign the reader's nonce and its own
+ *   0x16  GET_CARD         — the card record: mint, unit, refund key, limit
+ *   0x20  SPEND_PROOF      — mark spent + sign that slot's own secret (no message is taken)
+ *   0x30  LOAD_PROOF       — store new proof (a PIN must be set, and verified)
  *   0x31  CLEAR_SPENT      — free spent slots (PIN required)
- *   0x40  VERIFY_PIN       — verify provisioning PIN
+ *   0x32  SET_CARD         — write the card record (PIN; only with nothing unspent)
+ *   0x33  SET_LIMIT        — the most one PIN entry may spend (PIN)
+ *   0x40  VERIFY_PIN       — verify the PIN
  *   0x41  SET_PIN          — set PIN (first-time, personalization only)
  *   0x42  CHANGE_PIN       — change PIN (current PIN session required)
  *   0x50  LOCK_CARD        — permanently disable write operations
+ *
+ * What the fork changes, and why (the spec's section 4):
+ *   - SPEND_PROOF takes no message. Upstream signed 32 bytes the reader
+ *     supplied, so a reader could have slot A burned for slot B's signature,
+ *     and the SPENT flag bound nothing. The card now rebuilds the slot's own
+ *     NUT-10 secret and signs its hash.
+ *   - SIGN_ARBITRARY is gone. It signed anything and burned nothing. AUTH is
+ *     what is left of "prove you are the card", over a tagged hash that no
+ *     secret can hash to.
+ *   - Nothing is loaded onto a card with no PIN.
+ *   - One PIN entry spends no more than the card's limit.
+ *   - A slot carries a date, and the card a refund key, so a lost or blocked
+ *     card's pieces can be taken back by whoever loaded them.
+ *   - The card says which mint its pieces are at.
  *
  * @see <a href="https://github.com/lnflash/cashu-javacard">cashu-javacard</a>
  * @see spec/APDU.md for full command reference
@@ -49,8 +70,12 @@ public class CashuApplet extends Applet {
     // but main tracked a 0.3 CAP with the old order, and SELECT's version is
     // all an installed card reports about its build.
     // -------------------------------------------------------------------------
-    static final byte VERSION_MAJOR = (byte) 0x00;
-    static final byte VERSION_MINOR = (byte) 0x04;
+    //
+    // 1.0 is the Foxy fork: another AID, another slot, another SPEND_PROOF.
+    // FORMAT is what a reader checks before it reads a slot.
+    static final byte VERSION_MAJOR = (byte) 0x01;
+    static final byte VERSION_MINOR = (byte) 0x00;
+    static final byte FORMAT        = (byte) 0x02;
 
     // -------------------------------------------------------------------------
     // APDU instruction bytes
@@ -61,19 +86,23 @@ public class CashuApplet extends Applet {
     static final byte INS_GET_PROOF_COUNT  = (byte) 0x12;
     static final byte INS_GET_PROOF        = (byte) 0x13;
     static final byte INS_GET_SLOT_STATUS  = (byte) 0x14;
+    static final byte INS_AUTH             = (byte) 0x15;
+    static final byte INS_GET_CARD         = (byte) 0x16;
     static final byte INS_SPEND_PROOF      = (byte) 0x20;
-    static final byte INS_SIGN_ARBITRARY   = (byte) 0x21;
+    // 0x21 was SIGN_ARBITRARY. It answers 6D00 and must stay unassigned.
     static final byte INS_LOAD_PROOF       = (byte) 0x30;
     static final byte INS_CLEAR_SPENT      = (byte) 0x31;
+    static final byte INS_SET_CARD         = (byte) 0x32;
+    static final byte INS_SET_LIMIT        = (byte) 0x33;
     static final byte INS_VERIFY_PIN       = (byte) 0x40;
     static final byte INS_SET_PIN          = (byte) 0x41;
     static final byte INS_CHANGE_PIN       = (byte) 0x42;
     static final byte INS_LOCK_CARD        = (byte) 0x50;
 
     // -------------------------------------------------------------------------
-    // Proof slot layout constants (78 bytes per slot)
+    // Proof slot layout constants (82 bytes per slot: upstream's 78 and a date)
     // -------------------------------------------------------------------------
-    static final short PROOF_SIZE          = (short) 78;
+    static final short PROOF_SIZE          = (short) 82;
     static final short PROOF_STATUS_OFFSET = (short) 0;
     static final short PROOF_KEYSET_OFFSET = (short) 1;
     static final short PROOF_AMOUNT_OFFSET = (short) 9;
@@ -82,14 +111,35 @@ public class CashuApplet extends Applet {
     // secret from this nonce plus GET_PUBKEY. See spec/NUT-XX.md.
     static final short PROOF_NONCE_OFFSET  = (short) 13;
     static final short PROOF_C_OFFSET      = (short) 45;
+    // The piece's NUT-11 locktime, big-endian seconds, or 0 for none. With a
+    // date the piece's secret also names the card's refund key, which may
+    // spend it once the date has passed (spec section 6).
+    static final short PROOF_DATE_OFFSET   = (short) 78;
 
-    static final short PROOF_DATA_LEN      = (short) 77;  // PROOF_SIZE - 1 (no status byte on input)
+    static final short PROOF_DATA_LEN      = (short) 81;  // PROOF_SIZE - 1 (no status byte on input)
 
     static final byte STATUS_EMPTY   = (byte) 0x00;
     static final byte STATUS_UNSPENT = (byte) 0x01;
     static final byte STATUS_SPENT   = (byte) 0x02;
 
-    static final short MAX_PROOFS = (short) 32;
+    static final short MAX_PROOFS = (short) 64;
+
+    // -------------------------------------------------------------------------
+    // The card record (persistent): which mint, which unit, who may take the
+    // pieces back, and how much one PIN entry may spend.
+    // -------------------------------------------------------------------------
+    static final short CARD_SET_OFFSET     = (short) 0;   // 1 once SET_CARD has run
+    static final short CARD_UNIT_OFFSET    = (short) 1;   // 0 = sat
+    static final short CARD_LIMIT_OFFSET   = (short) 2;   // 4 bytes, 0 = no limit
+    static final short CARD_REFUND_OFFSET  = (short) 6;   // 33 bytes, zeros = none
+    static final short CARD_MINTLEN_OFFSET = (short) 39;
+    static final short CARD_MINT_OFFSET    = (short) 40;
+    static final short CARD_MINT_MAX       = (short) 96;
+    static final short CARD_RECORD_LEN     = (short) 136;
+    // SET_CARD's data: unit, refund key, mint length, mint
+    static final short SET_CARD_FIXED      = (short) 35;
+
+    static final short AUTH_NONCE_LEN      = (short) 16;
 
     // -------------------------------------------------------------------------
     // Status words
@@ -106,6 +156,11 @@ public class CashuApplet extends Applet {
     static final short SW_SLOT_OUT_OF_RANGE     = (short) 0x6A83;
     static final short SW_CRYPTO_ERROR          = (short) 0x6F00;
     static final short SW_CARD_LOCKED           = (short) 0x6985;
+    // The fork's own, in a part of 6Axx ISO 7816-4 leaves unassigned
+    static final short SW_NO_CARD_RECORD        = (short) 0x6A8C; // LOAD_PROOF before SET_CARD
+    static final short SW_CARD_IN_USE           = (short) 0x6A8D; // SET_CARD with pieces unspent
+    static final short SW_NO_REFUND_KEY         = (short) 0x6A8E; // a dated piece on a card with no refund key
+    static final short SW_OVER_LIMIT            = (short) 0x6A8F; // this PIN entry has spent its limit
 
     // LOCK_CARD confirmation byte
     static final byte LOCK_CONFIRM_BYTE = (byte) 0xDE;
@@ -160,6 +215,38 @@ public class CashuApplet extends Applet {
     };
 
     // -------------------------------------------------------------------------
+    // A piece's NUT-10 secret, as text. The card signs SHA-256 of exactly this
+    // (NUT-11), so it is the wire format between the card and whoever made the
+    // piece: no spaces, this key order, lowercase hex, the date in decimal.
+    //
+    //   ["P2PK",{"nonce":"<64 hex>","data":"<66 hex card key>","tags":[["sigflag","SIG_INPUTS"]]}]
+    //
+    // and with a date:
+    //
+    //   ...,"tags":[["sigflag","SIG_INPUTS"],["locktime","<date>"],["refund","<66 hex>"]]}]
+    //
+    // The first form is upstream's, byte for byte.
+    // -------------------------------------------------------------------------
+    private static final byte[] SECRET_1 = {   // ["P2PK",{"nonce":"
+        '[','"','P','2','P','K','"',',','{','"','n','o','n','c','e','"',':','"' };
+    private static final byte[] SECRET_2 = {   // ","data":"
+        '"',',','"','d','a','t','a','"',':','"' };
+    private static final byte[] SECRET_3 = {   // ","tags":[["sigflag","SIG_INPUTS"]
+        '"',',','"','t','a','g','s','"',':','[','[','"','s','i','g','f','l','a','g','"',',',
+        '"','S','I','G','_','I','N','P','U','T','S','"',']' };
+    private static final byte[] SECRET_DATE = {   // ,["locktime","
+        ',','[','"','l','o','c','k','t','i','m','e','"',',','"' };
+    private static final byte[] SECRET_REFUND = { // "],["refund","
+        '"',']',',','[','"','r','e','f','u','n','d','"',',','"' };
+    private static final byte[] SECRET_END_DATED = { '"',']',']','}',']' };   // "]]}]
+    private static final byte[] SECRET_END = { ']','}',']' };                  // ]}]
+    private static final byte[] HEX = {
+        '0','1','2','3','4','5','6','7','8','9','a','b','c','d','e','f' };
+    /** AUTH's tag: the message signed is SHA-256(SHA-256(tag) || SHA-256(tag) || ...). */
+    private static final byte[] AUTH_TAG = {
+        'F','o','x','y','C','a','r','d','/','a','u','t','h' };
+
+    // -------------------------------------------------------------------------
     // Persistent state (EEPROM)
     // -------------------------------------------------------------------------
 
@@ -174,6 +261,12 @@ public class CashuApplet extends Applet {
 
     /** The provisioning PIN (up to PIN_MAX_LEN bytes) */
     private OwnerPIN pin;
+
+    /** The card record (CARD_RECORD_LEN bytes) */
+    private byte[] cardRecord;
+
+    /** SHA-256 of AUTH_TAG, worked out once at install */
+    private byte[] authTagHash;
 
     // -------------------------------------------------------------------------
     // Card keypair (persistent, generated once on install)
@@ -206,6 +299,25 @@ public class CashuApplet extends Applet {
      */
     private byte[] pinVerifiedFlag;
 
+    /** What this PIN entry has spent so far, 4 bytes big-endian. Cleared on deselect and by VERIFY_PIN. */
+    private byte[] spentThisPin;
+
+    // Scratch for building a secret's hash and AUTH's (D10: allocated once).
+    //   0..65   hex text of the value being hashed
+    //   66..97  the 32-byte message
+    //   98..107 a date's decimal digits
+    //   108..111 a copy of a date, divided away
+    //   112..115 a sum
+    private static final short X_HEX   = (short) 0;
+    private static final short X_MSG   = (short) 66;
+    private static final short X_DEC   = (short) 98;
+    private static final short X_NUM   = (short) 108;
+    private static final short X_SUM   = (short) 112;
+    private static final short X_LEN   = (short) 116;
+    private byte[] scratch;
+    private MessageDigest sha;
+    private RandomData rng;
+
     // -------------------------------------------------------------------------
     // Install / init
     // -------------------------------------------------------------------------
@@ -219,7 +331,15 @@ public class CashuApplet extends Applet {
         cardLocked      = new byte[1];
         pinState        = new byte[1];
         pin             = new OwnerPIN(PIN_MAX_TRIES, (byte) PIN_MAX_LEN);
+        cardRecord      = new byte[CARD_RECORD_LEN];
+        authTagHash     = new byte[32];
         pinVerifiedFlag = JCSystem.makeTransientByteArray((short) 1, JCSystem.CLEAR_ON_DESELECT);
+        spentThisPin    = JCSystem.makeTransientByteArray((short) 4, JCSystem.CLEAR_ON_DESELECT);
+        scratch         = JCSystem.makeTransientByteArray(X_LEN, JCSystem.CLEAR_ON_DESELECT);
+        sha             = MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
+        rng             = RandomData.getInstance(RandomData.ALG_SECURE_RANDOM);
+        sha.reset();
+        sha.doFinal(AUTH_TAG, (short) 0, (short) AUTH_TAG.length, authTagHash, (short) 0);
         initCardKeypair();
 
         schnorrHW = new SchnorrHW(SECP256K1_G, SECP256K1_P,
@@ -301,10 +421,13 @@ public class CashuApplet extends Applet {
             case INS_GET_PROOF_COUNT:  processGetProofCount(apdu);  break;
             case INS_GET_PROOF:        processGetProof(apdu);       break;
             case INS_GET_SLOT_STATUS:  processGetSlotStatus(apdu);  break;
+            case INS_AUTH:             processAuth(apdu);           break;
+            case INS_GET_CARD:         processGetCard(apdu);        break;
             case INS_SPEND_PROOF:      processSpendProof(apdu);     break;
-            case INS_SIGN_ARBITRARY:   processSignArbitrary(apdu);  break;
             case INS_LOAD_PROOF:       processLoadProof(apdu);      break;
             case INS_CLEAR_SPENT:      processClearSpent(apdu);     break;
+            case INS_SET_CARD:         processSetCard(apdu);        break;
+            case INS_SET_LIMIT:        processSetLimit(apdu);       break;
             case INS_VERIFY_PIN:       processVerifyPin(apdu);      break;
             case INS_SET_PIN:          processSetPin(apdu);         break;
             case INS_CHANGE_PIN:       processChangePin(apdu);      break;
@@ -339,7 +462,14 @@ public class CashuApplet extends Applet {
         //   bit2 = PIN supported (always set)
         buf[6] = (byte) 0x07; // secp256k1 + Schnorr + PIN
         buf[7] = pinState[0];
-        apdu.setOutgoingAndSend((short) 0, (short) 8);
+        // The fork's: the first eight bytes are upstream's, so a reader that
+        // knows only those still reads them right.
+        buf[8]  = FORMAT;
+        buf[9]  = pin.getTriesRemaining();
+        buf[10] = cardLocked[0];
+        buf[11] = cardRecord[CARD_SET_OFFSET];
+        Util.arrayCopyNonAtomic(cardRecord, CARD_LIMIT_OFFSET, buf, (short) 12, (short) 4);
+        apdu.setOutgoingAndSend((short) 0, (short) 16);
     }
 
     private void processGetPubkey(APDU apdu) {
@@ -441,29 +571,108 @@ public class CashuApplet extends Applet {
         if (status == STATUS_EMPTY)  ISOException.throwIt(SW_SLOT_EMPTY);
         if (status == STATUS_SPENT)  ISOException.throwIt(SW_ALREADY_SPENT);
 
-        short msgLen = apdu.setIncomingAndReceive();
-        if (msgLen != (short) 32) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        /* The limit, before anything is burned. What this PIN entry has
+         * signed so far and this piece must not pass it. A terminal sees the
+         * PIN and picks the slots, so without this one PIN entry was worth
+         * the whole card to it; with it, more needs the PIN typed again. */
+        Util.arrayCopyNonAtomic(spentThisPin, (short) 0, scratch, X_SUM, (short) 4);
+        short carry = addUint32Carry(scratch, X_SUM, proofStorage, (short)(base + PROOF_AMOUNT_OFFSET));
+        if (!isZero(cardRecord, CARD_LIMIT_OFFSET, (short) 4)
+            && (carry != 0 || cmpUint32(scratch, X_SUM, cardRecord, CARD_LIMIT_OFFSET) > 0)) {
+            ISOException.throwIt(SW_OVER_LIMIT);
+        }
+
+        /* The message is the card's to work out. Upstream took 32 bytes from
+         * the reader here, and signed them: slot A could be burned for slot
+         * B's signature, or for anything at all, so SPENT bound nothing.
+         * Nothing the reader sends reaches the signer now. Built before the
+         * burn: it changes no state, and a fault in it must not cost a piece. */
+        secretHash(base, buf);
 
         // ATOMIC: mark spent BEFORE signing.
         // If signing fails, the proof is still consumed — this prevents an
         // attacker from aborting the transaction to reset the spent flag.
         proofStorage[(short)(base + PROOF_STATUS_OFFSET)] = STATUS_SPENT;
+        Util.arrayCopyNonAtomic(scratch, X_SUM, spentThisPin, (short) 0, (short) 4);
 
-        short sigLen = doSign(buf, ISO7816.OFFSET_CDATA, (short) 32, buf, (short) 0);
+        short sigLen = schnorrHW.sign(cardPrivKey, cardPubKey, scratch, X_MSG, buf, (short) 0);
         apdu.setOutgoingAndSend((short) 0, sigLen);
     }
 
-    private void processSignArbitrary(APDU apdu) {
-        // D13: the signature is a spend authorisation under the card's key,
-        // so it is gated exactly like SPEND_PROOF.
-        requirePinIfSet();
+    /**
+     * SHA-256 of the NUT-10 secret of the piece at `base`, into scratch[X_MSG].
+     * `buf` is the APDU buffer, used for the card's public key.
+     */
+    private void secretHash(short base, byte[] buf) {
+        sha.reset();
+        sha.update(SECRET_1, (short) 0, (short) SECRET_1.length);
+        toHex(proofStorage, (short)(base + PROOF_NONCE_OFFSET), (short) 32);
+        sha.update(scratch, X_HEX, (short) 64);
+        sha.update(SECRET_2, (short) 0, (short) SECRET_2.length);
+        short len = toCompressed(buf, cardPubKey.getW(buf, (short) 0));
+        toHex(buf, (short) 0, len);
+        sha.update(scratch, X_HEX, (short) 66);
+        sha.update(SECRET_3, (short) 0, (short) SECRET_3.length);
+        if (isZero(proofStorage, (short)(base + PROOF_DATE_OFFSET), (short) 4)) {
+            sha.doFinal(SECRET_END, (short) 0, (short) SECRET_END.length, scratch, X_MSG);
+            return;
+        }
+        sha.update(SECRET_DATE, (short) 0, (short) SECRET_DATE.length);
+        short digits = toDecimal(proofStorage, (short)(base + PROOF_DATE_OFFSET));
+        sha.update(scratch, (short)(X_DEC + 10 - digits), digits);
+        sha.update(SECRET_REFUND, (short) 0, (short) SECRET_REFUND.length);
+        toHex(cardRecord, CARD_REFUND_OFFSET, (short) 33);
+        sha.update(scratch, X_HEX, (short) 66);
+        sha.doFinal(SECRET_END_DATED, (short) 0, (short) SECRET_END_DATED.length, scratch, X_MSG);
+    }
 
+    /**
+     * AUTH: that this is the card whose key GET_PUBKEY gives.
+     *
+     * The reader sends 16 random bytes. The card answers 16 of its own and a
+     * BIP-340 signature over
+     *
+     *   SHA-256( SHA-256("FoxyCard/auth") || SHA-256("FoxyCard/auth")
+     *            || reader's 16 || card's 16 || the card's key, compressed )
+     *
+     * No PIN: it spends nothing and says only what GET_PUBKEY already has. It
+     * is not SIGN_ARBITRARY by another name. That signed the reader's 32 bytes
+     * as they came, which could be a piece's own message; here the reader's
+     * bytes are hashed under a tag with the card's, and a spend's message is
+     * the hash of a secret's text, which no such hash can equal.
+     */
+    private void processAuth(APDU apdu) {
+        short len = apdu.setIncomingAndReceive();
+        if (len != AUTH_NONCE_LEN) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         byte[] buf = apdu.getBuffer();
-        short msgLen = apdu.setIncomingAndReceive();
-        if (msgLen != (short) 32) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
 
-        short sigLen = doSign(buf, ISO7816.OFFSET_CDATA, (short) 32, buf, (short) 0);
-        apdu.setOutgoingAndSend((short) 0, sigLen);
+        sha.reset();
+        sha.update(authTagHash, (short) 0, (short) 32);
+        sha.update(authTagHash, (short) 0, (short) 32);
+        sha.update(buf, ISO7816.OFFSET_CDATA, AUTH_NONCE_LEN);
+        // the card's own, kept in scratch while the buffer is used for the key
+        rng.generateData(scratch, X_HEX, AUTH_NONCE_LEN);
+        sha.update(scratch, X_HEX, AUTH_NONCE_LEN);
+        short keyLen = toCompressed(buf, cardPubKey.getW(buf, (short) 0));
+        sha.doFinal(buf, (short) 0, keyLen, scratch, X_MSG);
+
+        Util.arrayCopyNonAtomic(scratch, X_HEX, buf, (short) 0, AUTH_NONCE_LEN);
+        short sigLen = schnorrHW.sign(cardPrivKey, cardPubKey, scratch, X_MSG, buf, AUTH_NONCE_LEN);
+        apdu.setOutgoingAndSend((short) 0, (short)(AUTH_NONCE_LEN + sigLen));
+    }
+
+    /** GET_CARD: format, whether the record is set, unit, limit, refund key, mint. */
+    private void processGetCard(APDU apdu) {
+        byte[] buf = apdu.getBuffer();
+        short mintLen = (short)(cardRecord[CARD_MINTLEN_OFFSET] & 0xFF);
+        buf[0] = FORMAT;
+        buf[1] = cardRecord[CARD_SET_OFFSET];
+        buf[2] = cardRecord[CARD_UNIT_OFFSET];
+        Util.arrayCopyNonAtomic(cardRecord, CARD_LIMIT_OFFSET, buf, (short) 3, (short) 4);
+        Util.arrayCopyNonAtomic(cardRecord, CARD_REFUND_OFFSET, buf, (short) 7, (short) 33);
+        buf[40] = (byte) mintLen;
+        Util.arrayCopyNonAtomic(cardRecord, CARD_MINT_OFFSET, buf, (short) 41, mintLen);
+        apdu.setOutgoingAndSend((short) 0, (short)(41 + mintLen));
     }
 
     // -------------------------------------------------------------------------
@@ -472,7 +681,10 @@ public class CashuApplet extends Applet {
 
     private void processLoadProof(APDU apdu) {
         requireNotLocked();
-        requirePinIfSet();
+        // Nothing goes onto a card with no PIN: upstream's did, and then any
+        // reader in range could spend it.
+        requirePinSetAndVerified();
+        if (cardRecord[CARD_SET_OFFSET] != (byte) 1) ISOException.throwIt(SW_NO_CARD_RECORD);
 
         short slot = -1;
         for (short i = 0; i < MAX_PROOFS; i++) {
@@ -487,6 +699,19 @@ public class CashuApplet extends Applet {
         if (dataLen != PROOF_DATA_LEN) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
 
         byte[] buf = apdu.getBuffer();
+        /* A piece with a date names the card's refund key in its secret, so a
+         * card with none cannot hold one: the card could not build the secret
+         * the mint signed, and its signature would be worth nothing. */
+        if (!isZero(buf, (short)(ISO7816.OFFSET_CDATA + PROOF_DATE_OFFSET - 1), (short) 4)
+            && cardRecord[CARD_REFUND_OFFSET] == (byte) 0) {
+            ISOException.throwIt(SW_NO_REFUND_KEY);
+        }
+        // not a point, or worth nothing: not a piece
+        byte c0 = buf[(short)(ISO7816.OFFSET_CDATA + PROOF_C_OFFSET - 1)];
+        if ((c0 != (byte) 0x02 && c0 != (byte) 0x03)
+            || isZero(buf, (short)(ISO7816.OFFSET_CDATA + PROOF_AMOUNT_OFFSET - 1), (short) 4)) {
+            ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+        }
         short base = (short)(slot * PROOF_SIZE);
         // The status byte is the slot's commit, written last (D14, ENG-620).
         // Util.arrayCopy into persistent memory is atomic, and so is a single
@@ -524,6 +749,57 @@ public class CashuApplet extends Applet {
         apdu.setOutgoingAndSend((short) 0, (short) 1);
     }
 
+    /**
+     * SET_CARD: unit (1), refund key (33, zeros for none), mint length (1), mint.
+     *
+     * Only with nothing unspent on the card. The refund key is part of every
+     * dated piece's secret and the mint is where every piece is, so changing
+     * either under pieces already loaded would leave them unspendable or
+     * unfindable. One transaction: the record is whole or as it was.
+     */
+    private void processSetCard(APDU apdu) {
+        requireNotLocked();
+        requirePinSetAndVerified();
+        for (short i = 0; i < MAX_PROOFS; i++) {
+            if (proofStorage[(short)(i * PROOF_SIZE + PROOF_STATUS_OFFSET)] == STATUS_UNSPENT) {
+                ISOException.throwIt(SW_CARD_IN_USE);
+            }
+        }
+        short dataLen = apdu.setIncomingAndReceive();
+        byte[] buf = apdu.getBuffer();
+        short off = ISO7816.OFFSET_CDATA;
+        if (dataLen < SET_CARD_FIXED) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        short mintLen = (short)(buf[(short)(off + 34)] & 0xFF);
+        if (mintLen < 1 || mintLen > CARD_MINT_MAX || dataLen != (short)(SET_CARD_FIXED + mintLen)) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+        // a refund key is a compressed point, or 33 zeros for none
+        byte r0 = buf[(short)(off + 1)];
+        if (r0 == (byte) 0) {
+            if (!isZero(buf, (short)(off + 1), (short) 33)) ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+        } else if (r0 != (byte) 0x02 && r0 != (byte) 0x03) {
+            ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+        }
+        JCSystem.beginTransaction();
+        cardRecord[CARD_UNIT_OFFSET] = buf[off];
+        Util.arrayCopy(buf, (short)(off + 1), cardRecord, CARD_REFUND_OFFSET, (short) 33);
+        cardRecord[CARD_MINTLEN_OFFSET] = (byte) mintLen;
+        Util.arrayCopy(buf, (short)(off + 35), cardRecord, CARD_MINT_OFFSET, mintLen);
+        cardRecord[CARD_SET_OFFSET] = (byte) 1;
+        JCSystem.commitTransaction();
+    }
+
+    /** SET_LIMIT: 4 bytes, the most one PIN entry may spend; zeros for no limit. */
+    private void processSetLimit(APDU apdu) {
+        requireNotLocked();
+        requirePinSetAndVerified();
+        short dataLen = apdu.setIncomingAndReceive();
+        if (dataLen != (short) 4) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        byte[] buf = apdu.getBuffer();
+        // four bytes in one copy: atomic, so the limit is the old one or the new
+        Util.arrayCopy(buf, ISO7816.OFFSET_CDATA, cardRecord, CARD_LIMIT_OFFSET, (short) 4);
+    }
+
     // -------------------------------------------------------------------------
     // Category 0x4x — Authentication
     // -------------------------------------------------------------------------
@@ -541,6 +817,8 @@ public class CashuApplet extends Applet {
         boolean ok = pin.check(buf, ISO7816.OFFSET_CDATA, (byte) pinLen);
         if (!ok) failPinCheck();
         pinVerifiedFlag[0] = (byte) 1;
+        // each PIN entry has the limit to itself
+        Util.arrayFillNonAtomic(spentThisPin, (short) 0, (short) 4, (byte) 0);
     }
 
     /**
@@ -645,33 +923,21 @@ public class CashuApplet extends Applet {
         }
     }
 
-    private void requirePinVerified() {
-        if (pinVerifiedFlag[0] != (byte) 1) {
+    /**
+     * For what writes value onto the card: a PIN must exist and be verified.
+     * requirePinIfSet lets a card with no PIN through, which is right for a
+     * spend on an empty card and wrong for loading one.
+     */
+    private void requirePinSetAndVerified() {
+        if (pinState[0] != (byte) 1 || pinVerifiedFlag[0] != (byte) 1) {
             ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Signing
-    // -------------------------------------------------------------------------
-
-    /**
-     * BIP-340 Schnorr sign over a 32-byte message: sig = (R.x || s), 64 bytes.
-     * Delegates to SchnorrHW (JavaCard-native crypto).
-     *
-     * @param msg    source buffer containing the 32-byte message
-     * @param msgOff offset of the message in the source buffer
-     * @param msgLen message length (must be 32)
-     * @param out    output buffer (receives the 64-byte signature)
-     * @param outOff offset in the output buffer
-     * @return 64 (signature length)
-     */
-    private short doSign(byte[] msg, short msgOff, short msgLen,
-                         byte[] out, short outOff) {
-        if (msgLen != (short) 32) {
-            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+    private void requirePinVerified() {
+        if (pinVerifiedFlag[0] != (byte) 1) {
+            ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
         }
-        return schnorrHW.sign(cardPrivKey, cardPubKey, msg, msgOff, out, outOff);
     }
 
     // -------------------------------------------------------------------------
@@ -699,5 +965,65 @@ public class CashuApplet extends Applet {
             acc[(short)(accOff + i)] = (byte) (sum & 0xFF);
             carry = (short) ((sum >> 8) & 0xFF);
         }
+    }
+    /** The same add, answering the carry out of the top byte (1 if the sum passed 2^32-1). */
+    private static short addUint32Carry(byte[] acc, short accOff, byte[] src, short srcOff) {
+        short carry = 0;
+        for (short i = 3; i >= 0; i--) {
+            short sum = (short) ((short)(acc[(short)(accOff + i)] & 0xFF)
+                               + (short)(src[(short)(srcOff + i)] & 0xFF)
+                               + carry);
+            acc[(short)(accOff + i)] = (byte) (sum & 0xFF);
+            carry = (short) ((sum >> 8) & 0xFF);
+        }
+        return carry;
+    }
+
+    /** Compare two big-endian uint32s: negative, zero or positive as a is below, equal to or above b. */
+    private static short cmpUint32(byte[] a, short aOff, byte[] b, short bOff) {
+        for (short i = 0; i < 4; i++) {
+            short x = (short)(a[(short)(aOff + i)] & 0xFF);
+            short y = (short)(b[(short)(bOff + i)] & 0xFF);
+            if (x != y) return (short)(x - y);
+        }
+        return (short) 0;
+    }
+
+    private static boolean isZero(byte[] a, short off, short len) {
+        byte any = 0;
+        for (short i = 0; i < len; i++) any |= a[(short)(off + i)];
+        return any == (byte) 0;
+    }
+
+    /** `len` bytes, 33 at most, as lowercase hex text into scratch[X_HEX]. */
+    private void toHex(byte[] src, short off, short len) {
+        for (short i = 0; i < len; i++) {
+            short v = (short)(src[(short)(off + i)] & 0xFF);
+            scratch[(short)(X_HEX + 2 * i)]     = HEX[(short)(v >> 4)];
+            scratch[(short)(X_HEX + 2 * i + 1)] = HEX[(short)(v & 0x0F)];
+        }
+    }
+
+    /**
+     * A big-endian uint32 as decimal text, right-aligned in the ten bytes at
+     * scratch[X_DEC], with no leading zeros. Answers how many digits.
+     *
+     * JavaCard has no long and int is optional, so it is long division by
+     * ten, a byte at a time: the running value never passes 9*256+255.
+     */
+    private short toDecimal(byte[] src, short off) {
+        Util.arrayCopyNonAtomic(src, off, scratch, X_NUM, (short) 4);
+        short digits = 0;
+        do {
+            short rem = 0;
+            for (short i = 0; i < 4; i++) {
+                short cur = (short)((short)(rem << 8) | (short)(scratch[(short)(X_NUM + i)] & 0xFF));
+                scratch[(short)(X_NUM + i)] = (byte)(cur / 10);
+                rem = (short)(cur % 10);
+            }
+            digits++;
+            scratch[(short)(X_DEC + 10 - digits)] = (byte)('0' + rem);
+        } while (!isZero(scratch, X_NUM, (short) 4));
+        return digits;
     }
 }

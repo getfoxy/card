@@ -7,896 +7,606 @@ import org.junit.jupiter.api.*;
 
 import javax.smartcardio.CommandAPDU;
 import javax.smartcardio.ResponseAPDU;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * jCardSim test suite for CashuApplet.
+ * jCardSim tests for the Foxy fork of the applet (docs/FOXY-CARD-SPEC.md).
  *
- * Tests cover all 14 APDU commands across 5 categories:
- *   - Read:     GET_INFO, GET_PUBKEY, GET_BALANCE, GET_PROOF_COUNT, GET_PROOF, GET_SLOT_STATUS
- *   - Spend:    SPEND_PROOF, SIGN_ARBITRARY
- *   - Write:    LOAD_PROOF, CLEAR_SPENT
- *   - Auth:     VERIFY_PIN, SET_PIN, CHANGE_PIN
- *   - Admin:    LOCK_CARD
- *
- * ENG-181 complete: secp256k1 curve params set + BIP-340 Schnorr implemented.
- * Signature tests verify cryptographic correctness using BigInteger Schnorr verify.
+ * Upstream's tests were of another wire format: a 78-byte slot, a SPEND_PROOF
+ * that signed the reader's bytes, SIGN_ARBITRARY, and cards loaded with no PIN.
+ * These are of this one. The helpers at the end (the BIP-340 verifier and its
+ * arithmetic) are upstream's, and the Schnorr tests beside this file still use
+ * them.
  */
-@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class CashuAppletTest {
 
-    static final String AID_HEX = "D276000085010200";  // includes trailing class byte for AIDUtil
-    static final String AID_STR = "D2760000850102";
+    static final String AID_HEX = "F0464F58594341524401";  // the applet's, for AIDUtil
+    static final String AID_STR = "F0464F585943415244";      // the package's: SELECT matches by prefix
+    static final String UPSTREAM_AID = "D2760000850102";
     static final byte   CLA     = (byte) 0xB0;
 
-    // Instruction bytes
     static final byte INS_GET_INFO         = (byte) 0x01;
     static final byte INS_GET_PUBKEY       = (byte) 0x10;
     static final byte INS_GET_BALANCE      = (byte) 0x11;
     static final byte INS_GET_PROOF_COUNT  = (byte) 0x12;
     static final byte INS_GET_PROOF        = (byte) 0x13;
     static final byte INS_GET_SLOT_STATUS  = (byte) 0x14;
+    static final byte INS_AUTH             = (byte) 0x15;
+    static final byte INS_GET_CARD         = (byte) 0x16;
     static final byte INS_SPEND_PROOF      = (byte) 0x20;
-    static final byte INS_SIGN_ARBITRARY   = (byte) 0x21;
+    static final byte INS_SIGN_ARBITRARY   = (byte) 0x21;   // upstream's; gone
     static final byte INS_LOAD_PROOF       = (byte) 0x30;
     static final byte INS_CLEAR_SPENT      = (byte) 0x31;
+    static final byte INS_SET_CARD         = (byte) 0x32;
+    static final byte INS_SET_LIMIT        = (byte) 0x33;
     static final byte INS_VERIFY_PIN       = (byte) 0x40;
     static final byte INS_SET_PIN          = (byte) 0x41;
     static final byte INS_CHANGE_PIN       = (byte) 0x42;
     static final byte INS_LOCK_CARD        = (byte) 0x50;
 
-    // Status words
     static final int SW_OK                  = 0x9000;
     static final int SW_WRONG_LENGTH        = 0x6700;
     static final int SW_SECURITY_NOT_SATIS  = 0x6982;
     static final int SW_PIN_BLOCKED         = 0x6983;
     static final int SW_PIN_NOT_SET         = 0x6984;
     static final int SW_CONDITIONS_NOT_SATIS= 0x6985;
+    static final int SW_NOT_ALLOWED         = 0x6986;
+    static final int SW_WRONG_DATA          = 0x6A80;
     static final int SW_SLOT_OUT_OF_RANGE   = 0x6A83;
     static final int SW_NO_SPACE            = 0x6A84;
     static final int SW_SLOT_EMPTY          = 0x6A88;
+    static final int SW_NO_CARD_RECORD      = 0x6A8C;
+    static final int SW_CARD_IN_USE         = 0x6A8D;
+    static final int SW_NO_REFUND_KEY       = 0x6A8E;
+    static final int SW_OVER_LIMIT          = 0x6A8F;
     static final int SW_INS_NOT_SUPPORTED   = 0x6D00;
     static final int SW_CLA_NOT_SUPPORTED   = 0x6E00;
 
-    static final int MAX_PROOFS = 32;
+    static final int MAX_PROOFS = 64;
+    static final int SLOT = 82;
 
-    // PIN bytes used across tests
-    static final byte[] TEST_PIN     = { 0x31, 0x32, 0x33, 0x34 };  // "1234"
-    static final byte[] WRONG_PIN    = { 0x00, 0x00, 0x00, 0x00 };
-    static final byte[] NEW_PIN      = { 0x35, 0x36, 0x37, 0x38 };  // "5678"
+    static final byte[] TEST_PIN  = { 0x31, 0x32, 0x33, 0x34 };
+    static final byte[] WRONG_PIN = { 0x39, 0x39, 0x39, 0x39 };
+    static final byte[] NEW_PIN   = { 0x35, 0x36, 0x37, 0x38 };
 
-    // Sample proof data (77 bytes = keyset_id[8] + amount[4] + nonce[32] + C[33]).
-    // Full 16-hex-char NUT-02 keyset ids, as a real mint issues them.
+    static final String KEYSET = "0059534ce0bfa19a";
+    // two pieces the write-order tests load (SlotWriteOrderTest)
     static final byte[] PROOF_1 = buildProof("0059534ce0bfa19a", 1000, 1);
     static final byte[] PROOF_2 = buildProof("008288762774ace1", 500, 2);
+    static final String MINT = "https://mint.example.com/Bitcoin";
+    /** A refund key: the curve's generator, compressed. Any point will do. */
+    static final byte[] REFUND = hexToBytes("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798");
+    static final byte[] NO_REFUND = new byte[33];
 
     private CardSimulator simulator;
 
     @BeforeEach
     void setup() {
-        simulator = new CardSimulator();
-        AID appletAID = AIDUtil.create(AID_HEX);
-        simulator.installApplet(appletAID, CashuApplet.class);
-        // SELECT the applet
-        CommandAPDU selectApdu = new CommandAPDU(
-            0x00, 0xA4, 0x04, 0x00,
-            hexToBytes(AID_STR)
-        );
-        ResponseAPDU resp = simulator.transmitCommand(selectApdu);
-        assertEquals(SW_OK, resp.getSW(), "SELECT should succeed");
-        assertEquals(2, resp.getData().length, "SELECT should return 2-byte version");
+        simulator = freshCard();
+    }
+
+    // ---- what the tests do to a card -------------------------------------
+
+    private int sw(CommandAPDU c) { return transmit(c).getSW(); }
+    private int setPin(byte[] pin) { return sw(new CommandAPDU(CLA, INS_SET_PIN, 0, 0, pin)); }
+    private int verify(byte[] pin) { return sw(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, pin)); }
+    private int setCard(String mint, byte[] refund) {
+        byte[] m = mint.getBytes(StandardCharsets.US_ASCII);
+        byte[] d = new byte[35 + m.length];
+        d[0] = 0;
+        System.arraycopy(refund, 0, d, 1, 33);
+        d[34] = (byte) m.length;
+        System.arraycopy(m, 0, d, 35, m.length);
+        return sw(new CommandAPDU(CLA, INS_SET_CARD, 0, 0, d));
+    }
+    private int setLimit(long sats) {
+        byte[] d = new byte[4];
+        putUint32(d, 0, sats);
+        return sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, d));
+    }
+    private ResponseAPDU load(byte[] proof) { return transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, proof, 1)); }
+    private ResponseAPDU spend(int slot) { return transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, slot, 0, 64)); }
+    private byte[] info() { return transmit(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)).getData(); }
+    private byte[] cardKey() { return transmit(new CommandAPDU(CLA, INS_GET_PUBKEY, 0, 0, 256)).getData(); }
+    private byte[] slot(int i) { return transmit(new CommandAPDU(CLA, INS_GET_PROOF, i, 0, 256)).getData(); }
+    private long balance() { return readUint32(transmit(new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4)).getData(), 0); }
+    private void reselect() {
+        assertEquals(SW_OK, sw(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR))));
+    }
+
+    /** A card as its holder leaves it: PIN set and verified, at a mint, with a refund key. */
+    private void ready() {
+        assertEquals(SW_OK, setPin(TEST_PIN));
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, setCard(MINT, REFUND));
+    }
+
+    private boolean signedFor(byte[] sig, byte[] slotData, byte[] refund) throws Exception {
+        byte[] nonce = Arrays.copyOfRange(slotData, 13, 45);
+        long date = readUint32(slotData, 78);
+        byte[] msg = sha256(secretText(nonce, cardKey(), date, refund).getBytes(StandardCharsets.UTF_8));
+        return schnorrVerify(extractPubkeyX(cardKey()), msg, sig);
     }
 
     // =========================================================================
-    // SELECT
+    // What the card is
     // =========================================================================
 
-    @Test @Order(1)
-    @DisplayName("SELECT returns version bytes")
+    @Test
+    @DisplayName("SELECT answers version 1.0, and not to upstream's AID")
     void testSelect() {
         ResponseAPDU resp = transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR)));
         assertEquals(SW_OK, resp.getSW());
-        byte[] data = resp.getData();
-        assertEquals(2, data.length, "Version response must be 2 bytes");
-        assertEquals(0x00, data[0], "Major version = 0");
-        assertEquals(0x04, data[1],
-            "Minor version = 4 (ENG-620: a slot's status byte is written last, D14). A fixed "
-                + "card must not answer SELECT like the 0.3 build main tracked with the old "
-                + "write order, nor like the ENG-615 builds below it.");
-    }
-
-    // =========================================================================
-    // GET_INFO (0x01)
-    // =========================================================================
-
-    @Test @Order(2)
-    @DisplayName("GET_INFO returns 8-byte structure with correct initial values")
-    void testGetInfo() {
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256));
-        assertEquals(SW_OK, resp.getSW());
-        byte[] d = resp.getData();
-        assertEquals(8, d.length, "GET_INFO must return 8 bytes");
-        assertEquals(0x00, d[0] & 0xFF, "major version");
-        assertEquals(0x04, d[1] & 0xFF, "minor version");
-        assertEquals(MAX_PROOFS, d[2] & 0xFF, "max slots = 32");
-        assertEquals(0, d[3] & 0xFF, "unspent = 0 initially");
-        assertEquals(0, d[4] & 0xFF, "spent = 0 initially");
-        assertEquals(MAX_PROOFS, d[5] & 0xFF, "empty = 32 initially");
-        // bit0 = secp256k1 native, bit1 = Schnorr, bit2 = PIN (all set after ENG-181)
-        assertEquals(0x07, d[6] & 0xFF, "Capabilities must be 0x07 (secp256k1+Schnorr+PIN)");
-        assertEquals(0, d[7] & 0xFF, "PIN state = 0 (unset) initially");
-    }
-
-    // =========================================================================
-    // GET_PUBKEY (0x10)
-    // =========================================================================
-
-    @Test @Order(3)
-    @DisplayName("GET_PUBKEY returns a 33-byte compressed secp256k1 public key")
-    void testGetPubkey() throws Exception {
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_GET_PUBKEY, 0, 0, 256));
-        assertEquals(SW_OK, resp.getSW());
-        byte[] pub = resp.getData();
-        // The wire format is fixed at 33 bytes (spec/APDU.md) even though
-        // ECPublicKey.getW() hands back the uncompressed point on hardware.
-        assertEquals(33, pub.length, "Public key must be 33-byte compressed");
-        assertTrue(pub[0] == 0x02 || pub[0] == 0x03,
-            "Compressed key prefix must be 0x02 or 0x03");
-        assertNotNull(liftX(new java.math.BigInteger(1,
-            java.util.Arrays.copyOfRange(pub, 1, 33))), "Public key must be on secp256k1");
-
-        // The compressed key must be the very key the card signs with: verify a
-        // real signature against its x-only form.
-        byte[] msg = new byte[32];
-        for (int i = 0; i < 32; i++) msg[i] = (byte) (i + 1);
-        ResponseAPDU signed = transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, msg, 0, 32, 64));
-        assertEquals(SW_OK, signed.getSW());
-        assertTrue(schnorrVerify(java.util.Arrays.copyOfRange(pub, 1, 33), msg, signed.getData()),
-            "Signature must verify against the key GET_PUBKEY returned");
-    }
-
-    // No @Order: a pure static helper with no card state, so it runs after the
-    // ordered APDU sequence rather than displacing its numbering.
-    @Test
-    @DisplayName("toCompressed normalises the 65-byte hardware point to 33 bytes")
-    void testToCompressed() {
-        // jCardSim's getW() already returns 33 bytes, so the branch that runs on
-        // real silicon is invisible here unless driven directly.
-        byte[] gx = toBytes32Test(SECP_GX);
-        byte[] gy = toBytes32Test(SECP_GY);
-        byte[] gyOdd = toBytes32Test(SECP_P.subtract(SECP_GY));
-
-        byte[] even = new byte[65];
-        even[0] = 0x04;
-        System.arraycopy(gx, 0, even, 1, 32);
-        System.arraycopy(gy, 0, even, 33, 32);
-        assertEquals(33, CashuApplet.toCompressed(even, (short) 65));
-        assertEquals(0x02, even[0] & 0xFF, "even Y must yield a 0x02 prefix");
-        assertArrayEquals(gx, java.util.Arrays.copyOfRange(even, 1, 33), "X must be preserved");
-
-        byte[] odd = new byte[65];
-        odd[0] = 0x04;
-        System.arraycopy(gx, 0, odd, 1, 32);
-        System.arraycopy(gyOdd, 0, odd, 33, 32);
-        assertEquals(33, CashuApplet.toCompressed(odd, (short) 65));
-        assertEquals(0x03, odd[0] & 0xFF, "odd Y must yield a 0x03 prefix");
-
-        byte[] compressed = new byte[33];
-        compressed[0] = 0x02;
-        System.arraycopy(gx, 0, compressed, 1, 32);
-        assertEquals(33, CashuApplet.toCompressed(compressed, (short) 33));
-        assertArrayEquals(gx, java.util.Arrays.copyOfRange(compressed, 1, 33),
-            "an already-compressed key must pass through untouched");
+        assertArrayEquals(new byte[] { 0x01, 0x00 }, resp.getData());
+        assertNotEquals(SW_OK, sw(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(UPSTREAM_AID))),
+            "an upstream reader must not find this applet under upstream's AID: the wire is not the same");
     }
 
     @Test
-    @DisplayName("toCompressed refuses encodings it does not recognise")
-    void testToCompressedRejectsUnknownEncodings() {
-        // Same policy as SchnorrHW.sign() for the same getW() output: an
-        // encoding we cannot name must not reach the host as a "pubkey".
-        byte[] gx = toBytes32Test(SECP_GX);
-        byte[] gy = toBytes32Test(SECP_GY);
-
-        // 65 bytes without the 0x04 marker.
-        byte[] badMarker = new byte[65];
-        badMarker[0] = 0x05;
-        System.arraycopy(gx, 0, badMarker, 1, 32);
-        System.arraycopy(gy, 0, badMarker, 33, 32);
-        assertCryptoError(() -> CashuApplet.toCompressed(badMarker, (short) 65));
-
-        // A bare X || Y with no marker at all.
-        byte[] bare = new byte[64];
-        System.arraycopy(gx, 0, bare, 0, 32);
-        System.arraycopy(gy, 0, bare, 32, 32);
-        assertCryptoError(() -> CashuApplet.toCompressed(bare, (short) 64));
-
-        // 33 bytes with a prefix that is not 02/03.
-        byte[] badPrefix = new byte[33];
-        badPrefix[0] = 0x04;
-        System.arraycopy(gx, 0, badPrefix, 1, 32);
-        assertCryptoError(() -> CashuApplet.toCompressed(badPrefix, (short) 33));
-
-        // Wrong length outright.
-        assertCryptoError(() -> CashuApplet.toCompressed(new byte[32], (short) 32));
+    @DisplayName("GET_INFO on a new card: 64 empty slots, no PIN, three tries, format 2, no record, no limit")
+    void testInfoFresh() {
+        byte[] d = info();
+        assertEquals(16, d.length);
+        assertEquals(1, d[0]); assertEquals(0, d[1]);
+        assertEquals(MAX_PROOFS, d[2] & 0xFF);
+        assertEquals(0, d[3]); assertEquals(0, d[4]);
+        assertEquals(MAX_PROOFS, d[5] & 0xFF);
+        assertEquals(0x07, d[6]);
+        assertEquals(0, d[7], "no PIN");
+        assertEquals(2, d[8], "format");
+        assertEquals(3, d[9], "tries");
+        assertEquals(0, d[10], "not locked");
+        assertEquals(0, d[11], "no card record");
+        assertEquals(0, readUint32(d, 12), "no limit");
     }
 
-    private static void assertCryptoError(org.junit.jupiter.api.function.Executable call) {
-        javacard.framework.ISOException thrown =
-            assertThrows(javacard.framework.ISOException.class, call);
-        assertEquals(CashuApplet.SW_CRYPTO_ERROR, thrown.getReason(),
-            "unrecognised encoding must fail with SW_CRYPTO_ERROR");
+    @Test
+    @DisplayName("GET_PUBKEY is a 33-byte compressed key")
+    void testPubkey() {
+        byte[] k = cardKey();
+        assertEquals(33, k.length);
+        assertTrue(k[0] == 0x02 || k[0] == 0x03);
     }
 
-    @Test @Order(4)
-    @DisplayName("GET_PUBKEY is stable (same key across multiple calls)")
-    void testGetPubkeyStable() {
-        byte[] pub1 = transmit(new CommandAPDU(CLA, INS_GET_PUBKEY, 0, 0, 256)).getData();
-        byte[] pub2 = transmit(new CommandAPDU(CLA, INS_GET_PUBKEY, 0, 0, 256)).getData();
-        assertArrayEquals(pub1, pub2, "Public key must be stable");
+    @Test
+    @DisplayName("A class other than B0, and an instruction nobody defined, are refused")
+    void testUnknown() {
+        assertEquals(SW_CLA_NOT_SUPPORTED, sw(new CommandAPDU(0x80, INS_GET_INFO, 0, 0, 256)));
+        assertEquals(SW_INS_NOT_SUPPORTED, sw(new CommandAPDU(CLA, 0x7F, 0, 0, 256)));
     }
 
     // =========================================================================
-    // GET_BALANCE (0x11)
+    // SIGN_ARBITRARY is gone
     // =========================================================================
 
-    @Test @Order(5)
-    @DisplayName("GET_BALANCE returns 0 on fresh card")
-    void testGetBalanceEmpty() {
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4));
-        assertEquals(SW_OK, resp.getSW());
-        byte[] d = resp.getData();
-        assertEquals(4, d.length);
-        assertEquals(0L, readUint32(d, 0), "Balance must be 0 on fresh card");
+    @Test
+    @DisplayName("SIGN_ARBITRARY does not exist: with no PIN, with the PIN, and with pieces on the card")
+    void testNoSignArbitrary() {
+        byte[] msg = new byte[32];
+        assertEquals(SW_INS_NOT_SUPPORTED, sw(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, msg, 64)));
+        ready();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 16, 1)).getSW());
+        assertEquals(SW_INS_NOT_SUPPORTED, sw(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, msg, 64)));
+        assertEquals(16, balance(), "and nothing was burned by asking");
     }
 
     // =========================================================================
-    // GET_PROOF_COUNT (0x12)
+    // Loading
     // =========================================================================
 
-    @Test @Order(6)
-    @DisplayName("GET_PROOF_COUNT returns 0 on fresh card")
-    void testGetProofCountEmpty() {
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_GET_PROOF_COUNT, 0, 0, 1));
-        assertEquals(SW_OK, resp.getSW());
-        assertEquals(0, resp.getData()[0] & 0xFF);
+    @Test
+    @DisplayName("Nothing is loaded onto a card with no PIN")
+    void testNoLoadWithoutPin() {
+        assertEquals(SW_SECURITY_NOT_SATIS, load(buildProof(KEYSET, 16, 1)).getSW());
+        assertEquals(SW_SECURITY_NOT_SATIS, setCard(MINT, REFUND), "nor is its record written");
+        assertEquals(0, info()[3], "no slot was taken");
+    }
+
+    @Test
+    @DisplayName("Nothing is loaded with the PIN set and not verified, or before the card knows its mint")
+    void testLoadNeedsVerifyAndRecord() {
+        assertEquals(SW_OK, setPin(TEST_PIN));
+        assertEquals(SW_SECURITY_NOT_SATIS, load(buildProof(KEYSET, 16, 1)).getSW());
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_NO_CARD_RECORD, load(buildProof(KEYSET, 16, 1)).getSW());
+        assertEquals(SW_OK, setCard(MINT, REFUND));
+        assertEquals(SW_OK, load(buildProof(KEYSET, 16, 1)).getSW());
+    }
+
+    @Test
+    @DisplayName("LOAD_PROOF takes 81 bytes, a C that is a point and an amount that is not nothing")
+    void testLoadShape() {
+        ready();
+        assertEquals(SW_WRONG_LENGTH, load(new byte[77]).getSW(), "upstream's 77 bytes are not a piece here");
+        assertEquals(SW_WRONG_LENGTH, load(new byte[82]).getSW());
+        byte[] notPoint = buildProof(KEYSET, 16, 1);
+        notPoint[44] = 0x04;
+        assertEquals(SW_WRONG_DATA, load(notPoint).getSW());
+        assertEquals(SW_WRONG_DATA, load(buildProof(KEYSET, 0, 1)).getSW());
+        assertEquals(0, info()[3], "none of them took a slot");
+        ResponseAPDU ok = load(buildProof(KEYSET, 16, 1, 1900000000L));
+        assertEquals(SW_OK, ok.getSW());
+        assertEquals(0, ok.getData()[0], "the first slot");
+        byte[] s = slot(0);
+        assertEquals(SLOT, s.length);
+        assertEquals(1, s[0]);
+        assertEquals(16, readUint32(s, 9));
+        assertEquals(1900000000L, readUint32(s, 78), "the date is kept with the piece");
+    }
+
+    @Test
+    @DisplayName("A dated piece needs a refund key on the card; an undated one does not")
+    void testDatedNeedsRefundKey() {
+        assertEquals(SW_OK, setPin(TEST_PIN));
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, setCard(MINT, NO_REFUND));
+        assertEquals(SW_NO_REFUND_KEY, load(buildProof(KEYSET, 16, 1, 1900000000L)).getSW());
+        assertEquals(SW_OK, load(buildProof(KEYSET, 16, 1, 0)).getSW());
+    }
+
+    @Test
+    @DisplayName("Sixty-four pieces fit, and the sixty-fifth is refused")
+    void testFull() {
+        ready();
+        for (int i = 0; i < MAX_PROOFS; i++) assertEquals(SW_OK, load(buildProof(KEYSET, 1, i)).getSW(), "slot " + i);
+        assertEquals(SW_NO_SPACE, load(buildProof(KEYSET, 1, 99)).getSW());
+        assertEquals(MAX_PROOFS, balance());
+        assertEquals(MAX_PROOFS, transmit(new CommandAPDU(CLA, INS_GET_SLOT_STATUS, 0, 0, 256)).getData().length);
+        assertEquals(SW_SLOT_OUT_OF_RANGE, sw(new CommandAPDU(CLA, INS_GET_PROOF, MAX_PROOFS, 0, 256)));
     }
 
     // =========================================================================
-    // GET_SLOT_STATUS (0x14)
+    // The card record
     // =========================================================================
 
-    @Test @Order(7)
-    @DisplayName("GET_SLOT_STATUS returns 32 zero bytes on fresh card")
-    void testGetSlotStatusEmpty() {
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_GET_SLOT_STATUS, 0, 0, MAX_PROOFS));
-        assertEquals(SW_OK, resp.getSW());
-        byte[] statuses = resp.getData();
-        assertEquals(MAX_PROOFS, statuses.length);
-        for (int i = 0; i < MAX_PROOFS; i++) {
-            assertEquals(0, statuses[i] & 0xFF, "Slot " + i + " should be empty");
+    @Test
+    @DisplayName("SET_CARD is read back by GET_CARD, whole")
+    void testCardRecord() {
+        ready();
+        assertEquals(SW_OK, setLimit(5000));
+        byte[] c = transmit(new CommandAPDU(CLA, INS_GET_CARD, 0, 0, 256)).getData();
+        assertEquals(41 + MINT.length(), c.length);
+        assertEquals(2, c[0]); assertEquals(1, c[1]); assertEquals(0, c[2]);
+        assertEquals(5000, readUint32(c, 3));
+        assertArrayEquals(REFUND, Arrays.copyOfRange(c, 7, 40));
+        assertEquals(MINT.length(), c[40] & 0xFF);
+        assertEquals(MINT, new String(Arrays.copyOfRange(c, 41, c.length), StandardCharsets.US_ASCII));
+        assertEquals(1, info()[11]);
+        assertEquals(5000, readUint32(info(), 12));
+    }
+
+    @Test
+    @DisplayName("SET_CARD refuses a record that is not one, and leaves the old one")
+    void testCardRecordShape() {
+        ready();
+        byte[] bad = REFUND.clone(); bad[0] = 0x04;
+        assertEquals(SW_WRONG_DATA, setCard(MINT, bad), "a refund key that is not a compressed point");
+        byte[] half = new byte[33]; half[5] = 1;
+        assertEquals(SW_WRONG_DATA, setCard(MINT, half), "zeros with something in them");
+        assertEquals(SW_WRONG_LENGTH, setCard("", REFUND), "no mint");
+        assertEquals(SW_WRONG_LENGTH, setCard("x".repeat(97), REFUND), "a mint too long to keep");
+        byte[] lying = new byte[35 + 10]; lying[1] = 0x02; lying[34] = 20;
+        assertEquals(SW_WRONG_LENGTH, sw(new CommandAPDU(CLA, INS_SET_CARD, 0, 0, lying)), "a length that is not the mint's");
+        byte[] c = transmit(new CommandAPDU(CLA, INS_GET_CARD, 0, 0, 256)).getData();
+        assertEquals(MINT, new String(Arrays.copyOfRange(c, 41, c.length), StandardCharsets.US_ASCII));
+        assertEquals(SW_OK, setCard("x".repeat(96), REFUND), "ninety-six is kept");
+    }
+
+    @Test
+    @DisplayName("The mint and the refund key cannot change under pieces that are still unspent")
+    void testCardRecordInUse() throws Exception {
+        ready();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 16, 1, 1900000000L)).getSW());
+        assertEquals(SW_CARD_IN_USE, setCard("https://other.example.com", NO_REFUND));
+        // the piece is still signed for with the key it was made with
+        ResponseAPDU r = spend(0);
+        assertEquals(SW_OK, r.getSW());
+        assertTrue(signedFor(r.getData(), slot(0), REFUND));
+        assertEquals(SW_OK, setCard("https://other.example.com", NO_REFUND), "with nothing unspent it may");
+    }
+
+    // =========================================================================
+    // Spending
+    // =========================================================================
+
+    @Test
+    @DisplayName("SPEND_PROOF signs the slot's own secret, upstream's form when there is no date")
+    void testSpendSignsTheSlot() throws Exception {
+        ready();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 16, 7)).getSW());
+        byte[] before = slot(0);
+        ResponseAPDU r = spend(0);
+        assertEquals(SW_OK, r.getSW());
+        assertEquals(64, r.getData().length);
+        assertTrue(signedFor(r.getData(), before, REFUND), "a BIP-340 signature over SHA-256 of the piece's secret");
+        // upstream's reconstruction, spelt out: no locktime, no refund
+        String upstream = "[\"P2PK\",{\"nonce\":\"" + toHex(Arrays.copyOfRange(before, 13, 45)) + "\",\"data\":\""
+            + toHex(cardKey()) + "\",\"tags\":[[\"sigflag\",\"SIG_INPUTS\"]]}]";
+        assertTrue(schnorrVerify(extractPubkeyX(cardKey()), sha256(upstream.getBytes(StandardCharsets.UTF_8)), r.getData()));
+        assertEquals(2, slot(0)[0], "and the slot is spent");
+        assertEquals(0, balance());
+    }
+
+    @Test
+    @DisplayName("A dated piece's secret names its date in decimal and the card's refund key")
+    void testSpendDated() throws Exception {
+        ready();
+        long[] dates = { 1L, 9L, 10L, 99L, 100L, 65535L, 65536L, 1700000000L, 1900000000L, 4294967295L };
+        for (int i = 0; i < dates.length; i++) {
+            assertEquals(SW_OK, load(buildProof(KEYSET, 16, 20 + i, dates[i])).getSW());
+        }
+        for (int i = 0; i < dates.length; i++) {
+            byte[] before = slot(i);
+            ResponseAPDU r = spend(i);
+            assertEquals(SW_OK, r.getSW(), "date " + dates[i]);
+            assertTrue(signedFor(r.getData(), before, REFUND), "date " + dates[i] + " as text in the secret");
+            // and not the same piece with no date, or with another refund key
+            byte[] undated = before.clone();
+            putUint32(undated, 78, 0);
+            assertFalse(signedFor(r.getData(), undated, REFUND));
+            byte[] other = REFUND.clone(); other[0] = 0x03;
+            assertFalse(signedFor(r.getData(), before, other));
         }
     }
 
-    // =========================================================================
-    // GET_PROOF (0x13) — error cases before any proofs loaded
-    // =========================================================================
-
-    @Test @Order(8)
-    @DisplayName("GET_PROOF on empty slot returns SW_SLOT_EMPTY")
-    void testGetProofSlotEmpty() {
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_GET_PROOF, 0, 0, 78));
-        assertEquals(SW_SLOT_EMPTY, resp.getSW());
+    @Test
+    @DisplayName("Nothing the reader sends is signed: 32 bytes offered to SPEND_PROOF change nothing")
+    void testSpendTakesNoMessage() throws Exception {
+        ready();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 16, 1)).getSW());
+        assertEquals(SW_OK, load(buildProof(KEYSET, 32, 2)).getSW());
+        byte[] a = slot(0), b = slot(1);
+        // upstream's attack: have slot 0 burned for slot 1's message
+        byte[] bMsg = sha256(secretText(Arrays.copyOfRange(b, 13, 45), cardKey(), 0, REFUND).getBytes(StandardCharsets.UTF_8));
+        ResponseAPDU r = transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, bMsg, 64));
+        assertEquals(SW_OK, r.getSW());
+        assertFalse(schnorrVerify(extractPubkeyX(cardKey()), bMsg, r.getData()), "not the message that was offered");
+        assertTrue(signedFor(r.getData(), a, REFUND), "the slot's own");
+        assertFalse(signedFor(r.getData(), b, REFUND), "and no other slot's");
+        assertEquals(1, slot(1)[0], "slot 1 is untouched");
     }
 
-    @Test @Order(9)
-    @DisplayName("GET_PROOF with out-of-range index returns SW_SLOT_OUT_OF_RANGE")
-    void testGetProofOutOfRange() {
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_GET_PROOF, MAX_PROOFS, 0, 78));
-        assertEquals(SW_SLOT_OUT_OF_RANGE, resp.getSW());
+    @Test
+    @DisplayName("A slot is signed for once")
+    void testSpendOnce() {
+        ready();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 16, 1)).getSW());
+        assertEquals(SW_OK, spend(0).getSW());
+        assertEquals(SW_CONDITIONS_NOT_SATIS, spend(0).getSW());
+        assertEquals(SW_SLOT_EMPTY, spend(1).getSW());
+        assertEquals(SW_SLOT_OUT_OF_RANGE, spend(MAX_PROOFS).getSW());
+        reselect();
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_CONDITIONS_NOT_SATIS, spend(0).getSW(), "and not in a later tap either");
     }
 
-    // =========================================================================
-    // LOAD_PROOF (0x30) — no PIN set
-    // =========================================================================
-
-    @Test @Order(10)
-    @DisplayName("LOAD_PROOF succeeds without PIN when PIN is not set")
-    void testLoadProofNoPinRequired() {
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_1, 0, PROOF_1.length, 1));
-        assertEquals(SW_OK, resp.getSW());
-        byte slotIdx = resp.getData()[0];
-        assertEquals(0, slotIdx & 0xFF, "First proof should be in slot 0");
-    }
-
-    @Test @Order(11)
-    @DisplayName("LOAD_PROOF wrong data length returns SW_WRONG_LENGTH")
-    void testLoadProofWrongLength() {
-        byte[] shortProof = new byte[10];
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, shortProof, 0, shortProof.length, 1));
-        assertEquals(SW_WRONG_LENGTH, resp.getSW());
-    }
-
-    @Test @Order(12)
-    @DisplayName("LOAD_PROOF fills slots sequentially")
-    void testLoadProofSequential() {
-        for (int i = 0; i < 3; i++) {
-            byte[] proof = buildProof("0059534ce0bfa19a", 100 * (i + 1), i + 1);
-            ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, proof, 0, proof.length, 1));
-            assertEquals(SW_OK, resp.getSW());
-            assertEquals(i, resp.getData()[0] & 0xFF, "Slot index should be " + i);
-        }
-    }
-
-    // =========================================================================
-    // GET_PROOF (0x13) — after loading
-    // =========================================================================
-
-    @Test @Order(13)
-    @DisplayName("GET_PROOF returns correct data after LOAD_PROOF")
-    void testGetProofAfterLoad() {
-        // Load proof into slot 0
-        transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_1, 0, PROOF_1.length, 1));
-
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_GET_PROOF, 0, 0, 78));
-        assertEquals(SW_OK, resp.getSW());
-        byte[] data = resp.getData();
-        assertEquals(78, data.length, "Proof data must be 78 bytes");
-        assertEquals(0x01, data[0] & 0xFF, "Status must be UNSPENT (0x01)");
-
-        // Verify the proof payload matches what we loaded (bytes 1..77)
-        for (int i = 0; i < 77; i++) {
-            assertEquals(PROOF_1[i] & 0xFF, data[i + 1] & 0xFF,
-                "Proof byte " + i + " mismatch");
-        }
-    }
-
-    // =========================================================================
-    // GET_BALANCE — after loading
-    // =========================================================================
-
-    @Test @Order(14)
-    @DisplayName("GET_BALANCE reflects loaded proof amounts")
-    void testGetBalanceAfterLoad() {
-        transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_1, 0, PROOF_1.length, 1)); // 1000
-        transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_2, 0, PROOF_2.length, 1)); // 500
-
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4));
-        assertEquals(SW_OK, resp.getSW());
-        assertEquals(1500L, readUint32(resp.getData(), 0), "Balance should be 1000 + 500 = 1500");
-    }
-
-    // =========================================================================
-    // GET_PROOF_COUNT — after loading
-    // =========================================================================
-
-    @Test @Order(15)
-    @DisplayName("GET_PROOF_COUNT increments after LOAD_PROOF")
-    void testGetProofCountAfterLoad() {
-        transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_1, 0, PROOF_1.length, 1));
-        transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_2, 0, PROOF_2.length, 1));
-
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_GET_PROOF_COUNT, 0, 0, 1));
-        assertEquals(SW_OK, resp.getSW());
-        assertEquals(2, resp.getData()[0] & 0xFF);
-    }
-
-    // =========================================================================
-    // GET_SLOT_STATUS — after loading
-    // =========================================================================
-
-    @Test @Order(16)
-    @DisplayName("GET_SLOT_STATUS shows correct status after LOAD_PROOF")
-    void testGetSlotStatusAfterLoad() {
-        transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_1, 0, PROOF_1.length, 1));
-
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_GET_SLOT_STATUS, 0, 0, MAX_PROOFS));
-        assertEquals(SW_OK, resp.getSW());
-        byte[] statuses = resp.getData();
-        assertEquals(0x01, statuses[0] & 0xFF, "Slot 0 should be UNSPENT");
-        for (int i = 1; i < MAX_PROOFS; i++) {
-            assertEquals(0x00, statuses[i] & 0xFF, "Slot " + i + " should be EMPTY");
-        }
-    }
-
-    // =========================================================================
-    // SPEND_PROOF (0x20)
-    // =========================================================================
-
-    @Test @Order(17)
-    @DisplayName("SPEND_PROOF returns 64-byte signature and marks slot spent")
-    void testSpendProof() {
-        transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_1, 0, PROOF_1.length, 1));
-
-        byte[] msg = new byte[32];
-        for (int i = 0; i < 32; i++) msg[i] = (byte) i; // dummy message
-
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, msg, 0, 32, 64));
-        assertEquals(SW_OK, resp.getSW());
-        byte[] sig = resp.getData();
-        assertEquals(64, sig.length, "Signature must be 64 bytes");
-        assertFalse(isAllZeros(sig), "Signature must not be all zeros (stub check)");
-
-        // Verify slot is now SPENT
-        ResponseAPDU proofResp = transmit(new CommandAPDU(CLA, INS_GET_PROOF, 0, 0, 78));
-        assertEquals(SW_OK, proofResp.getSW());
-        assertEquals(0x02, proofResp.getData()[0] & 0xFF, "Status must be SPENT after spend");
-    }
-
-    @Test @Order(18)
-    @DisplayName("SPEND_PROOF on spent slot returns SW_ALREADY_SPENT (6985)")
-    void testSpendProofDoubleSpend() {
-        transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_1, 0, PROOF_1.length, 1));
-        byte[] msg = new byte[32];
-
-        // First spend
-        transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, msg, 0, 32, 64));
-
-        // Second spend — should fail
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, msg, 0, 32, 64));
-        assertEquals(SW_CONDITIONS_NOT_SATIS, resp.getSW(), "Double spend must be rejected");
-    }
-
-    @Test @Order(19)
-    @DisplayName("SPEND_PROOF on empty slot returns SW_SLOT_EMPTY")
-    void testSpendProofEmptySlot() {
-        byte[] msg = new byte[32];
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, msg, 0, 32, 64));
-        assertEquals(SW_SLOT_EMPTY, resp.getSW());
-    }
-
-    @Test @Order(20)
-    @DisplayName("SPEND_PROOF with wrong message length returns SW_WRONG_LENGTH")
-    void testSpendProofWrongMsgLength() {
-        transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_1, 0, PROOF_1.length, 1));
-        byte[] shortMsg = new byte[16];
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, shortMsg, 0, shortMsg.length, 64));
-        assertEquals(SW_WRONG_LENGTH, resp.getSW());
-    }
-
-    @Test @Order(21)
-    @DisplayName("GET_BALANCE decreases to zero after all proofs spent")
-    void testBalanceAfterSpend() {
-        transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_1, 0, PROOF_1.length, 1));
-        byte[] msg = new byte[32];
-        transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, msg, 0, 32, 64));
-
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4));
-        assertEquals(SW_OK, resp.getSW());
-        assertEquals(0L, readUint32(resp.getData(), 0), "Balance must be 0 after spending all proofs");
-    }
-
-    // =========================================================================
-    // SIGN_ARBITRARY (0x21)
-    // =========================================================================
-
-    @Test @Order(22)
-    @DisplayName("SIGN_ARBITRARY returns 64-byte signature without affecting proofs")
-    void testSignArbitrary() {
-        transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_1, 0, PROOF_1.length, 1));
-        long balanceBefore = readUint32(
-            transmit(new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4)).getData(), 0);
-
-        byte[] msg = new byte[32];
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, msg, 0, 32, 64));
-        assertEquals(SW_OK, resp.getSW());
-        assertEquals(64, resp.getData().length);
-
-        // Balance unchanged
-        long balanceAfter = readUint32(
-            transmit(new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4)).getData(), 0);
-        assertEquals(balanceBefore, balanceAfter, "SIGN_ARBITRARY must not consume proofs");
-    }
-
-    @Test @Order(23)
-    @DisplayName("SIGN_ARBITRARY wrong message length returns SW_WRONG_LENGTH")
-    void testSignArbitraryWrongLength() {
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, new byte[16], 0, 16, 64));
-        assertEquals(SW_WRONG_LENGTH, resp.getSW());
-    }
-
-    // =========================================================================
-    // Schnorr signature cryptographic verification (ENG-181)
-    // =========================================================================
-
-    @Test @Order(24)
-    @DisplayName("SIGN_ARBITRARY produces a valid BIP-340 Schnorr signature")
-    void testSignArbitrarySchnorrValid() throws Exception {
-        // Get card public key
-        byte[] pubBytes = transmit(new CommandAPDU(CLA, INS_GET_PUBKEY, 0, 0, 256)).getData();
-
-        // Sign a known 32-byte message
-        byte[] msg = new byte[32];
-        for (int i = 0; i < 32; i++) msg[i] = (byte)(i + 1);
-
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, msg, 0, 32, 64));
-        assertEquals(SW_OK, resp.getSW());
-        byte[] sig = resp.getData();
-        assertEquals(64, sig.length);
-        assertFalse(isAllZeros(sig), "Signature must not be all zeros");
-
-        // Extract 32-byte x-coordinate of public key
-        byte[] pubX = extractPubkeyX(pubBytes);
-
-        // Verify BIP-340 Schnorr signature
-        assertTrue(schnorrVerify(pubX, msg, sig),
-            "Schnorr signature must verify against the card's public key");
-    }
-
-    @Test @Order(25)
-    @DisplayName("SPEND_PROOF produces a valid BIP-340 Schnorr signature")
-    void testSpendProofSchnorrValid() throws Exception {
-        transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_1, 0, PROOF_1.length, 1));
-
-        byte[] pubBytes = transmit(new CommandAPDU(CLA, INS_GET_PUBKEY, 0, 0, 256)).getData();
-        byte[] pubX = extractPubkeyX(pubBytes);
-
-        byte[] msg = new byte[32];
-        for (int i = 0; i < 32; i++) msg[i] = (byte)(0xAB ^ i);
-
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, msg, 0, 32, 64));
-        assertEquals(SW_OK, resp.getSW());
-        byte[] sig = resp.getData();
-
-        assertTrue(schnorrVerify(pubX, msg, sig),
-            "SPEND_PROOF Schnorr signature must verify");
-    }
-
-    @Test @Order(26)
-    @DisplayName("Different messages produce different signatures (non-determinism test)")
-    void testSignArbitraryDifferentMessages() throws Exception {
-        byte[] msg1 = new byte[32];
-        byte[] msg2 = new byte[32];
-        java.util.Arrays.fill(msg1, (byte) 0x01);
-        java.util.Arrays.fill(msg2, (byte) 0x02);
-
-        // Need two proofs since SPEND_PROOF marks slots spent
-        transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_1, 0, PROOF_1.length, 1));
-        transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_2, 0, PROOF_2.length, 1));
-
-        byte[] sig1 = transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, msg1, 0, 32, 64)).getData();
-        byte[] sig2 = transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, msg2, 0, 32, 64)).getData();
-
-        assertFalse(java.util.Arrays.equals(sig1, sig2),
-            "Different messages must produce different signatures");
-    }
-
-    @Test @Order(27)
-    @DisplayName("Signature for wrong message does not verify")
-    void testSignArbitraryWrongMsgDoesNotVerify() throws Exception {
-        byte[] pubBytes = transmit(new CommandAPDU(CLA, INS_GET_PUBKEY, 0, 0, 256)).getData();
-        byte[] pubX = extractPubkeyX(pubBytes);
-
-        byte[] msg = new byte[32];
-        java.util.Arrays.fill(msg, (byte) 0x42);
-
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, msg, 0, 32, 64));
-        byte[] sig = resp.getData();
-
-        byte[] wrongMsg = new byte[32];
-        java.util.Arrays.fill(wrongMsg, (byte) 0x99);
-
-        assertFalse(schnorrVerify(pubX, wrongMsg, sig),
-            "Signature must not verify against a different message");
-    }
-
-    // =========================================================================
-    // CLEAR_SPENT (0x31)
-    // =========================================================================
-
-    @Test @Order(24)
-    @DisplayName("CLEAR_SPENT frees spent slots and returns freed count")
+    @Test
+    @DisplayName("CLEAR_SPENT frees what was spent, and only that")
     void testClearSpent() {
-        transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_1, 0, PROOF_1.length, 1));
-        transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_2, 0, PROOF_2.length, 1));
-
-        // Spend slot 0
-        transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, new byte[32], 0, 32, 64));
-
-        ResponseAPDU clearResp = transmit(new CommandAPDU(CLA, INS_CLEAR_SPENT, 0, 0, 1));
-        assertEquals(SW_OK, clearResp.getSW());
-        assertEquals(1, clearResp.getData()[0] & 0xFF, "Should free 1 spent slot");
-
-        // Slot 0 should now be EMPTY, slot 1 still UNSPENT
-        byte[] statuses = transmit(new CommandAPDU(CLA, INS_GET_SLOT_STATUS, 0, 0, MAX_PROOFS)).getData();
-        assertEquals(0x00, statuses[0] & 0xFF, "Slot 0 should be EMPTY after CLEAR_SPENT");
-        assertEquals(0x01, statuses[1] & 0xFF, "Slot 1 should still be UNSPENT");
+        ready();
+        for (int i = 0; i < 3; i++) assertEquals(SW_OK, load(buildProof(KEYSET, 8, i)).getSW());
+        assertEquals(SW_OK, spend(1).getSW());
+        ResponseAPDU r = transmit(new CommandAPDU(CLA, INS_CLEAR_SPENT, 0, 0, 1));
+        assertEquals(SW_OK, r.getSW());
+        assertEquals(1, r.getData()[0]);
+        assertEquals(SW_SLOT_EMPTY, sw(new CommandAPDU(CLA, INS_GET_PROOF, 1, 0, 256)));
+        assertEquals(16, balance());
+        assertEquals(1, load(buildProof(KEYSET, 4, 9)).getData()[0], "the freed slot is the next one used");
     }
 
-    @Test @Order(25)
-    @DisplayName("CLEAR_SPENT returns 0 when no spent proofs exist")
-    void testClearSpentNoneToFree() {
-        transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_1, 0, PROOF_1.length, 1));
+    // =========================================================================
+    // The PIN
+    // =========================================================================
 
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_CLEAR_SPENT, 0, 0, 1));
-        assertEquals(SW_OK, resp.getSW());
-        assertEquals(0, resp.getData()[0] & 0xFF, "No spent proofs to free");
+    /** Every command that needs the PIN, as (name, command). */
+    private Object[][] gated() {
+        byte[] card = new byte[35 + 4]; card[1] = 0x02; card[34] = 4; card[35] = 'm';
+        return new Object[][] {
+            { "SPEND_PROOF", new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, 64) },
+            { "LOAD_PROOF",  new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 4, 50), 1) },
+            { "CLEAR_SPENT", new CommandAPDU(CLA, INS_CLEAR_SPENT, 0, 0, 1) },
+            { "SET_CARD",    new CommandAPDU(CLA, INS_SET_CARD, 0, 0, card) },
+            { "SET_LIMIT",   new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, new byte[4]) },
+            { "CHANGE_PIN",  new CommandAPDU(CLA, INS_CHANGE_PIN, 0, 0, new byte[] { 4, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38 }) },
+            { "LOCK_CARD",   new CommandAPDU(CLA, INS_LOCK_CARD, 0, 0xDE) },
+        };
     }
 
-    @Test @Order(26)
-    @DisplayName("LOAD_PROOF NO_SPACE after all 32 slots filled")
-    void testLoadProofNoSpace() {
-        for (int i = 0; i < MAX_PROOFS; i++) {
-            byte[] proof = buildProof("0059534ce0bfa19a", 1, i);
-            ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, proof, 0, proof.length, 1));
-            assertEquals(SW_OK, resp.getSW(), "Slot " + i + " should be loadable");
+    private void assertAllGatedRefuse(String when) {
+        long before = balance();
+        byte[] status = transmit(new CommandAPDU(CLA, INS_GET_SLOT_STATUS, 0, 0, 256)).getData();
+        for (Object[] g : gated()) {
+            assertEquals(SW_SECURITY_NOT_SATIS, sw((CommandAPDU) g[1]), g[0] + " " + when);
         }
-        byte[] overflow = buildProof("0059534ce0bfa19a", 1, 99);
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, overflow, 0, overflow.length, 1));
-        assertEquals(SW_NO_SPACE, resp.getSW(), "33rd proof should fail with NO_SPACE");
+        assertEquals(before, balance(), "nothing was spent or added " + when);
+        assertArrayEquals(status, transmit(new CommandAPDU(CLA, INS_GET_SLOT_STATUS, 0, 0, 256)).getData());
+        assertEquals(0, info()[10], "and the card was not locked " + when);
     }
 
-    // =========================================================================
-    // PIN — SET_PIN (0x41)
-    // =========================================================================
+    @Test
+    @DisplayName("Every gated command refuses: PIN set and not verified, after a wrong PIN, and once blocked, for good")
+    void testGateInEveryState() {
+        ready();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 16, 1)).getSW());
+        reselect();
+        assertAllGatedRefuse("with the PIN set and not verified");
 
-    @Test @Order(27)
-    @DisplayName("SET_PIN succeeds on fresh card")
-    void testSetPin() {
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_SET_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length));
-        assertEquals(SW_OK, resp.getSW());
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(0x63C2, verify(WRONG_PIN));
+        assertAllGatedRefuse("after a wrong PIN ended the session");
 
-        // GET_INFO should now show PIN state = 1 (set)
-        byte[] info = transmit(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)).getData();
-        assertEquals(1, info[7] & 0xFF, "PIN state should be 1 (set) after SET_PIN");
+        assertEquals(0x63C1, verify(WRONG_PIN));
+        assertEquals(SW_PIN_BLOCKED, verify(WRONG_PIN));
+        assertEquals(2, info()[7], "blocked");
+        assertEquals(0, info()[9], "no tries left");
+        assertAllGatedRefuse("once the PIN is blocked");
+        assertEquals(SW_PIN_BLOCKED, verify(TEST_PIN), "the right PIN no longer opens it");
+        assertAllGatedRefuse("after the right PIN was tried on a blocked card");
+        reselect();
+        assertAllGatedRefuse("in a later tap of a blocked card");
+        assertEquals(SW_CONDITIONS_NOT_SATIS, setPin(NEW_PIN), "and a blocked card cannot be given a new PIN");
+        assertEquals(16, balance(), "the piece is still there, for its refund key");
     }
 
-    @Test @Order(28)
-    @DisplayName("SET_PIN a second time returns SW_CONDITIONS_NOT_SATIS")
-    void testSetPinAlreadySet() {
-        transmit(new CommandAPDU(CLA, INS_SET_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length));
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_SET_PIN, 0, 0, NEW_PIN, 0, NEW_PIN.length));
-        assertEquals(SW_CONDITIONS_NOT_SATIS, resp.getSW());
+    @Test
+    @DisplayName("The PIN is for one tap")
+    void testPinIsForOneTap() {
+        ready();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 16, 1)).getSW());
+        reselect();
+        assertEquals(SW_SECURITY_NOT_SATIS, spend(0).getSW());
+        assertEquals(1, slot(0)[0], "a refused spend burns nothing");
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, spend(0).getSW());
     }
 
-    // =========================================================================
-    // PIN — VERIFY_PIN (0x40)
-    // =========================================================================
-
-    @Test @Order(29)
-    @DisplayName("VERIFY_PIN succeeds with correct PIN")
-    void testVerifyPinCorrect() {
-        transmit(new CommandAPDU(CLA, INS_SET_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length));
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length));
-        assertEquals(SW_OK, resp.getSW());
+    @Test
+    @DisplayName("A right PIN gives the tries back; VERIFY_PIN before a PIN exists says so")
+    void testTries() {
+        assertEquals(SW_PIN_NOT_SET, verify(TEST_PIN));
+        assertEquals(SW_OK, setPin(TEST_PIN));
+        assertEquals(SW_CONDITIONS_NOT_SATIS, setPin(NEW_PIN), "a PIN is set once");
+        assertEquals(0x63C2, verify(WRONG_PIN));
+        assertEquals(2, info()[9]);
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(3, info()[9]);
+        assertEquals(SW_WRONG_LENGTH, verify(new byte[] { 1, 2, 3 }));
+        assertEquals(SW_WRONG_LENGTH, verify(new byte[9]));
     }
 
-    @Test @Order(30)
-    @DisplayName("VERIFY_PIN with wrong PIN returns 63CX with decrementing counter")
-    void testVerifyPinWrong() {
-        transmit(new CommandAPDU(CLA, INS_SET_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length));
-
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, WRONG_PIN, 0, WRONG_PIN.length));
-        int sw = resp.getSW();
-        assertEquals(0x63C0, sw & 0xFFF0, "Wrong PIN SW must be 0x63CX");
-        assertTrue((sw & 0x0F) < 3, "Retry counter should have decremented");
-    }
-
-    @Test @Order(31)
-    @DisplayName("VERIFY_PIN blocks after max retries exhausted")
-    void testVerifyPinBlocked() {
-        transmit(new CommandAPDU(CLA, INS_SET_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length));
-
-        // Exhaust retries (default 3)
-        for (int i = 0; i < 3; i++) {
-            transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, WRONG_PIN, 0, WRONG_PIN.length));
-        }
-
-        // Now PIN should be blocked
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length));
-        assertEquals(SW_PIN_BLOCKED, resp.getSW(), "PIN must be blocked after max retries");
-
-        // GET_INFO PIN state should show 2 (locked)
-        byte[] info = transmit(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)).getData();
-        assertEquals(2, info[7] & 0xFF, "PIN state should be 2 (locked)");
-    }
-
-    @Test @Order(32)
-    @DisplayName("VERIFY_PIN on card with no PIN set returns SW_PIN_NOT_SET")
-    void testVerifyPinNotSet() {
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length));
-        assertEquals(SW_PIN_NOT_SET, resp.getSW());
-    }
-
-    // =========================================================================
-    // PIN gate on LOAD_PROOF
-    // =========================================================================
-
-    @Test @Order(33)
-    @DisplayName("LOAD_PROOF is blocked when PIN is set but not verified")
-    void testLoadProofPinRequired() {
-        transmit(new CommandAPDU(CLA, INS_SET_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length));
-
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_1, 0, PROOF_1.length, 1));
-        assertEquals(SW_SECURITY_NOT_SATIS, resp.getSW(), "LOAD_PROOF must require PIN when PIN is set");
-    }
-
-    @Test @Order(34)
-    @DisplayName("LOAD_PROOF succeeds after VERIFY_PIN")
-    void testLoadProofAfterPinVerified() {
-        transmit(new CommandAPDU(CLA, INS_SET_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length));
-        transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length));
-
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_1, 0, PROOF_1.length, 1));
-        assertEquals(SW_OK, resp.getSW());
-    }
-
-    // =========================================================================
-    // CHANGE_PIN (0x42)
-    // =========================================================================
-
-    @Test @Order(35)
-    @DisplayName("CHANGE_PIN succeeds and new PIN works")
+    @Test
+    @DisplayName("CHANGE_PIN: the old one stops working, and a wrong old one costs a try and the session")
     void testChangePin() {
-        transmit(new CommandAPDU(CLA, INS_SET_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length));
-        transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length));
-
-        // Data: 1-byte old-pin-len + old-pin + new-pin
-        byte[] changePinData = new byte[1 + TEST_PIN.length + NEW_PIN.length];
-        changePinData[0] = (byte) TEST_PIN.length;
-        System.arraycopy(TEST_PIN, 0, changePinData, 1, TEST_PIN.length);
-        System.arraycopy(NEW_PIN, 0, changePinData, 1 + TEST_PIN.length, NEW_PIN.length);
-
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_CHANGE_PIN, 0, 0, changePinData));
-        assertEquals(SW_OK, resp.getSW());
-
-        // Old PIN should no longer work
-        ResponseAPDU oldPinResp = transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length));
-        assertNotEquals(SW_OK, oldPinResp.getSW(), "Old PIN should be rejected after change");
-
-        // New PIN should work
-        ResponseAPDU newPinResp = transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, NEW_PIN, 0, NEW_PIN.length));
-        assertEquals(SW_OK, newPinResp.getSW());
+        ready();
+        byte[] wrongOld = { 4, 0x39, 0x39, 0x39, 0x39, 0x35, 0x36, 0x37, 0x38 };
+        assertEquals(0x63C2, sw(new CommandAPDU(CLA, INS_CHANGE_PIN, 0, 0, wrongOld)));
+        assertEquals(SW_SECURITY_NOT_SATIS, setLimit(1), "the session ended with it");
+        assertEquals(SW_OK, verify(TEST_PIN));
+        byte[] good = { 4, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38 };
+        assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_CHANGE_PIN, 0, 0, good)));
+        reselect();
+        assertEquals(0x63C2, verify(TEST_PIN));
+        assertEquals(SW_OK, verify(NEW_PIN));
     }
 
     // =========================================================================
-    // LOCK_CARD (0x50)
+    // The limit
     // =========================================================================
 
-    @Test @Order(36)
-    @DisplayName("LOCK_CARD blocks LOAD_PROOF permanently")
-    void testLockCard() {
-        // Lock with confirmation byte P2=0xDE
-        ResponseAPDU lockResp = transmit(new CommandAPDU(CLA, INS_LOCK_CARD, 0, 0xDE));
-        assertEquals(SW_OK, lockResp.getSW());
-
-        // LOAD_PROOF should now fail
-        ResponseAPDU loadResp = transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_1, 0, PROOF_1.length, 1));
-        assertEquals(ISO7816.SW_COMMAND_NOT_ALLOWED, loadResp.getSW(), "LOAD_PROOF must be blocked on locked card");
+    @Test
+    @DisplayName("One PIN entry spends up to the limit and no further; the PIN again starts it again")
+    void testLimit() {
+        ready();
+        assertEquals(SW_OK, setLimit(1000));
+        assertEquals(SW_OK, load(buildProof(KEYSET, 600, 1)).getSW());
+        assertEquals(SW_OK, load(buildProof(KEYSET, 400, 2)).getSW());
+        assertEquals(SW_OK, load(buildProof(KEYSET, 1, 3)).getSW());
+        assertEquals(SW_OK, load(buildProof(KEYSET, 2000, 4)).getSW());
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OVER_LIMIT, spend(3).getSW(), "a piece over the limit by itself");
+        assertEquals(SW_OK, spend(0).getSW());
+        assertEquals(SW_OK, spend(1).getSW(), "exactly the limit is within it");
+        assertEquals(SW_OVER_LIMIT, spend(2).getSW(), "one sat more is not");
+        assertEquals(1, slot(2)[0], "and the refused piece is not burned");
+        assertEquals(2001, balance());
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, spend(2).getSW(), "typed again, the PIN has its limit again");
+        assertEquals(SW_OVER_LIMIT, spend(3).getSW());
     }
 
-    @Test @Order(37)
-    @DisplayName("LOCK_CARD without confirmation byte is rejected")
-    void testLockCardNoConfirm() {
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_LOCK_CARD, 0, 0x00));
-        assertNotEquals(SW_OK, resp.getSW(), "LOCK_CARD without P2=0xDE must fail");
-    }
-
-    @Test @Order(38)
-    @DisplayName("SPEND_PROOF still works on locked card (bearer spend is always allowed)")
-    void testSpendProofOnLockedCard() {
-        transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_1, 0, PROOF_1.length, 1));
-        transmit(new CommandAPDU(CLA, INS_LOCK_CARD, 0, 0xDE));
-
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, new byte[32], 0, 32, 64));
-        assertEquals(SW_OK, resp.getSW(), "Spending must be allowed even on locked card");
-    }
-
-    // =========================================================================
-    // Odd-y normalisation coverage
-    // =========================================================================
-
-    /**
-     * SchnorrHW.sign() branches on the parity of the card public key's
-     * y-coordinate: if P.y is odd it must sign with d = n − d instead of d. On
-     * real cards the parity is a coin flip per card, so getting that branch
-     * wrong would break half the fleet.
-     *
-     * Under jCardSim the parity is not a coin flip and not even random:
-     * KeyPairImpl seeds its EC generator with SecureRandomNullProvider, so
-     * every simulator ever created generates the SAME keypair — and that
-     * keypair has an even y. No number of fresh installs will ever exercise the
-     * odd-y path through the APDU layer.
-     *
-     * This test pins that fact, because it is the sole justification for
-     * SchnorrHWSignTest driving SchnorrHW.sign() directly with chosen keys. If
-     * this assertion ever starts failing, jCardSim has gained real key
-     * randomness: applet-level parity coverage becomes possible, and the note in
-     * SchnorrHWSignTest should be revisited — but the direct test stays, because
-     * it is deterministic and this would not be.
-     */
-    @Test @Order(41)
-    @DisplayName("Card signature verifies; jCardSim's fixed key covers only the even-y path")
-    void testCardSignatureAndParityCoverageLimit() throws Exception {
-        byte[] msg = new byte[32];
-        for (int i = 0; i < 32; i++) msg[i] = (byte) (0x5A ^ i);
-
-        byte[] firstPub = null;
-        for (int i = 0; i < 5; i++) {
-            CardSimulator card = freshCard();
-            byte[] pub = card.transmitCommand(
-                new CommandAPDU(CLA, INS_GET_PUBKEY, 0, 0, 256)).getData();
-            if (firstPub == null) {
-                firstPub = pub;
-            } else {
-                assertArrayEquals(firstPub, pub,
-                    "jCardSim is expected to generate an identical keypair on every fresh "
-                        + "card (SecureRandomNullProvider). It no longer does — re-read the "
-                        + "comment on this test and on SchnorrHWSignTest.");
-            }
-
-            ResponseAPDU resp = card.transmitCommand(
-                new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, msg, 0, 32, 64));
-            assertEquals(SW_OK, resp.getSW(), "card " + i + ": SIGN_ARBITRARY failed");
-            assertTrue(schnorrVerify(extractPubkeyX(pub), msg, resp.getData()),
-                "card " + i + ": signature must verify against the card's own public key");
-        }
-
-        assertFalse(pubkeyYIsOdd(firstPub),
-            "jCardSim's fixed keypair is expected to have an even P.y, so the APDU-level "
-                + "tests only ever exercise the plain-d path. The odd-y d = n - d branch is "
-                + "covered deterministically in SchnorrHWSignTest — check it still is.");
+    @Test
+    @DisplayName("A later tap has the limit to itself, no limit is no limit, and a sum past 2^32 is over any limit")
+    void testLimitEdges() {
+        ready();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 700, 1)).getSW());
+        assertEquals(SW_OK, load(buildProof(KEYSET, 700, 2)).getSW());
+        assertEquals(SW_OK, load(buildProof(KEYSET, 4294967295L, 3)).getSW());
+        assertEquals(SW_OK, load(buildProof(KEYSET, 4294967295L, 4)).getSW());
+        assertEquals(SW_OK, setLimit(1000));
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, spend(0).getSW());
+        assertEquals(SW_OVER_LIMIT, spend(1).getSW());
+        reselect();
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, spend(1).getSW());
+        // the largest limit there is, and two pieces whose sum wraps
+        assertEquals(SW_OK, setLimit(4294967295L));
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, spend(2).getSW());
+        assertEquals(SW_OVER_LIMIT, spend(3).getSW(), "a sum that wraps round is not a small one");
+        assertEquals(SW_OK, setLimit(0));
+        assertEquals(SW_OK, spend(3).getSW(), "with no limit it goes");
+        assertEquals(SW_WRONG_LENGTH, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, new byte[3])));
     }
 
     // =========================================================================
-    // GET_BALANCE carry propagation (addUint32)
+    // AUTH
     // =========================================================================
 
-    @Test @Order(42)
-    @DisplayName("GET_BALANCE carries correctly past 2^16 and 2^24")
-    void testGetBalanceCarriesAcrossAllBytes() {
-        // 4 x 0x00FFFFFF = 0x03FFFFFC, then + 0x01000000 = 0x04FFFFFC.
-        // Forces carries out of bytes 3, 2 and 1 — testGetBalanceAfterLoad
-        // (1000 + 500) only ever carries out of byte 3.
-        for (int i = 0; i < 4; i++) {
-            byte[] p = buildProof("0059534ce0bfa19a", 0x00FFFFFFL, i);
-            assertEquals(SW_OK,
-                transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, p, 0, p.length, 1)).getSW());
-        }
-        byte[] big = buildProof("0059534ce0bfa19a", 0x01000000L, 9);
-        assertEquals(SW_OK,
-            transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, big, 0, big.length, 1)).getSW());
-
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4));
-        assertEquals(SW_OK, resp.getSW());
-        assertEquals(0x04FFFFFCL, readUint32(resp.getData(), 0),
-            "4 x 0x00FFFFFF + 0x01000000 must be 0x04FFFFFC");
+    private byte[] authMessage(byte[] reader, byte[] card, byte[] key) throws Exception {
+        byte[] tag = sha256("FoxyCard/auth".getBytes(StandardCharsets.US_ASCII));
+        java.security.MessageDigest d = java.security.MessageDigest.getInstance("SHA-256");
+        d.update(tag); d.update(tag); d.update(reader); d.update(card); d.update(key);
+        return d.digest();
     }
 
-    @Test @Order(43)
-    @DisplayName("GET_BALANCE wraps past 2^32 (addUint32 does not detect overflow)")
-    void testGetBalanceWrapsPast2Pow32() {
-        byte[] max = buildProof("0059534ce0bfa19a", 0xFFFFFFFFL, 1);
-        byte[] two = buildProof("0059534ce0bfa19a", 0x00000002L, 2);
-        assertEquals(SW_OK,
-            transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, max, 0, max.length, 1)).getSW());
-        assertEquals(SW_OK,
-            transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, two, 0, two.length, 1)).getSW());
+    @Test
+    @DisplayName("AUTH signs the reader's nonce and the card's own under a tag, with no PIN, and never the same twice")
+    void testAuth() throws Exception {
+        byte[] reader = hexToBytes("000102030405060708090a0b0c0d0e0f");
+        ResponseAPDU r = transmit(new CommandAPDU(CLA, INS_AUTH, 0, 0, reader, 80));
+        assertEquals(SW_OK, r.getSW());
+        assertEquals(80, r.getData().length);
+        byte[] cardNonce = Arrays.copyOfRange(r.getData(), 0, 16);
+        byte[] sig = Arrays.copyOfRange(r.getData(), 16, 80);
+        byte[] key = cardKey();
+        assertTrue(schnorrVerify(extractPubkeyX(key), authMessage(reader, cardNonce, key), sig));
+        byte[] other = reader.clone(); other[0] ^= 1;
+        assertFalse(schnorrVerify(extractPubkeyX(key), authMessage(other, cardNonce, key), sig), "another reader's nonce is not answered by it");
+        ResponseAPDU again = transmit(new CommandAPDU(CLA, INS_AUTH, 0, 0, reader, 80));
+        assertFalse(Arrays.equals(cardNonce, Arrays.copyOfRange(again.getData(), 0, 16)), "the card's nonce is new each time");
+        assertEquals(SW_WRONG_LENGTH, sw(new CommandAPDU(CLA, INS_AUTH, 0, 0, new byte[32], 80)), "32 bytes are not taken: that was SIGN_ARBITRARY");
+        assertEquals(SW_WRONG_LENGTH, sw(new CommandAPDU(CLA, INS_AUTH, 0, 0, new byte[15], 80)));
+    }
 
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4));
-        assertEquals(SW_OK, resp.getSW());
-        assertEquals(1L, readUint32(resp.getData(), 0),
-            "0xFFFFFFFF + 2 wraps to 1: the uint32 accumulator has no overflow "
-                + "detection, and the applet reports the wrapped value rather than "
-                + "an error. Pinned so the behaviour is a decision, not a surprise.");
+    @Test
+    @DisplayName("AUTH's signature is not a spend: it verifies for no piece on the card, and burns none")
+    void testAuthIsNotASpend() throws Exception {
+        ready();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 16, 1)).getSW());
+        assertEquals(SW_OK, load(buildProof(KEYSET, 16, 2, 1900000000L)).getSW());
+        reselect();
+        ResponseAPDU r = transmit(new CommandAPDU(CLA, INS_AUTH, 0, 0, new byte[16], 80));
+        assertEquals(SW_OK, r.getSW(), "it needs no PIN");
+        byte[] sig = Arrays.copyOfRange(r.getData(), 16, 80);
+        assertFalse(signedFor(sig, slot(0), REFUND));
+        assertFalse(signedFor(sig, slot(1), REFUND));
+        assertEquals(32, balance());
     }
 
     // =========================================================================
-    // CLA / INS validation
+    // A locked card
     // =========================================================================
 
-    @Test @Order(39)
-    @DisplayName("Unsupported CLA returns SW_CLA_NOT_SUPPORTED")
-    void testUnsupportedCla() {
-        ResponseAPDU resp = transmit(new CommandAPDU(0x00, INS_GET_PUBKEY, 0, 0, 256));
-        assertEquals(SW_CLA_NOT_SUPPORTED, resp.getSW());
-    }
-
-    @Test @Order(40)
-    @DisplayName("Unknown INS returns SW_INS_NOT_SUPPORTED")
-    void testUnknownIns() {
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, 0xFF, 0, 0, 256));
-        assertEquals(SW_INS_NOT_SUPPORTED, resp.getSW());
+    @Test
+    @DisplayName("A locked card takes no writes and still pays")
+    void testLocked() throws Exception {
+        ready();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 16, 1)).getSW());
+        assertEquals(0x6B00, sw(new CommandAPDU(CLA, INS_LOCK_CARD, 0, 0)), "without its confirming byte it is not locked");
+        assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_LOCK_CARD, 0, 0xDE)));
+        assertEquals(1, info()[10]);
+        assertEquals(SW_NOT_ALLOWED, load(buildProof(KEYSET, 16, 2)).getSW());
+        assertEquals(SW_NOT_ALLOWED, setLimit(5));
+        assertEquals(SW_NOT_ALLOWED, setCard(MINT, REFUND));
+        assertEquals(SW_NOT_ALLOWED, sw(new CommandAPDU(CLA, INS_CLEAR_SPENT, 0, 0, 1)));
+        byte[] before = slot(0);
+        ResponseAPDU r = spend(0);
+        assertEquals(SW_OK, r.getSW());
+        assertTrue(signedFor(r.getData(), before, REFUND));
     }
 
     // =========================================================================
@@ -931,38 +641,60 @@ class CashuAppletTest {
     }
 
     /**
-     * Build a 77-byte proof payload: keyset_id[8] + amount[4] + nonce[32] + C[33].
+     * Build an 81-byte proof payload: keyset_id[8] + amount[4] + nonce[32] + C[33] + date[4].
      *
-     * keysetIdHex is hex-decoded to 8 RAW bytes, never ASCII-encoded. A NUT-02
-     * keyset id is 16 hex chars, which is exactly 8 bytes raw; storing it as
-     * ASCII text would fit only half the id. The 32-byte field is the P2PK
-     * nonce, not the secret string — see spec/NUT-XX.md.
-     *
-     * Short ids are rejected rather than zero-padded: padding made a half id
-     * look like a working one, which is exactly the class of bug this file is
-     * meant to catch.
+     * keysetIdHex is hex-decoded to 8 RAW bytes, never ASCII-encoded. The
+     * 32-byte field is the P2PK nonce, not the secret string. `date` is the
+     * piece's locktime, 0 for none.
      */
-    static byte[] buildProof(String keysetIdHex, long amount, int seed) {
+    static byte[] buildProof(String keysetIdHex, long amount, int seed, long date) {
         if (keysetIdHex.length() != 16) {
             throw new IllegalArgumentException(
                 "keyset id must be 16 hex chars (8 raw bytes), got " + keysetIdHex.length()
                 + ": " + keysetIdHex);
         }
-        byte[] proof = new byte[77];
-        // keyset_id: 8 raw bytes from the hex string
-        byte[] kid = hexToBytes(keysetIdHex);
-        System.arraycopy(kid, 0, proof, 0, 8);
-        // amount: big-endian uint32
-        proof[8]  = (byte)((amount >> 24) & 0xFF);
-        proof[9]  = (byte)((amount >> 16) & 0xFF);
-        proof[10] = (byte)((amount >> 8)  & 0xFF);
-        proof[11] = (byte)( amount        & 0xFF);
-        // nonce: 32 bytes filled with seed value
-        for (int i = 0; i < 32; i++) proof[12 + i] = (byte) seed;
-        // C point: 33 bytes (02 prefix + 32 bytes of seed+1)
+        byte[] proof = new byte[81];
+        System.arraycopy(hexToBytes(keysetIdHex), 0, proof, 0, 8);
+        putUint32(proof, 8, amount);
+        for (int i = 0; i < 32; i++) proof[12 + i] = (byte) (seed + i);
         proof[44] = 0x02;
         for (int i = 0; i < 32; i++) proof[45 + i] = (byte)(seed + 1);
+        putUint32(proof, 77, date);
         return proof;
+    }
+
+    static byte[] buildProof(String keysetIdHex, long amount, int seed) {
+        return buildProof(keysetIdHex, amount, seed, 0);
+    }
+
+    static void putUint32(byte[] buf, int off, long v) {
+        buf[off]     = (byte)((v >> 24) & 0xFF);
+        buf[off + 1] = (byte)((v >> 16) & 0xFF);
+        buf[off + 2] = (byte)((v >> 8)  & 0xFF);
+        buf[off + 3] = (byte)( v        & 0xFF);
+    }
+
+    static String toHex(byte[] b) {
+        StringBuilder sb = new StringBuilder();
+        for (byte v : b) sb.append(String.format("%02x", v & 0xFF));
+        return sb.toString();
+    }
+
+    static byte[] sha256(byte[] in) {
+        try { return java.security.MessageDigest.getInstance("SHA-256").digest(in); }
+        catch (java.security.NoSuchAlgorithmException e) { throw new IllegalStateException(e); }
+    }
+
+    /**
+     * A piece's NUT-10 secret, as whoever makes the piece writes it and as the
+     * card must rebuild it (CashuApplet's SECRET_* constants). Written out here
+     * by hand, on purpose: this is the other side of the wire.
+     */
+    static String secretText(byte[] nonce, byte[] cardKey, long date, byte[] refundKey) {
+        String s = "[\"P2PK\",{\"nonce\":\"" + toHex(nonce) + "\",\"data\":\"" + toHex(cardKey)
+                 + "\",\"tags\":[[\"sigflag\",\"SIG_INPUTS\"]";
+        if (date != 0) s += ",[\"locktime\",\"" + date + "\"],[\"refund\",\"" + toHex(refundKey) + "\"]";
+        return s + "]}]";
     }
 
     static byte[] hexToBytes(String hex) {
@@ -1149,294 +881,4 @@ class CashuAppletTest {
         static final int SW_COMMAND_NOT_ALLOWED = 0x6986;
 
 }
-
-    // =========================================================================
-    // D13 — PIN-gated spend/sign
-    // =========================================================================
-
-    private void personalise() {
-        assertEquals(SW_OK, transmit(new CommandAPDU(CLA, INS_SET_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length)).getSW());
-    }
-
-    private ResponseAPDU loadProof1() {
-        return transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_1, 0, PROOF_1.length, 1));
-    }
-
-    private byte[] spendMessage() {
-        byte[] msg = new byte[32];
-        for (int i = 0; i < 32; i++) msg[i] = (byte) (0xA0 + i);
-        return msg;
-    }
-
-    private ResponseAPDU verifyPin(String pin) {
-        byte[] b = pin.getBytes();
-        return transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, b, 0, b.length));
-    }
-
-    @Test @Order(20)
-    @DisplayName("SPEND_PROOF without a verified session is 6982 when a PIN is set (D13)")
-    void testSpendRequiresPinWhenSet() {
-        assertEquals(SW_OK, loadProof1().getSW());
-        personalise();
-
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, spendMessage(), 0, 32, 64));
-        assertEquals(0x6982, resp.getSW(), "unverified session must not spend");
-
-        // The gate runs before the burn: the slot is intact.
-        ResponseAPDU proof = transmit(new CommandAPDU(CLA, 0x13, 0, 0, 78));
-        assertEquals(0x01, proof.getData()[0] & 0xFF, "slot must still be unspent");
-    }
-
-    @Test @Order(21)
-    @DisplayName("SPEND_PROOF after VERIFY_PIN in the same session works")
-    void testSpendWithVerifiedPin() {
-        assertEquals(SW_OK, loadProof1().getSW());
-        personalise();
-        assertEquals(SW_OK, transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length)).getSW());
-
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, spendMessage(), 0, 32, 64));
-        assertEquals(SW_OK, resp.getSW());
-        assertEquals(64, resp.getData().length, "BIP-340 signature expected");
-    }
-
-    @Test @Order(22)
-    @DisplayName("a wrong PIN burns nothing and decrements the retry counter")
-    void testSpendWrongPinLeavesSlotIntact() {
-        assertEquals(SW_OK, loadProof1().getSW());
-        personalise();
-        byte[] wrong = "9999".getBytes();
-        ResponseAPDU wrongResp = transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, wrong, 0, wrong.length));
-        assertEquals(0x63C2, wrongResp.getSW(), "63CX with 2 tries remaining");
-
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, spendMessage(), 0, 32, 64));
-        assertEquals(0x6982, resp.getSW());
-        ResponseAPDU proof = transmit(new CommandAPDU(CLA, 0x13, 0, 0, 1));
-        assertEquals(0x01, proof.getData()[0] & 0xFF, "slot unspent after failed verify");
-    }
-
-    @Test @Order(23)
-    @DisplayName("SIGN_ARBITRARY is gated like SPEND_PROOF (D13)")
-    void testSignArbitraryGatedWhenPinSet() {
-        personalise();
-        ResponseAPDU gated = transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, spendMessage(), 0, 32, 64));
-        assertEquals(0x6982, gated.getSW());
-
-        assertEquals(SW_OK, transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length)).getSW());
-        ResponseAPDU resp = transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, spendMessage(), 0, 32, 64));
-        assertEquals(SW_OK, resp.getSW());
-        assertEquals(64, resp.getData().length);
-    }
-
-    // =========================================================================
-    // ENG-615 — a blocked PIN must keep gating, not stop gating
-    // =========================================================================
-
-    @Test @Order(24)
-    @DisplayName("a blocked PIN still gates every PIN-gated command (ENG-615)")
-    void testBlockedPinStillGatesEveryCommand() {
-        assertEquals(SW_OK, loadProof1().getSW());
-        personalise();
-
-        // Exhaust the three tries. Before the fix this left pinState at 2,
-        // which `requirePinIfSet` did not recognise as "a PIN exists" — so a
-        // thief who failed three times got a card that spent without asking.
-        for (int i = 0; i < 2; i++) {
-            transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, WRONG_PIN, 0, WRONG_PIN.length));
-        }
-        ResponseAPDU last = transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, WRONG_PIN, 0, WRONG_PIN.length));
-        assertEquals(SW_PIN_BLOCKED, last.getSW(), "third wrong PIN blocks the card");
-        byte[] info = transmit(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)).getData();
-        assertEquals(2, info[7] & 0xFF, "GET_INFO reports the PIN as blocked");
-
-        // Every gated command must now refuse — and SPEND_PROOF must refuse
-        // before it burns.
-        assertEquals(SW_SECURITY_NOT_SATIS,
-            transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, spendMessage(), 0, 32, 64)).getSW(),
-            "SPEND_PROOF on a blocked card");
-        assertEquals(0x01, transmit(new CommandAPDU(CLA, INS_GET_PROOF, 0, 0, 78)).getData()[0] & 0xFF,
-            "the slot is intact: the gate ran before the burn");
-        assertEquals(SW_SECURITY_NOT_SATIS,
-            transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, spendMessage(), 0, 32, 64)).getSW(),
-            "SIGN_ARBITRARY on a blocked card");
-        assertEquals(SW_SECURITY_NOT_SATIS,
-            transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_1, 0, PROOF_1.length, 1)).getSW(),
-            "LOAD_PROOF on a blocked card");
-        assertEquals(SW_SECURITY_NOT_SATIS,
-            transmit(new CommandAPDU(CLA, INS_CLEAR_SPENT, 0, 0, 1)).getSW(),
-            "CLEAR_SPENT on a blocked card");
-        assertEquals(SW_SECURITY_NOT_SATIS,
-            transmit(new CommandAPDU(CLA, INS_LOCK_CARD, 0, 0xDE)).getSW(),
-            "LOCK_CARD on a blocked card");
-
-        // No route may re-key a blocked PIN. SET_PIN is the dangerous one:
-        // OwnerPIN.update() resets the try counter, so if SET_PIN read
-        // "blocked" as "no PIN" (the ENG-615 shape, one token away) a thief
-        // would set their own PIN, verify it and spend. CHANGE_PIN needs a
-        // verified session, which a blocked card can never grant.
-        assertEquals(SW_CONDITIONS_NOT_SATIS,
-            transmit(new CommandAPDU(CLA, INS_SET_PIN, 0, 0, NEW_PIN, 0, NEW_PIN.length)).getSW(),
-            "SET_PIN cannot re-personalise a blocked card");
-        assertEquals(SW_SECURITY_NOT_SATIS,
-            transmit(new CommandAPDU(CLA, INS_CHANGE_PIN, 0, 0, changePinData(TEST_PIN, NEW_PIN))).getSW(),
-            "CHANGE_PIN cannot re-key a blocked card");
-        assertEquals(SW_PIN_BLOCKED,
-            transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, NEW_PIN, 0, NEW_PIN.length)).getSW(),
-            "the PIN SET_PIN offered did not take");
-        assertEquals(SW_PIN_BLOCKED,
-            transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, TEST_PIN, 0, TEST_PIN.length)).getSW(),
-            "and the real PIN is refused too");
-        assertEquals(2, transmit(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)).getData()[7] & 0xFF,
-            "still blocked after every attempt to get back in");
-
-        // Reads stay open: the holder can still see what is stranded.
-        assertEquals(SW_OK, transmit(new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4)).getSW());
-
-        // The sequence a thief actually sends: VERIFY_PIN on the blocked card
-        // (6983), then the gated command. VERIFY_PIN answers a blocked card
-        // before its PIN check, so a session flag written on that early path
-        // would open every gate while the card still reports itself blocked.
-        // Checking the gate only before these attempts cannot see that.
-        assertGatedCommandsRefuse("after SET_PIN, CHANGE_PIN and VERIFY_PIN attempts on a blocked card");
-    }
-
-    @Test @Order(25)
-    @DisplayName("a failed CHANGE_PIN costs a try, ends the session, and counts toward the block (ENG-615)")
-    void testChangePinFailureEndsTheSessionAndCountsTowardTheBlock() {
-        assertEquals(SW_OK, loadProof1().getSW());
-        personalise();
-        assertEquals(SW_OK, verify(TEST_PIN));
-
-        // A verified session, then a CHANGE_PIN carrying the wrong current
-        // PIN. On v0.2 this path decremented the counter without touching
-        // pinState and left the session verified, so three in a row ran the
-        // counter to zero while GET_INFO still said "set", and the session
-        // stayed open throughout.
-        byte[] wrongCurrent = changePinData(WRONG_PIN, NEW_PIN);
-        assertEquals(0x63C2, changePin(wrongCurrent), "a wrong current PIN costs a try");
-
-        // The failed check ended the session, as OwnerPIN.check resets its own
-        // validated flag. The next CHANGE_PIN stops at 6982 without reaching
-        // the PIN (the counter holds at 2), the right current PIN cannot
-        // re-key from here either, and nothing the session had unlocked is
-        // still open. On v0.2 the second call answered 63C1 and the third 63C0.
-        assertEquals(SW_SECURITY_NOT_SATIS, changePin(wrongCurrent),
-            "the next CHANGE_PIN never reaches the PIN check");
-        assertEquals(SW_SECURITY_NOT_SATIS, changePin(changePinData(TEST_PIN, NEW_PIN)),
-            "not even with the right current PIN: the session is gone");
-        assertGatedCommandsRefuse("after a failed CHANGE_PIN");
-
-        // The CHANGE_PIN failure counted: two wrong VERIFY_PINs now block the
-        // card, not three, and the block is reported the same way as any other.
-        assertEquals(0x63C1, verify(WRONG_PIN));
-        assertEquals(SW_PIN_BLOCKED, verify(WRONG_PIN),
-            "the CHANGE_PIN failure counted toward the block");
-        assertEquals(2, transmit(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)).getData()[7] & 0xFF,
-            "GET_INFO reports the PIN as blocked");
-
-        // Blocked, and neither route re-keys it: CHANGE_PIN has no session to
-        // run in, in this session or the next. After re-SELECT the gate holds
-        // and neither PIN verifies, so the new one was never installed.
-        assertEquals(SW_SECURITY_NOT_SATIS, changePin(changePinData(TEST_PIN, NEW_PIN)),
-            "CHANGE_PIN with the right current PIN on a blocked card");
-        assertEquals(SW_OK,
-            transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR))).getSW(),
-            "re-SELECT starts a new session");
-        assertEquals(SW_SECURITY_NOT_SATIS,
-            transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, spendMessage(), 0, 32, 64)).getSW(),
-            "the gate holds for every session after that");
-        assertEquals(SW_SECURITY_NOT_SATIS, changePin(changePinData(TEST_PIN, NEW_PIN)),
-            "CHANGE_PIN in the new session");
-        assertEquals(SW_PIN_BLOCKED, verify(TEST_PIN), "the old PIN is refused");
-        assertEquals(SW_PIN_BLOCKED, verify(NEW_PIN), "and the new one was never installed");
-        assertGatedCommandsRefuse("after VERIFY_PIN attempts on a blocked card, in a new session");
-    }
-
-    @Test @Order(26)
-    @DisplayName("one wrong VERIFY_PIN after a right one ends the session (OwnerPIN.check semantics)")
-    void testFailedVerifyEndsAVerifiedSession() {
-        assertEquals(SW_OK, loadProof1().getSW());
-        personalise();
-        assertEquals(SW_OK, verify(TEST_PIN));
-
-        // OwnerPIN.check resets its validated flag before it compares, so a
-        // wrong PIN ends whatever the session had proved. On v0.2 this session
-        // stayed verified and the spend below answered 9000.
-        assertEquals(0x63C2, verify(WRONG_PIN));
-        assertGatedCommandsRefuse("after a wrong VERIFY_PIN in a verified session");
-
-        // Not a lockout: the right PIN verifies again (resetting the counter)
-        // and the session spends.
-        assertEquals(SW_OK, verify(TEST_PIN));
-        assertEquals(SW_OK,
-            transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, spendMessage(), 0, 32, 64)).getSW(),
-            "a fresh verify re-opens the session");
-    }
-
-    @Test @Order(27)
-    @DisplayName("blocking the PIN from a verified session leaves that session nothing (ENG-615)")
-    void testBlockingFromAVerifiedSessionClosesIt() {
-        assertEquals(SW_OK, loadProof1().getSW());
-        personalise();
-        assertEquals(SW_OK, verify(TEST_PIN));
-
-        // Verify, then three wrong PINs in the same session. The card now
-        // reports itself blocked (GET_INFO 2, VERIFY_PIN 6983); on v0.2 this
-        // session still spent, signed, loaded and locked — "looks locked, is
-        // open", scoped to one tap. The session has to agree with the card.
-        assertEquals(0x63C2, verify(WRONG_PIN));
-        assertEquals(0x63C1, verify(WRONG_PIN));
-        assertEquals(SW_PIN_BLOCKED, verify(WRONG_PIN), "third wrong PIN blocks the card");
-        assertEquals(2, transmit(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)).getData()[7] & 0xFF,
-            "GET_INFO reports the PIN as blocked");
-        assertGatedCommandsRefuse("in the session the card was blocked from");
-        assertEquals(SW_PIN_BLOCKED, verify(TEST_PIN), "and the right PIN cannot re-open it");
-        assertGatedCommandsRefuse("after the right PIN was refused on the blocked card");
-    }
-
-    // -------------------------------------------------------------------------
-    // ENG-615 helpers
-    // -------------------------------------------------------------------------
-
-    /** CHANGE_PIN data: 1-byte old PIN length, old PIN, new PIN. */
-    private static byte[] changePinData(byte[] oldPin, byte[] newPin) {
-        byte[] data = new byte[1 + oldPin.length + newPin.length];
-        data[0] = (byte) oldPin.length;
-        System.arraycopy(oldPin, 0, data, 1, oldPin.length);
-        System.arraycopy(newPin, 0, data, 1 + oldPin.length, newPin.length);
-        return data;
-    }
-
-    private int verify(byte[] pin) {
-        return transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, pin, 0, pin.length)).getSW();
-    }
-
-    private int changePin(byte[] data) {
-        return transmit(new CommandAPDU(CLA, INS_CHANGE_PIN, 0, 0, data)).getSW();
-    }
-
-    /**
-     * Every PIN-gated command answers 6982, and SPEND_PROOF refuses before it
-     * burns. Expects slot 0 to hold an unspent proof on entry. LOCK_CARD comes
-     * last: were the gate open it would lock the card for good, and a locked
-     * card answers LOAD_PROOF / CLEAR_SPENT with 6986 before their gate runs.
-     */
-    private void assertGatedCommandsRefuse(String when) {
-        assertEquals(SW_SECURITY_NOT_SATIS,
-            transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, spendMessage(), 0, 32, 64)).getSW(),
-            "SPEND_PROOF " + when);
-        assertEquals(0x01, transmit(new CommandAPDU(CLA, INS_GET_PROOF, 0, 0, 78)).getData()[0] & 0xFF,
-            "the slot is intact " + when + ": the gate ran before the burn");
-        assertEquals(SW_SECURITY_NOT_SATIS,
-            transmit(new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, spendMessage(), 0, 32, 64)).getSW(),
-            "SIGN_ARBITRARY " + when);
-        assertEquals(SW_SECURITY_NOT_SATIS,
-            transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, PROOF_2, 0, PROOF_2.length, 1)).getSW(),
-            "LOAD_PROOF " + when);
-        assertEquals(SW_SECURITY_NOT_SATIS,
-            transmit(new CommandAPDU(CLA, INS_CLEAR_SPENT, 0, 0, 1)).getSW(),
-            "CLEAR_SPENT " + when);
-        assertEquals(SW_SECURITY_NOT_SATIS,
-            transmit(new CommandAPDU(CLA, INS_LOCK_CARD, 0, 0xDE)).getSW(),
-            "LOCK_CARD " + when);
-    }
 }
