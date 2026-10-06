@@ -23,7 +23,7 @@ own class in jCardSim, including with a few real sats at your own mint
    signature you already make.
 2. **AUTH** (4). Is a signature over a tagged hash a safe way to prove the
    card holds its key, given that the same key signs spends?
-3. **The limit for one PIN entry** (3.8). It is counted in RAM and ends with
+3. **The limit for one PIN entry** (3.5). It is counted in RAM and ends with
    the tap. Is there a way round it we have not seen?
 4. **The date and refund key on a piece** (5). Your notes called a refund
    path "the right shape" and named its flaw. We think the date on the slot
