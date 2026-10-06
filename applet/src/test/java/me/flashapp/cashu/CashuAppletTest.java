@@ -647,6 +647,115 @@ class CashuAppletTest {
             out.toString().getBytes(StandardCharsets.UTF_8));
     }
 
+    /**
+     * A whole conversation with the card, written down: every command, what it
+     * was sent and what came back. A model of the card (Foxy's tests have one,
+     * so a wallet can be tested with no card and no Java) is held to this,
+     * command for command. `kind` says how an answer may be compared: `exact`
+     * to the byte; `key`, `sig` and `auth` hold a key or a signature, which is
+     * another card's to differ in and the reader's to verify.
+     * Written to target/transcript.json; spec/vectors/transcript.json is one
+     * run of it, kept.
+     */
+    @Test
+    @DisplayName("A conversation with the card, as a transcript for a model of it to be held to")
+    void testWriteTranscript() throws Exception {
+        StringBuilder out = new StringBuilder("[\n");
+        java.util.function.BiConsumer<String[], CommandAPDU> say = (label, cmd) -> {
+            ResponseAPDU r = transmit(cmd);
+            out.append("  {\"name\": ").append(jsonString(label[0])).append(", \"kind\": \"").append(label[1])
+               .append("\", \"apdu\": \"").append(toHex(cmd.getBytes()))
+               .append("\", \"sw\": \"").append(String.format("%04x", r.getSW()))
+               .append("\", \"data\": \"").append(toHex(r.getData())).append("\"},\n");
+        };
+        byte[] card = new byte[35 + MINT.length()];
+        System.arraycopy(REFUND, 0, card, 1, 33);
+        card[34] = (byte) MINT.length();
+        System.arraycopy(MINT.getBytes(StandardCharsets.US_ASCII), 0, card, 35, MINT.length());
+        byte[] badCard = card.clone(); badCard[1] = 0x04;
+        byte[] limit = new byte[4]; putUint32(limit, 0, 1000);
+        byte[] notPoint = buildProof(KEYSET, 16, 5); notPoint[44] = 0x04;
+        CommandAPDU select = new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR));
+        CommandAPDU info = new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256);
+
+        say.accept(new String[] { "select", "exact" }, select);
+        say.accept(new String[] { "a new card says what it is", "exact" }, info);
+        say.accept(new String[] { "its key", "key" }, new CommandAPDU(CLA, INS_GET_PUBKEY, 0, 0, 256));
+        say.accept(new String[] { "its record, not yet written", "exact" }, new CommandAPDU(CLA, INS_GET_CARD, 0, 0, 256));
+        say.accept(new String[] { "nothing loads with no PIN", "exact" }, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 16, 1), 1));
+        say.accept(new String[] { "VERIFY_PIN before there is one", "exact" }, new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, TEST_PIN));
+        say.accept(new String[] { "SET_PIN", "exact" }, new CommandAPDU(CLA, INS_SET_PIN, 0, 0, TEST_PIN));
+        say.accept(new String[] { "SET_PIN a second time", "exact" }, new CommandAPDU(CLA, INS_SET_PIN, 0, 0, NEW_PIN));
+        say.accept(new String[] { "nothing loads with the PIN not verified", "exact" }, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 16, 1), 1));
+        say.accept(new String[] { "a wrong PIN", "exact" }, new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, WRONG_PIN));
+        say.accept(new String[] { "the info after a wrong PIN", "exact" }, info);
+        say.accept(new String[] { "the right PIN", "exact" }, new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, TEST_PIN));
+        say.accept(new String[] { "nothing loads before the card has a record", "exact" }, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 16, 1), 1));
+        say.accept(new String[] { "a record whose refund key is not a point", "exact" }, new CommandAPDU(CLA, INS_SET_CARD, 0, 0, badCard));
+        say.accept(new String[] { "SET_CARD", "exact" }, new CommandAPDU(CLA, INS_SET_CARD, 0, 0, card));
+        say.accept(new String[] { "SET_LIMIT of 1000", "exact" }, new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, limit));
+        say.accept(new String[] { "the record, read back", "exact" }, new CommandAPDU(CLA, INS_GET_CARD, 0, 0, 256));
+        say.accept(new String[] { "a piece of 600 with a date", "exact" }, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 600, 1, 1900000000L), 1));
+        say.accept(new String[] { "a piece of 400 with none", "exact" }, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 400, 2), 1));
+        say.accept(new String[] { "a piece of 1", "exact" }, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 1, 3, 1900000000L), 1));
+        say.accept(new String[] { "a piece of 2000", "exact" }, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 2000, 4), 1));
+        say.accept(new String[] { "a piece whose C is not a point", "exact" }, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, notPoint, 1));
+        say.accept(new String[] { "a piece worth nothing", "exact" }, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 0, 6), 1));
+        say.accept(new String[] { "a piece of upstream's length", "exact" }, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, new byte[77], 1));
+        say.accept(new String[] { "the record cannot change under unspent pieces", "exact" }, new CommandAPDU(CLA, INS_SET_CARD, 0, 0, card));
+        say.accept(new String[] { "every slot's state", "exact" }, new CommandAPDU(CLA, INS_GET_SLOT_STATUS, 0, 0, 256));
+        say.accept(new String[] { "slot 0", "exact" }, new CommandAPDU(CLA, INS_GET_PROOF, 0, 0, 256));
+        say.accept(new String[] { "slot 1", "exact" }, new CommandAPDU(CLA, INS_GET_PROOF, 1, 0, 256));
+        say.accept(new String[] { "an empty slot", "exact" }, new CommandAPDU(CLA, INS_GET_PROOF, 9, 0, 256));
+        say.accept(new String[] { "a slot there is not", "exact" }, new CommandAPDU(CLA, INS_GET_PROOF, 64, 0, 256));
+        say.accept(new String[] { "the balance", "exact" }, new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4));
+        say.accept(new String[] { "how many slots are in use", "exact" }, new CommandAPDU(CLA, INS_GET_PROOF_COUNT, 0, 0, 1));
+        say.accept(new String[] { "2000 is over the limit by itself", "exact" }, new CommandAPDU(CLA, INS_SPEND_PROOF, 3, 0, 64));
+        say.accept(new String[] { "spend slot 0", "sig" }, new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, 64));
+        say.accept(new String[] { "spend slot 1, to the limit exactly", "sig" }, new CommandAPDU(CLA, INS_SPEND_PROOF, 1, 0, 64));
+        say.accept(new String[] { "one sat more is over it", "exact" }, new CommandAPDU(CLA, INS_SPEND_PROOF, 2, 0, 64));
+        say.accept(new String[] { "slot 0 a second time", "exact" }, new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, 64));
+        say.accept(new String[] { "an empty slot spent", "exact" }, new CommandAPDU(CLA, INS_SPEND_PROOF, 9, 0, 64));
+        say.accept(new String[] { "the PIN again", "exact" }, new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, TEST_PIN));
+        say.accept(new String[] { "spend slot 2, within the new entry's limit", "sig" }, new CommandAPDU(CLA, INS_SPEND_PROOF, 2, 0, 64));
+        say.accept(new String[] { "the balance after", "exact" }, new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4));
+        say.accept(new String[] { "CLEAR_SPENT", "exact" }, new CommandAPDU(CLA, INS_CLEAR_SPENT, 0, 0, 1));
+        say.accept(new String[] { "every slot's state after", "exact" }, new CommandAPDU(CLA, INS_GET_SLOT_STATUS, 0, 0, 256));
+        say.accept(new String[] { "the freed slot is used next", "exact" }, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 8, 7), 1));
+        say.accept(new String[] { "SIGN_ARBITRARY is not a command", "exact" }, new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, new byte[32], 64));
+        say.accept(new String[] { "AUTH", "auth" }, new CommandAPDU(CLA, INS_AUTH, 0, 0, hexToBytes("a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"), 80));
+        say.accept(new String[] { "AUTH with 32 bytes", "exact" }, new CommandAPDU(CLA, INS_AUTH, 0, 0, new byte[32], 80));
+        say.accept(new String[] { "CHANGE_PIN with a wrong old one", "exact" }, new CommandAPDU(CLA, INS_CHANGE_PIN, 0, 0, new byte[] { 4, 0x39, 0x39, 0x39, 0x39, 0x35, 0x36, 0x37, 0x38 }));
+        say.accept(new String[] { "which ended the session", "exact" }, new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, limit));
+        say.accept(new String[] { "the PIN once more", "exact" }, new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, TEST_PIN));
+        say.accept(new String[] { "CHANGE_PIN", "exact" }, new CommandAPDU(CLA, INS_CHANGE_PIN, 0, 0, new byte[] { 4, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38 }));
+        say.accept(new String[] { "a new tap", "exact" }, select);
+        say.accept(new String[] { "a spend with the PIN not typed in this tap", "exact" }, new CommandAPDU(CLA, INS_SPEND_PROOF, 3, 0, 64));
+        say.accept(new String[] { "the old PIN", "exact" }, new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, TEST_PIN));
+        say.accept(new String[] { "the new PIN", "exact" }, new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, NEW_PIN));
+        say.accept(new String[] { "a limit of nothing is no limit", "exact" }, new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, new byte[4]));
+        say.accept(new String[] { "and 2000 goes", "sig" }, new CommandAPDU(CLA, INS_SPEND_PROOF, 3, 0, 64));
+        say.accept(new String[] { "LOCK_CARD without its byte", "exact" }, new CommandAPDU(CLA, INS_LOCK_CARD, 0, 0));
+        say.accept(new String[] { "another new tap", "exact" }, select);
+        say.accept(new String[] { "wrong, two left", "exact" }, new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, WRONG_PIN));
+        say.accept(new String[] { "wrong, one left", "exact" }, new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, WRONG_PIN));
+        say.accept(new String[] { "wrong, blocked", "exact" }, new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, WRONG_PIN));
+        say.accept(new String[] { "a blocked card says so", "exact" }, info);
+        say.accept(new String[] { "the right PIN opens nothing now", "exact" }, new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, NEW_PIN));
+        say.accept(new String[] { "a blocked card does not spend", "exact" }, new CommandAPDU(CLA, INS_SPEND_PROOF, 4, 0, 64));
+        say.accept(new String[] { "nor load", "exact" }, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 16, 8), 1));
+        say.accept(new String[] { "nor lock", "exact" }, new CommandAPDU(CLA, INS_LOCK_CARD, 0, 0xDE));
+        say.accept(new String[] { "but still says what it holds", "exact" }, new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4));
+        say.accept(new String[] { "and proves it is the card", "auth" }, new CommandAPDU(CLA, INS_AUTH, 0, 0, new byte[16], 80));
+
+        String text = out.toString();
+        text = text.substring(0, text.lastIndexOf(",\n")) + "\n]\n";
+        java.nio.file.Path target = SchnorrHWMathTest.mainSourceDir().toAbsolutePath().normalize();
+        while (target != null && !target.endsWith("applet")) target = target.getParent();
+        assertNotNull(target, "the applet folder");
+        java.nio.file.Files.write(target.resolve("target").resolve("transcript.json"), text.getBytes(StandardCharsets.UTF_8));
+    }
+
     static String jsonString(String s) {
         return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
     }
