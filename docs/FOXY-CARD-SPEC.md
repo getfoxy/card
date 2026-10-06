@@ -224,6 +224,12 @@ shape" and name its flaw. This is that path, with the flaw answered.
   funded it. A different refund key for each card keeps two cards from being
   tied to each other.
 
+- **Mints differ on what a passed date does.** NUT-11 as it now reads lets
+  the first key go on spending beside the refund key, and the Cashu library
+  Foxy ships reads it that way (`tests/flashcard-vectors.js` in Foxy shows
+  it); an older mint takes the refund key only. The rule above leans on
+  neither, so it is right at both.
+
 A card can be made with no refund key, and is then cash, as upstream's.
 
 ## 7. Foxy: reading the card (Swift)
