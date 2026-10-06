@@ -140,6 +140,13 @@ A slot, 82 bytes (upstream's 78 and a date):
 64 slots to begin with (5,248 bytes), more if the J3R180's memory allows once
 measured. Phase 3 adds 97 bytes a slot for the DLEQ.
 
+The text of a piece's secret, which is what the card signs the hash of, is
+the text Foxy's Cashu library writes for a piece locked to one key:
+`["P2PK",{"nonce":"…","data":"<card key>","tags":[]}]`, and with a date
+`…"tags":[["locktime","<date>"],["refund","<refund key>"]]}]`. The card builds
+what the library builds, so loading a card is an ordinary locked payment and
+nothing is made specially for it. It is not upstream's text.
+
 ### 5.2 Commands
 
 | Command | Upstream | Fork |

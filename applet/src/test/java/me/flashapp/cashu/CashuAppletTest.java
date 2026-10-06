@@ -313,7 +313,7 @@ class CashuAppletTest {
     // =========================================================================
 
     @Test
-    @DisplayName("SPEND_PROOF signs the slot's own secret, upstream's form when there is no date")
+    @DisplayName("SPEND_PROOF signs the slot's own secret, as the wallet's library writes one")
     void testSpendSignsTheSlot() throws Exception {
         ready();
         assertEquals(SW_OK, load(buildProof(KEYSET, 16, 7)).getSW());
@@ -322,10 +322,13 @@ class CashuAppletTest {
         assertEquals(SW_OK, r.getSW());
         assertEquals(64, r.getData().length);
         assertTrue(signedFor(r.getData(), before, REFUND), "a BIP-340 signature over SHA-256 of the piece's secret");
-        // upstream's reconstruction, spelt out: no locktime, no refund
-        String upstream = "[\"P2PK\",{\"nonce\":\"" + toHex(Arrays.copyOfRange(before, 13, 45)) + "\",\"data\":\""
-            + toHex(cardKey()) + "\",\"tags\":[[\"sigflag\",\"SIG_INPUTS\"]]}]";
-        assertTrue(schnorrVerify(extractPubkeyX(cardKey()), sha256(upstream.getBytes(StandardCharsets.UTF_8)), r.getData()));
+        // spelt out: a piece locked to one key, as cashu-ts writes it
+        String plain = "[\"P2PK\",{\"nonce\":\"" + toHex(Arrays.copyOfRange(before, 13, 45)) + "\",\"data\":\""
+            + toHex(cardKey()) + "\",\"tags\":[]}]";
+        assertTrue(schnorrVerify(extractPubkeyX(cardKey()), sha256(plain.getBytes(StandardCharsets.UTF_8)), r.getData()));
+        // and not upstream's, which the library does not write
+        String upstream = plain.replace("\"tags\":[]", "\"tags\":[[\"sigflag\",\"SIG_INPUTS\"]]");
+        assertFalse(schnorrVerify(extractPubkeyX(cardKey()), sha256(upstream.getBytes(StandardCharsets.UTF_8)), r.getData()));
         assertEquals(2, slot(0)[0], "and the slot is spent");
         assertEquals(0, balance());
     }
@@ -753,8 +756,8 @@ class CashuAppletTest {
      */
     static String secretText(byte[] nonce, byte[] cardKey, long date, byte[] refundKey) {
         String s = "[\"P2PK\",{\"nonce\":\"" + toHex(nonce) + "\",\"data\":\"" + toHex(cardKey)
-                 + "\",\"tags\":[[\"sigflag\",\"SIG_INPUTS\"]";
-        if (date != 0) s += ",[\"locktime\",\"" + date + "\"],[\"refund\",\"" + toHex(refundKey) + "\"]";
+                 + "\",\"tags\":[";
+        if (date != 0) s += "[\"locktime\",\"" + date + "\"],[\"refund\",\"" + toHex(refundKey) + "\"]";
         return s + "]}]";
     }
 

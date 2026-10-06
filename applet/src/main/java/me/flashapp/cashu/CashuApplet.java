@@ -219,23 +219,27 @@ public class CashuApplet extends Applet {
     // (NUT-11), so it is the wire format between the card and whoever made the
     // piece: no spaces, this key order, lowercase hex, the date in decimal.
     //
-    //   ["P2PK",{"nonce":"<64 hex>","data":"<66 hex card key>","tags":[["sigflag","SIG_INPUTS"]]}]
+    //   ["P2PK",{"nonce":"<64 hex>","data":"<66 hex card key>","tags":[]}]
     //
     // and with a date:
     //
-    //   ...,"tags":[["sigflag","SIG_INPUTS"],["locktime","<date>"],["refund","<66 hex>"]]}]
+    //   ...,"tags":[["locktime","<date>"],["refund","<66 hex>"]]}]
     //
-    // The first form is upstream's, byte for byte.
+    // It is the text cashu-ts writes for a piece locked to one key, and for
+    // one with a locktime and one refund key (OutputData.createP2PKData), to
+    // the character: the wallet that loads a card makes its pieces with that
+    // library, so the card builds what the library builds and nothing has to
+    // be made specially for it. Foxy's tests hold the two together. It is not
+    // upstream's text, which carried a sigflag tag the library does not write.
     // -------------------------------------------------------------------------
     private static final byte[] SECRET_1 = {   // ["P2PK",{"nonce":"
         '[','"','P','2','P','K','"',',','{','"','n','o','n','c','e','"',':','"' };
     private static final byte[] SECRET_2 = {   // ","data":"
         '"',',','"','d','a','t','a','"',':','"' };
-    private static final byte[] SECRET_3 = {   // ","tags":[["sigflag","SIG_INPUTS"]
-        '"',',','"','t','a','g','s','"',':','[','[','"','s','i','g','f','l','a','g','"',',',
-        '"','S','I','G','_','I','N','P','U','T','S','"',']' };
-    private static final byte[] SECRET_DATE = {   // ,["locktime","
-        ',','[','"','l','o','c','k','t','i','m','e','"',',','"' };
+    private static final byte[] SECRET_3 = {   // ","tags":[
+        '"',',','"','t','a','g','s','"',':','[' };
+    private static final byte[] SECRET_DATE = {   // ["locktime","
+        '[','"','l','o','c','k','t','i','m','e','"',',','"' };
     private static final byte[] SECRET_REFUND = { // "],["refund","
         '"',']',',','[','"','r','e','f','u','n','d','"',',','"' };
     private static final byte[] SECRET_END_DATED = { '"',']',']','}',']' };   // "]]}]
