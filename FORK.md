@@ -28,10 +28,25 @@ section 4. In short:
 | `spec/`, `README.md`, the other `docs/` | upstream's, describing upstream's wire. Not yet rewritten |
 | `tools/cardctl`, `tools/e2e-*` | upstream's host tools, for upstream's wire. They do not drive this applet |
 | CI | switched off here until the host tools are ported |
+| `tools/cardsim/` | new: the applet on a loopback port, for Foxy in the iOS Simulator (below) |
 
 Nothing here has run on a card yet. The applet has been converted to a CAP by
 the JavaCard 3.0.5 tools and tested under jCardSim, which cannot reproduce
 EEPROM limits, torn writes, or how long a signature takes.
+
+## A card with no card
+
+`sh tools/cardsim/run.sh` runs the applet in jCardSim and listens on
+127.0.0.1:47431. Foxy's simulator build has no NFC and reaches a card there
+instead, so the app's card screens, its bridge and a mint can be driven against
+the applet's own class before a card exists. `sh tools/cardsim/ctl.sh off`
+takes the card off the reader; `on`, `pull N` (let N more commands through,
+then take it away), `new` and `show` are the others. The app's repository has
+`tests/flashcard-applet.js`, which drives the wallet's flows over the same
+socket from Node.
+
+What it holds lasts as long as the process. It prints each command's
+instruction and status and never its data, because one command is the PIN.
 
 ## Not public
 

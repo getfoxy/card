@@ -136,6 +136,16 @@ class CashuAppletTest {
     // =========================================================================
 
     @Test
+    @DisplayName("SELECT by the applet's whole name answers, as by its package's nine bytes")
+    void testSelectByTheWholeName() {
+        // what a phone sends: iOS chooses by the name in the app's Info.plist, and Foxy by the same ten bytes
+        ResponseAPDU whole = transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_HEX), 256));
+        assertEquals(SW_OK, whole.getSW());
+        assertArrayEquals(new byte[] { 0x01, 0x00 }, whole.getData(), "the same answer either way: version 1.0");
+        assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)), "and its instructions follow");
+    }
+
+    @Test
     @DisplayName("SELECT answers version 1.0, and not to upstream's AID")
     void testSelect() {
         ResponseAPDU resp = transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR)));
