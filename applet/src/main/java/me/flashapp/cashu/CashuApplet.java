@@ -19,7 +19,7 @@ import javacardx.crypto.*;
  * AID: F0 46 4F 58 59 43 41 52 44   ("FOXYCARD" after a proprietary F0)
  *
  * Command set:
- *   0x01  GET_INFO         — version, format, slot stats, PIN state, tries, limit, owner, the day
+ *   0x01  GET_INFO         — version, format, slot stats, PIN state, tries, limit, owner, the day; with P1 = 1, the tap as well
  *   0x10  GET_PUBKEY       — 33-byte compressed secp256k1 card pubkey
  *   0x11  GET_BALANCE      — sum of unspent proof amounts (uint32)
  *   0x12  GET_PROOF_COUNT  — count of non-empty slots
@@ -33,7 +33,7 @@ import javacardx.crypto.*;
  *   0x31  CLEAR_SPENT      — free spent slots (PIN, or the owner's grant)
  *   0x32  SET_CARD         — write the card record (open card: PIN; owned card: the owner's proof; only with nothing unspent)
  *   0x33  SET_LIMIT        — the daily limit, by PIN: an open card only (no owner, nothing unspent)
- *   0x34  SET_LIMIT        — the daily limit, by the owner's proof
+ *   0x34  SET_LIMIT        — the daily limit, by the owner's proof; with eight bytes, the limit on one tap as well
  *   0x35  SET_TIME         — tell the card the time, under the time key's signature
  *   0x40  VERIFY_PIN       — verify the PIN
  *   0x41  SET_PIN          — set or replace the PIN: an open card only (no owner, nothing unspent)
@@ -99,7 +99,8 @@ public class CashuApplet extends Applet {
     // FORMAT is what a reader checks before it reads a slot: 3 for this design
     // (2 was the allowance draft and the first limit).
     static final byte VERSION_MAJOR = (byte) 0x01;
-    static final byte VERSION_MINOR = (byte) 0x02;
+    // 1.3 is the limit on one tap (docs/FOXY-CARD-DAILY-LIMIT.md, section 6a).
+    static final byte VERSION_MINOR = (byte) 0x03;
     static final byte FORMAT        = (byte) 0x03;
 
     // -------------------------------------------------------------------------
@@ -188,7 +189,14 @@ public class CashuApplet extends Applet {
     // When the current day began, and what has been signed for since.
     static final short CARD_WINDOW_OFFSET  = (short) 189;
     static final short CARD_SPENT_OFFSET   = (short) 193;
-    static final short CARD_RECORD_LEN     = (short) 197;
+    // The most the card signs for in one tap, sats, big-endian; 0 is NO limit.
+    // A tap, to the card, is TAP_SECONDS of its own clock: nothing a terminal
+    // can send (the PIN again, a new SELECT, a reset) begins a new one, only
+    // time. When the current one began, and what has been signed for in it.
+    static final short CARD_TAP_LIMIT_OFFSET  = (short) 197;
+    static final short CARD_TAP_WINDOW_OFFSET = (short) 201;
+    static final short CARD_TAP_SPENT_OFFSET  = (short) 205;
+    static final short CARD_RECORD_LEN     = (short) 209;
     // SET_CARD's data: unit (1), refund key (33), time key (65), mint length (1), then the mint
     static final short SET_CARD_FIXED      = (short) 100;
     static final short SET_CARD_TIMEKEY_AT = (short) 34;
@@ -227,6 +235,7 @@ public class CashuApplet extends Applet {
     static final short SW_NO_TIME               = (short) 0x6A92; // the card has never been told the time, and this needs one
     static final short SW_NOT_THE_TIME          = (short) 0x6A93; // SET_TIME whose signature is not the time key's
     static final short SW_PIECE_ON_CARD         = (short) 0x6A94; // LOAD_PROOF of a piece whose nonce is already in a slot, spent or not
+    static final short SW_OVER_TAP_LIMIT        = (short) 0x6A95; // the piece would take this tap past the limit on one tap
 
     // LOCK_CARD confirmation byte
     static final byte LOCK_CONFIRM_BYTE = (byte) 0xDE;
@@ -391,6 +400,14 @@ public class CashuApplet extends Applet {
     /** 86 400 seconds, big-endian: how long a day is. */
     private static final byte[] DAY_SECONDS = { (byte) 0x00, (byte) 0x01, (byte) 0x51, (byte) 0x80 };
 
+    /**
+     * 10 seconds, big-endian: how long a tap is, for the limit on one tap.
+     * Longer than a card is held to a phone to pay, so one tap is one window;
+     * short enough that a second tap, for the rest of a payment larger than
+     * the limit or for the next payment, begins a window of its own.
+     */
+    private static final byte[] TAP_SECONDS = { (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x0A };
+
     // -------------------------------------------------------------------------
     // Persistent state (EEPROM)
     // -------------------------------------------------------------------------
@@ -501,12 +518,14 @@ public class CashuApplet extends Applet {
     //   98..107 a date's decimal digits
     //   108..111 a copy of a date, divided away; the end of a window, added up
     //   112..115 what the day would have signed for, with this piece
+    //   116..119 what the tap would have signed for, with this piece
     private static final short X_HEX   = (short) 0;
     private static final short X_MSG   = (short) 66;
     private static final short X_DEC   = (short) 98;
     private static final short X_NUM   = (short) 108;
     private static final short X_SUM   = (short) 112;
-    private static final short X_LEN   = (short) 116;
+    private static final short X_TAP   = (short) 116;
+    private static final short X_LEN   = (short) 120;
     private byte[] scratch;
     private MessageDigest sha;
     private RandomData rng;
@@ -683,6 +702,8 @@ public class CashuApplet extends Applet {
 
     private void processGetInfo(APDU apdu) {
         byte[] buf = apdu.getBuffer();
+        // read before the answer is written over the command
+        byte p1 = buf[ISO7816.OFFSET_P1];
         short unspent = 0, spent = 0, empty = 0;
         for (short i = 0; i < MAX_PROOFS; i++) {
             byte status = proofStorage[(short)(i * PROOF_SIZE + PROOF_STATUS_OFFSET)];
@@ -717,6 +738,17 @@ public class CashuApplet extends Applet {
         Util.arrayCopyNonAtomic(cardRecord, CARD_SPENT_OFFSET, buf, (short) 25, (short) 4);
         // and whether this tap, being the one after a payment, may put pieces on with no PIN
         buf[29] = changeGrant[0];
+        /* P1 = 1 asks for the limit on one tap as well: the limit, when the
+         * current tap began, and what has been signed for in it. Asked for,
+         * and not simply appended, so that a reader that knows the thirty
+         * bytes and checks for them still gets thirty. */
+        if (p1 == (byte) 1) {
+            Util.arrayCopyNonAtomic(cardRecord, CARD_TAP_LIMIT_OFFSET, buf, (short) 30, (short) 4);
+            Util.arrayCopyNonAtomic(cardRecord, CARD_TAP_WINDOW_OFFSET, buf, (short) 34, (short) 4);
+            Util.arrayCopyNonAtomic(cardRecord, CARD_TAP_SPENT_OFFSET, buf, (short) 38, (short) 4);
+            apdu.setOutgoingAndSend((short) 0, (short) 42);
+            return;
+        }
         apdu.setOutgoingAndSend((short) 0, (short) 30);
     }
 
@@ -903,6 +935,31 @@ public class CashuApplet extends Applet {
             }
         }
 
+        /* And the limit on one tap, the same way: a number in permanent
+         * memory, counted against a window that only the card's clock can
+         * end. A tap is TAP_SECONDS of that clock. It is not a PIN entry, a
+         * SELECT or a time in the field: a limit that any of those began
+         * again was tried first, and a terminal holding the PIN began it
+         * again between every two pieces. What bounds a terminal here is
+         * what bounds it by the day: it cannot make time pass (and with a
+         * time signer that every copy of the app holds, it can; see the
+         * spec's 5.7 for both limits). */
+        boolean tapLimited = !isZero(cardRecord, CARD_TAP_LIMIT_OFFSET, (short) 4);
+        boolean newTap = false;
+        if (tapLimited) {
+            if (isZero(cardRecord, CARD_NOW_OFFSET, (short) 4)) ISOException.throwIt(SW_NO_TIME);
+            newTap = windowIsOver(CARD_TAP_WINDOW_OFFSET, TAP_SECONDS);
+            if (newTap) {
+                Util.arrayFillNonAtomic(scratch, X_TAP, (short) 4, (byte) 0);
+            } else {
+                Util.arrayCopyNonAtomic(cardRecord, CARD_TAP_SPENT_OFFSET, scratch, X_TAP, (short) 4);
+            }
+            short over = addUint32Carry(scratch, X_TAP, proofStorage, (short)(base + PROOF_AMOUNT_OFFSET));
+            if (over != 0 || cmpUint32(scratch, X_TAP, cardRecord, CARD_TAP_LIMIT_OFFSET) > 0) {
+                ISOException.throwIt(SW_OVER_TAP_LIMIT);
+            }
+        }
+
         /* The message is the card's to work out. Upstream took 32 bytes from
          * the reader here, and signed them: slot A could be burned for slot
          * B's signature, or for anything at all, so SPENT bound nothing.
@@ -937,6 +994,10 @@ public class CashuApplet extends Applet {
         if (limited) {
             if (newDay) Util.arrayCopy(cardRecord, CARD_NOW_OFFSET, cardRecord, CARD_WINDOW_OFFSET, (short) 4);
             Util.arrayCopy(scratch, X_SUM, cardRecord, CARD_SPENT_OFFSET, (short) 4);
+        }
+        if (tapLimited) {
+            if (newTap) Util.arrayCopy(cardRecord, CARD_NOW_OFFSET, cardRecord, CARD_TAP_WINDOW_OFFSET, (short) 4);
+            Util.arrayCopy(scratch, X_TAP, cardRecord, CARD_TAP_SPENT_OFFSET, (short) 4);
         }
         proofStorage[(short)(base + PROOF_STATUS_OFFSET)] = STATUS_SPENT;
         // and the next tap may put the change on with no PIN (see select)
@@ -1201,6 +1262,8 @@ public class CashuApplet extends Applet {
             Util.arrayFillNonAtomic(cardRecord, CARD_NOW_OFFSET, (short) 4, (byte) 0);
             Util.arrayFillNonAtomic(cardRecord, CARD_WINDOW_OFFSET, (short) 4, (byte) 0);
             Util.arrayFillNonAtomic(cardRecord, CARD_SPENT_OFFSET, (short) 4, (byte) 0);
+            Util.arrayFillNonAtomic(cardRecord, CARD_TAP_WINDOW_OFFSET, (short) 4, (byte) 0);
+            Util.arrayFillNonAtomic(cardRecord, CARD_TAP_SPENT_OFFSET, (short) 4, (byte) 0);
         }
         cardRecord[CARD_SET_OFFSET] = (byte) 1;
         JCSystem.commitTransaction();
@@ -1220,8 +1283,8 @@ public class CashuApplet extends Applet {
         if (ownerSet[0] == (byte) 1) ISOException.throwIt(SW_OWNER_PROOF);
         requireNothingUnspent();
         short dataLen = apdu.setIncomingAndReceive();
-        if (dataLen != (short) 4) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-        writeLimit(apdu.getBuffer(), ISO7816.OFFSET_CDATA);
+        if (dataLen != (short) 4 && dataLen != (short) 8) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        writeLimit(apdu.getBuffer(), ISO7816.OFFSET_CDATA, dataLen);
     }
 
     /**
@@ -1238,8 +1301,9 @@ public class CashuApplet extends Applet {
         short dataLen = apdu.setIncomingAndReceive();
         byte[] buf = apdu.getBuffer();
         short at = requireOwnerProof(LABEL_SET_LIMIT, buf, dataLen);
-        if ((short)(ISO7816.OFFSET_CDATA + dataLen - at) != (short) 4) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-        writeLimit(buf, at);
+        short len = (short)(ISO7816.OFFSET_CDATA + dataLen - at);
+        if (len != (short) 4 && len != (short) 8) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        writeLimit(buf, at, len);
     }
 
     /**
@@ -1247,14 +1311,33 @@ public class CashuApplet extends Applet {
      * A limit needs a time to start from (`6A92`); a limit of 0 (none) does not.
      * One transaction: the limit and its window are all new or all old.
      */
-    private void writeLimit(byte[] src, short at) {
-        if (!isZero(src, at, (short) 4) && isZero(cardRecord, CARD_NOW_OFFSET, (short) 4)) {
+    /*
+     * `len` is 4 or 8. Four bytes are the day's limit, as they always were,
+     * and the limit on one tap is left as it is. Eight are both: the day's,
+     * then the tap's. In that form a limit whose number is not changed keeps
+     * its window and what was signed for in it, so that setting one of the
+     * two does not begin the other again; a number that changes begins its
+     * window at `now` with nothing spent, as the four-byte form always does.
+     */
+    private void writeLimit(byte[] src, short at, short len) {
+        boolean both = len == (short) 8;
+        boolean anyLimit = !isZero(src, at, (short) 4) || (both && !isZero(src, (short)(at + 4), (short) 4));
+        if (anyLimit && isZero(cardRecord, CARD_NOW_OFFSET, (short) 4)) {
             ISOException.throwIt(SW_NO_TIME);
         }
+        boolean dayChanged = !both || !sameBytes(src, at, cardRecord, CARD_LIMIT_OFFSET, (short) 4);
+        boolean tapChanged = both && !sameBytes(src, (short)(at + 4), cardRecord, CARD_TAP_LIMIT_OFFSET, (short) 4);
         JCSystem.beginTransaction();
-        Util.arrayCopy(src, at, cardRecord, CARD_LIMIT_OFFSET, (short) 4);
-        Util.arrayCopy(cardRecord, CARD_NOW_OFFSET, cardRecord, CARD_WINDOW_OFFSET, (short) 4);
-        Util.arrayFillNonAtomic(cardRecord, CARD_SPENT_OFFSET, (short) 4, (byte) 0);
+        if (dayChanged) {
+            Util.arrayCopy(src, at, cardRecord, CARD_LIMIT_OFFSET, (short) 4);
+            Util.arrayCopy(cardRecord, CARD_NOW_OFFSET, cardRecord, CARD_WINDOW_OFFSET, (short) 4);
+            Util.arrayFillNonAtomic(cardRecord, CARD_SPENT_OFFSET, (short) 4, (byte) 0);
+        }
+        if (tapChanged) {
+            Util.arrayCopy(src, (short)(at + 4), cardRecord, CARD_TAP_LIMIT_OFFSET, (short) 4);
+            Util.arrayCopy(cardRecord, CARD_NOW_OFFSET, cardRecord, CARD_TAP_WINDOW_OFFSET, (short) 4);
+            Util.arrayFillNonAtomic(cardRecord, CARD_TAP_SPENT_OFFSET, (short) 4, (byte) 0);
+        }
         JCSystem.commitTransaction();
     }
 
@@ -1659,8 +1742,13 @@ public class CashuApplet extends Applet {
      * ends. Works in scratch[X_NUM], which nothing live is using here.
      */
     private boolean dayIsOver() {
-        Util.arrayCopyNonAtomic(cardRecord, CARD_WINDOW_OFFSET, scratch, X_NUM, (short) 4);
-        if (addUint32Carry(scratch, X_NUM, DAY_SECONDS, (short) 0) != 0) return false;
+        return windowIsOver(CARD_WINDOW_OFFSET, DAY_SECONDS);
+    }
+
+    /** Whether the window that began at cardRecord[`windowAt`] and lasts `seconds` (4, big-endian) has ended by the card's clock. */
+    private boolean windowIsOver(short windowAt, byte[] seconds) {
+        Util.arrayCopyNonAtomic(cardRecord, windowAt, scratch, X_NUM, (short) 4);
+        if (addUint32Carry(scratch, X_NUM, seconds, (short) 0) != 0) return false;
         return cmpUint32(cardRecord, CARD_NOW_OFFSET, scratch, X_NUM) >= 0;
     }
 

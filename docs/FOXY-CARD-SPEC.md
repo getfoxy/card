@@ -268,7 +268,7 @@ nothing is made specially for it. It is not upstream's text.
 | LOAD_PROOF | 77 bytes | 81 bytes, with the date; refused unless a PIN is set and verified or the owner has allowed loading for this tap; refused on a card with no owner and on a card never told the time. Never touches the limit |
 | CLEAR_SPENT | as is | as is, or under the owner's grant for this tap |
 | LOCK_CARD | the PIN if one is set | a PIN set and verified, and the owner's proof (5.6) |
-| **SET_LIMIT** (`33`, `34`) | none | the daily limit (5.7): `34` by the owner's proof, on any card with an owner and any funds, with no PIN; `33` by the PIN, on a card with no owner while it is empty. 0 is no limit. (`33` was once a limit on one PIN entry, which a terminal that had the PIN walked round; it is not that) |
+| **SET_LIMIT** (`33`, `34`) | none | the daily limit (5.7): `34` by the owner's proof, on any card with an owner and any funds, with no PIN; `33` by the PIN, on a card with no owner while it is empty. 0 is no limit. Four bytes are the day's limit; eight are the day's and then the limit on ONE TAP, which the card counts against ten seconds of its own clock (`FOXY-CARD-DAILY-LIMIT.md`, 6a; `6A95` when a spend is over it). (`33` was once a limit on one PIN entry, which a terminal that had the PIN walked round; it is not that) |
 | **SET_TIME** (`35`) | none | tells the card the time under the time key's signature; it only moves the card's clock forward |
 | **SET_OWNER** (`43`) | none | gives the card its owner's public key (5.6) |
 | **GET_NONCE** (`44`) | none | a fresh 16 bytes for one owner's proof. No PIN (5.6) |
@@ -363,7 +363,9 @@ unassigned:
    nothing a terminal that has the PIN can send changes it except by spending.
    (A limit on one PIN entry, kept in RAM, was tried first: a terminal that
    had the PIN sent it again between spends, or set the limit to nothing. It
-   is gone.) The whole text is `FOXY-CARD-DAILY-LIMIT.md`, sections 3 and 6.
+   is gone. The limit on one tap that the card has now is not that: it is a
+   second number in permanent memory, counted against ten seconds of the
+   card's own clock, which the PIN, a SELECT and a reset do not begin again.) The whole text is `FOXY-CARD-DAILY-LIMIT.md`, sections 3 and 6.
 4. **Three tries**, then blocked, as upstream. The owner's proof unblocks it
    (`CHANGE_PIN`), and a wrong proof costs no tries. The refund path (6) is a
    second way out, for a card set up as recoverable.

@@ -159,6 +159,9 @@ time key, the mint and the set flag, and never the limit, the day or `now`
 | now | 4 | the latest signed time the card has accepted, seconds, big-endian; 0 until it has been told one. Written only by `SET_TIME` (and cleared only as rule 4 says) |
 | window start | 4 | when the current day began; written by `SET_LIMIT` and by a `SPEND` that begins a new day |
 | spent today | 4 | what the card has signed for since the window began |
+| tap limit | 4 | the most the card signs for in one tap, in sats, big-endian; **0 is no limit** (section 6a). Not in `GET_CARD`; `GET_INFO` with P1 = 1 says it |
+| tap start | 4 | when the current tap began; written by an eight-byte `SET_LIMIT` that changes the tap's limit and by a `SPEND` that begins a new tap |
+| spent this tap | 4 | what has been signed for since the tap began |
 | mint | 1 + up to 80 | the mint's address, as text |
 
 The mint is at most 80 characters, not 96 as it was. The reason is one
@@ -317,6 +320,58 @@ starts a new window with nothing spent, so a withdrawal gives the day back its
 whole limit. That is one extra day's limit, at the moment the owner is holding
 the card, and no more.
 
+## 6a. One tap
+
+A second limit, kept the same way: the most the card signs for in **one tap**.
+It is there for the same terminal the day is, and for the hold of a card to a
+phone that the day does not bound: with no limit on a tap, whatever the day
+allows goes in one tap, and with no limit on the day either, the whole card.
+
+**A tap is ten seconds of the card's clock** (`TAP_SECONDS`), from the first
+piece signed in it. It is not a PIN entry, a SELECT, or a time in the field. The
+first limit this card had was on one PIN entry (section 0) and bounded nothing,
+because everything that began it again was something a terminal sends. What a
+terminal cannot send is a later time, once the signer is real (5.2); until then
+this limit is exactly as strong as the day's, and no stronger.
+
+On `SPEND`, after the day's check and before anything is signed, when the tap
+limit is not 0:
+
+1. `now = 0` → `6A92`, as for the day.
+2. If `now ≥ tap start + 10`, the tap is new: it will start at `now` with nothing
+   spent.
+3. spent this tap (0 in a new one) + the piece's amount, with its carry, over the
+   tap limit → **`6A95`**, nothing signed, nothing burned, nothing written.
+4. Otherwise, in the same transaction as the day's count and the burn: the tap
+   start (if new) `= now`; spent this tap `+=` the amount.
+
+**Ten seconds** is longer than a card is held to a phone to pay (a read and two
+signatures are under three), so one hold is one tap; and short enough that the
+next charge, which a person has to type an amount and a PIN for, begins a tap of
+its own. A payment larger than the limit is made as more than one charge. A
+terminal that keeps a card for a minute can take six taps' worth: the bound is
+per ten seconds of holding, and it is written down rather than hidden.
+
+**It counts the pieces signed, not the price**, as the day does.
+
+**Setting it.** `SET_LIMIT` takes four bytes or eight, by either form. Four are
+the day's limit, as before, and leave the tap's as it is. Eight are both: the
+day's, then the tap's. In the eight-byte form a limit whose number does not
+change keeps its window and its count, so that setting one does not begin the
+other again; a number that changes begins its window at `now` with nothing
+spent. The owner's proof covers all eight bytes under `FoxyCard/set-limit`. A
+limit on a tap needs a time, as a limit on the day does (`6A92`). The owner's
+own withdrawal lifts both with one command (`0, 0`) and puts both back with one.
+
+**Reading it.** `GET_INFO` with P1 = 1 answers 42 bytes: the thirty it always
+gave, then the tap limit, the tap start and spent this tap, four bytes each.
+With P1 = 0 it answers the thirty, so a reader that checks for thirty still
+gets them. An applet without this section ignores P1 and answers thirty: that
+is how a phone tells that a card has no limit on a tap to set.
+
+**A different time key** (rule 4) clears the tap start and its count with the
+clock and the day's window. The limit itself stays.
+
 ## 7. The owner
 
 ### 7.1 The key
@@ -361,7 +416,7 @@ had a hash:
 | Command | Label (ASCII) | Value |
 |---|---|---|
 | `CHANGE_PIN` | `FoxyCard/change-pin` | the new PIN's bytes |
-| `SET_LIMIT` (owner form, `34`) | `FoxyCard/set-limit` | the new limit, 4 bytes, big-endian |
+| `SET_LIMIT` (owner form, `34`) | `FoxyCard/set-limit` | the new limit, 4 bytes, big-endian; or 8, the day's and then the tap's (6a) |
 | `SET_OWNER` (on a card that has an owner) | `FoxyCard/set-owner` | the new owner key, 65 bytes |
 | `SET_CARD` (on a card that has an owner) | `FoxyCard/set-card` | the data sent: unit, refund key, time key, mint length, mint |
 | `ALLOW_LOAD` | `FoxyCard/load` | nothing |
@@ -417,18 +472,18 @@ or changed from `FOXY-CARD-SPEC.md` 5.2 and the allowance draft.
 
 | INS | Command | Needs | Data sent | Answers |
 |---|---|---|---|---|
-| `01` | **GET_INFO** | | | 30 bytes: the draft's 17 (version 2, slots, unspent, spent, empty, capabilities, PIN state, format, tries left, locked, record set, limit 4, has owner 1), then `now` (4), window start (4), spent today (4), then whether this tap may load with no PIN (1; 8.2) |
+| `01` | **GET_INFO** | | | 30 bytes: the draft's 17 (version 2, slots, unspent, spent, empty, capabilities, PIN state, format, tries left, locked, record set, limit 4, has owner 1), then `now` (4), window start (4), spent today (4), then whether this tap may load with no PIN (1; 8.2) With **P1 = 1**, 42 bytes: those thirty, then the tap limit, the tap start and spent this tap, 4 each (6a). |
 | `10` | GET_PUBKEY | | | the card's 33-byte compressed key |
 | `11` `12` `13` `14` | GET_BALANCE, GET_PROOF_COUNT, GET_PROOF, GET_SLOT_STATUS | | | as before |
 | `15` | AUTH | | 16 random bytes | 16 of the card's own and a signature |
 | `16` | **GET_CARD** | | | format, record set, unit, limit (4), refund key (33), time key (65), mint length, mint |
 | `17` | **GET_PIECES** | | P1 = the first slot to report | one page: the first slot the page does not cover (1), then for each slot in the range that is not empty a tag (1) and, for an unspent slot, its 81 bytes (8.1). `6A83` for a P1 of 64 or more |
-| `20` | **SPEND_PROOF** | PIN, if one is set; a time, if a limit is set | P1 = the slot | the 64-byte signature; `6A8F` over the day; `6A92` with no time. **Not** opened by `ALLOW_LOAD`, nor by the tap after a payment. Notes, in permanent memory, that the card has paid: the next tap may load with no PIN (8.2) |
+| `20` | **SPEND_PROOF** | PIN, if one is set; a time, if a limit is set | P1 = the slot | the 64-byte signature; `6A8F` over the day; `6A92` with no time. **Not** opened by `ALLOW_LOAD`, nor by the tap after a payment. Notes, in permanent memory, that the card has paid: the next tap may load with no PIN (8.2) `6A95` over the limit on one tap (6a). |
 | `30` | **LOAD_PROOF** | an owner; a PIN set, and verified or `ALLOW_LOAD` given in this tap or this tap being the one after a payment (8.2); a card record; a time | 81 bytes | `6982` with no verified PIN and no grant (the gate comes first); then `6A90` with no owner; `6A92` with no time; `6A94` for a piece whose nonce is already in a slot, spent or not (checked last, after the length and the piece itself, and before anything is written) |
 | `31` | **CLEAR_SPENT** | the PIN, if one is set, or `ALLOW_LOAD` given in this tap, or the tap after a payment | | |
 | `32` | **SET_CARD** | no owner: PIN set and verified, nothing unspent. Owner: the owner's proof, nothing unspent | unit (1), refund key (33), time key (65), mint length (1), mint; with an owner, proof length (1) and the proof first | `6A8D` if anything is unspent; `6A80` for a time key not beginning `04`, or a bad refund key; `6700` for a bad length |
-| `33` | **SET_LIMIT, PIN form** | **a card with no owner**: PIN set and verified; nothing unspent; a time, unless the limit is 0 | limit (4) | `6A91` on a card with an owner (use `34`); `6A8D` if anything is unspent; `6A92` with no time |
-| `34` | **SET_LIMIT, owner's form** | the owner's proof; a time, unless the limit is 0. **No PIN**, any funds | proof length (1), proof (DER), limit (4) | `6A90`, `6A91`, `6A92`; `6986` on a locked card |
+| `33` | **SET_LIMIT, PIN form** | **a card with no owner**: PIN set and verified; nothing unspent; a time, unless the limit is 0 | limit (4) | `6A91` on a card with an owner (use `34`); `6A8D` if anything is unspent; `6A92` with no time Eight bytes set the limit on one tap as well (6a). |
+| `34` | **SET_LIMIT, owner's form** | the owner's proof; a time, unless the limit is 0. **No PIN**, any funds | proof length (1), proof (DER), limit (4) | `6A90`, `6A91`, `6A92`; `6986` on a locked card Eight bytes of limit (the day's, then the tap's) set both (6a). |
 | `35` | **SET_TIME** | nothing | time (4), signature length (1), signature (DER) | the card's `now` (4); `6A93` for a signature not the time key's; `6A8C` with no record |
 | `40` | VERIFY_PIN | | the PIN, 4 to 8 bytes | changes nothing about spending |
 | `41` | **SET_PIN** | **a card with no owner**, nothing unspent. No PIN, no proof | the PIN | sets or replaces the PIN and unblocks; `6A91` on a card with an owner (use `42`); `6A8D` if anything is unspent; `6986` locked |
@@ -474,6 +529,7 @@ Status words, in the part of `6Axx` ISO 7816-4 leaves unassigned:
 |---|---|
 | `6A8D` | card in use: a thing that is set only on an empty card, on a card with an unspent piece |
 | `6A8F` | over the day: this piece would take today past its limit. Nothing signed, nothing burned |
+| `6A95` | over the tap: this piece would take this tap past the limit on one tap (6a). Nothing signed, nothing burned |
 | `6A90` | no owner: a command that needs the owner's proof, or `GET_NONCE`, or a load, on a card that has none |
 | `6A91` | the owner's proof is missing or is not the owner's, or this command is not open to a card with an owner. Costs no PIN tries, changes nothing, does not end the PIN session |
 | `6A92` | no time: the card has never been told the time, and this needs one |

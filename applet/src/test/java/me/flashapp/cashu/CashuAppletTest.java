@@ -79,6 +79,9 @@ class CashuAppletTest {
     static final int SW_NO_OWNER            = 0x6A90;
     static final int SW_OWNER_PROOF         = 0x6A91;
     static final int SW_NO_TIME             = 0x6A92;
+    static final int SW_OVER_TAP_LIMIT      = 0x6A95;
+    // how long a tap is, to the card: the applet's TAP_SECONDS
+    static final long TAP = 10L;
     static final int SW_NOT_THE_TIME        = 0x6A93;
     static final int SW_PIECE_ON_CARD       = 0x6A94;
     static final int SW_INS_NOT_SUPPORTED   = 0x6D00;
@@ -216,6 +219,10 @@ class CashuAppletTest {
     private static CommandAPDU setLimitCommand(byte[] proof, long sats) {
         return new CommandAPDU(CLA, INS_SET_LIMIT_OWNER, 0, 0, ownerData(proof, u32(sats)));
     }
+    /** Both limits in one command: the day's, then the tap's. */
+    private static CommandAPDU setLimitsCommand(byte[] proof, long day, long tap) {
+        return new CommandAPDU(CLA, INS_SET_LIMIT_OWNER, 0, 0, ownerData(proof, concat(u32(day), u32(tap))));
+    }
     private static CommandAPDU setLimitByPinCommand(long sats) {
         return new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, u32(sats));
     }
@@ -268,6 +275,15 @@ class CashuAppletTest {
     private int lock() {
         return sw(lockCommand(ownerProof(L_LOCK, OWNER, nonceBytes(), new byte[0])));
     }
+    /** The owner's phone setting both limits: a nonce, a proof over the eight bytes, the command. */
+    private int setLimits(long day, long tap) {
+        return sw(setLimitsCommand(ownerProof(L_LIMIT, OWNER, nonceBytes(), concat(u32(day), u32(tap))), day, tap));
+    }
+    /** GET_INFO asked for the tap as well (P1 = 1): forty-two bytes. */
+    private byte[] infoTap() { return transmit(new CommandAPDU(CLA, INS_GET_INFO, 1, 0, 256)).getData(); }
+    private long tapLimit() { return readUint32(infoTap(), 30); }
+    private long tapWindow() { return readUint32(infoTap(), 34); }
+    private long tapSpent() { return readUint32(infoTap(), 38); }
     /** The card is told the time, by the signer. */
     private int setTime(long t) { return sw(setTimeCommand(t, timeSignature(SIGNER, t))); }
 
@@ -352,7 +368,7 @@ class CashuAppletTest {
         // what a phone sends: iOS chooses by the name in the app's Info.plist, and Foxy by the same ten bytes
         ResponseAPDU whole = transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_HEX), 256));
         assertEquals(SW_OK, whole.getSW());
-        assertArrayEquals(new byte[] { 0x01, 0x02 }, whole.getData(), "the same answer either way: version 1.2");
+        assertArrayEquals(new byte[] { 0x01, 0x03 }, whole.getData(), "the same answer either way: version 1.3");
         assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)), "and its instructions follow");
     }
 
@@ -361,7 +377,7 @@ class CashuAppletTest {
     void testSelect() {
         ResponseAPDU resp = transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR)));
         assertEquals(SW_OK, resp.getSW());
-        assertArrayEquals(new byte[] { 0x01, 0x02 }, resp.getData());
+        assertArrayEquals(new byte[] { 0x01, 0x03 }, resp.getData());
         assertNotEquals(SW_OK, sw(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(UPSTREAM_AID))),
             "an upstream reader must not find this applet under upstream's AID: the wire is not the same");
     }
@@ -371,7 +387,7 @@ class CashuAppletTest {
     void testInfoFresh() {
         byte[] d = info();
         assertEquals(30, d.length);
-        assertEquals(1, d[0]); assertEquals(2, d[1]);
+        assertEquals(1, d[0]); assertEquals(3, d[1]);
         assertEquals(MAX_PROOFS, d[2] & 0xFF);
         assertEquals(0, d[3]); assertEquals(0, d[4]);
         assertEquals(MAX_PROOFS, d[5] & 0xFF);
@@ -1825,6 +1841,205 @@ class CashuAppletTest {
     }
 
     // =========================================================================
+    // One tap
+    // =========================================================================
+
+    @Test
+    @DisplayName("GET_INFO with P1 = 1 adds the tap: 42 bytes, the first thirty as they are without it; a new card has no limit on a tap")
+    void testInfoWithTheTap() {
+        byte[] plain = info();
+        byte[] more = infoTap();
+        assertEquals(30, plain.length);
+        assertEquals(42, more.length);
+        assertArrayEquals(plain, Arrays.copyOf(more, 30), "nothing before it moved");
+        assertEquals(0, readUint32(more, 30), "no limit on a tap");
+        assertEquals(0, readUint32(more, 34), "no window");
+        assertEquals(0, readUint32(more, 38), "nothing signed for in it");
+    }
+
+    @Test
+    @DisplayName("One tap: a terminal that sends the PIN again, selects again and resets the card between spends takes one tap's limit, and a second only once the card's clock is ten seconds on")
+    void testTerminalTakesOneTap() {
+        readyWithLimit(0);
+        assertEquals(SW_OK, setLimits(0, 100));
+        assertEquals(100, tapLimit());
+        assertEquals(0, limit(), "and no limit on the day");
+        for (int i = 0; i < 6; i++) assertEquals(SW_OK, load(buildProof(KEYSET, 50, i + 1)).getSW());
+        reselect();
+        int taken = 0;
+        for (int i = 0; i < 6; i++) {
+            assertEquals(SW_OK, verify(TEST_PIN));
+            if (spend(i).getSW() == SW_OK) taken += 50;
+        }
+        assertEquals(100, taken, "two pieces of six, with the PIN presented six times");
+        assertEquals(100, tapSpent());
+        assertEquals(T0, tapWindow());
+        // a new SELECT, a power cycle, the same time again and nine seconds on: nothing more
+        for (int round = 0; round < 3; round++) {
+            if (round == 1) simulator.reset();
+            reselect();
+            assertEquals(SW_OK, verify(TEST_PIN));
+            assertEquals(SW_OK, setTime(T0 + (round == 2 ? TAP - 1 : 0)));
+            for (int i = 0; i < 6; i++) {
+                assertEquals(SW_OK, verify(TEST_PIN));
+                if (slot(i)[0] == 1) assertEquals(SW_OVER_TAP_LIMIT, spend(i).getSW());
+            }
+        }
+        assertEquals(200, balance());
+        // the owner's proof is what changes it, and a terminal has none
+        byte[] terminalProof = new byte[8];
+        nonceBytes();
+        assertEquals(SW_OWNER_PROOF, sw(setLimitsCommand(terminalProof, 0, 0)));
+        assertEquals(SW_OWNER_PROOF, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(0), u32(0)))), "nor does the PIN, on a card with an owner");
+        assertEquals(100, tapLimit());
+        // ten seconds on by the card's clock: the next tap
+        reselect();
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, setTime(T0 + TAP));
+        int second = 0;
+        for (int i = 0; i < 6; i++) {
+            assertEquals(SW_OK, verify(TEST_PIN));
+            if (slot(i)[0] == 1 && spend(i).getSW() == SW_OK) second += 50;
+        }
+        assertEquals(100, second, "a second tap's worth, and no more");
+        assertEquals(T0 + TAP, tapWindow());
+        assertEquals(100, tapSpent());
+        assertEquals(100, balance());
+    }
+
+    @Test
+    @DisplayName("One tap: a piece larger than the limit is never signed, exactly the limit is, and nothing is burned or counted by a refusal")
+    void testExactlyTheTap() {
+        readyWithLimit(0);
+        assertEquals(SW_OK, setLimits(0, 64));
+        assertEquals(SW_OK, load(buildProof(KEYSET, 128, 1)).getSW());
+        assertEquals(SW_OK, load(buildProof(KEYSET, 64, 2)).getSW());
+        assertEquals(SW_OK, load(buildProof(KEYSET, 1, 3)).getSW());
+        reselect();
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OVER_TAP_LIMIT, spend(0).getSW(), "128 is over a limit of 64 on its own");
+        assertEquals(1, slot(0)[0], "and is not burned");
+        assertEquals(0, tapSpent(), "nor counted");
+        assertEquals(SW_OK, spend(1).getSW(), "64 is the limit, and is signed");
+        assertEquals(SW_OVER_TAP_LIMIT, spend(2).getSW(), "and then not one sat more");
+        assertEquals(64, tapSpent());
+        assertEquals(129, balance());
+    }
+
+    @Test
+    @DisplayName("The two limits side by side: each refuses in its own name, the tap's window turns in ten seconds and the day's does not, and a spend is counted in both")
+    void testTheDayAndTheTap() {
+        readyWithLimit(0);
+        assertEquals(SW_OK, setLimits(150, 100));
+        assertEquals(150, limit());
+        assertEquals(100, tapLimit());
+        for (int i = 0; i < 4; i++) assertEquals(SW_OK, load(buildProof(KEYSET, 50, i + 1)).getSW());
+        reselect();
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, spend(0).getSW());
+        assertEquals(SW_OK, spend(1).getSW());
+        assertEquals(100, spentToday());
+        assertEquals(100, tapSpent());
+        assertEquals(SW_OVER_TAP_LIMIT, spend(2).getSW(), "the tap is full; the day is not");
+        assertEquals(SW_OK, setTime(T0 + TAP));
+        assertEquals(SW_OK, spend(2).getSW(), "the next tap: 150 today, which is the day's limit");
+        assertEquals(150, spentToday());
+        assertEquals(50, tapSpent());
+        assertEquals(SW_OVER_LIMIT, spend(3).getSW(), "the tap has room; the day has none");
+        assertEquals(SW_OK, setTime(T0 + 2 * TAP));
+        assertEquals(SW_OVER_LIMIT, spend(3).getSW(), "and another tap does not give the day more");
+        assertEquals(50, balance());
+    }
+
+    @Test
+    @DisplayName("SET_LIMIT with eight bytes sets both; a limit whose number does not change keeps its window and its count; four bytes are the day's alone and leave the tap's; it needs a time, as the day's does")
+    void testSettingTheTwoLimits() {
+        assertEquals(SW_OK, setPin(TEST_PIN));
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, setCard(MINT, REFUND));
+        assertEquals(SW_OK, setOwner(OWNER));
+        assertEquals(SW_NO_TIME, setLimits(0, 500), "never told the time");
+        assertEquals(SW_OK, setLimits(0, 0), "no limits need none");
+        assertEquals(SW_OK, setTime(T0));
+        assertEquals(SW_OK, setLimits(1000, 500));
+        assertEquals(1000, limit());
+        assertEquals(500, tapLimit());
+        assertEquals(SW_OK, load(buildProof(KEYSET, 100, 1)).getSW());
+        assertEquals(SW_OK, load(buildProof(KEYSET, 100, 2)).getSW());
+        reselect();
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, spend(0).getSW());
+        assertEquals(100, spentToday());
+        assertEquals(100, tapSpent());
+        // the tap's limit changed, the day's the same: the day keeps its window and its count
+        assertEquals(SW_OK, setTime(T0 + 5));
+        assertEquals(SW_OK, setLimits(1000, 300));
+        assertEquals(300, tapLimit());
+        assertEquals(T0 + 5, tapWindow(), "the tap begins again at the clock");
+        assertEquals(0, tapSpent());
+        assertEquals(T0, windowStart(), "the day does not");
+        assertEquals(100, spentToday());
+        // the day's changed, the tap's the same
+        assertEquals(SW_OK, spend(1).getSW());
+        assertEquals(SW_OK, setLimits(2000, 300));
+        assertEquals(2000, limit());
+        assertEquals(0, spentToday(), "the day begins again");
+        assertEquals(100, tapSpent(), "the tap does not");
+        // four bytes: the day's alone, as it always was
+        assertEquals(SW_OK, setLimit(700));
+        assertEquals(700, limit());
+        assertEquals(300, tapLimit(), "the tap's limit is left as it is");
+        // both removed, for a withdrawal, and put back
+        assertEquals(SW_OK, setLimits(0, 0));
+        assertEquals(0, limit());
+        assertEquals(0, tapLimit());
+        assertEquals(SW_OK, setLimits(700, 300));
+        assertEquals(300, tapLimit());
+        // a length that is neither
+        byte[] six = new byte[6];
+        assertEquals(0x6700, sw(new CommandAPDU(CLA, INS_SET_LIMIT_OWNER, 0, 0, ownerData(ownerProof(L_LIMIT, OWNER, nonceBytes(), six), six))));
+        // and a new SELECT and a reset leave both
+        reselect();
+        simulator.reset();
+        reselect();
+        assertEquals(700, limit());
+        assertEquals(300, tapLimit());
+    }
+
+    @Test
+    @DisplayName("A limit on a tap with no time refuses to sign, as the day's does; a new time key clears the tap's window with the clock")
+    void testTheTapNeedsATime() throws Exception {
+        readyWithLimit(0);
+        assertEquals(SW_OK, setLimits(0, 100));
+        assertEquals(SW_OK, load(buildProof(KEYSET, 50, 1)).getSW());
+        assertEquals(SW_OK, load(buildProof(KEYSET, 50, 2)).getSW());
+        reselect();
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, spend(0).getSW());
+        assertEquals(T0, tapWindow());
+        assertEquals(50, tapSpent());
+        // another signer's key: the clock is cleared, and the tap's window and count with it. The limit stays.
+        assertEquals(SW_CARD_IN_USE, ownerSetCard(MINT, REFUND, OTHER_SIGNER), "not while it holds money");
+        assertEquals(SW_OK, spend(1).getSW());
+        assertEquals(SW_OK, ownerSetCard(MINT, REFUND, OTHER_SIGNER));
+        assertEquals(0, now());
+        assertEquals(0, tapWindow());
+        assertEquals(0, tapSpent());
+        assertEquals(100, tapLimit());
+        assertEquals(SW_NO_TIME, load(buildProof(KEYSET, 50, 3)).getSW(), "and nothing goes on until it is told the time again");
+        // a funded card with no clock: no command can leave one so, so the state is set directly
+        assertEquals(SW_OK, sw(setTimeCommand(T0 + 100, timeSignature(OTHER_SIGNER, T0 + 100))));
+        assertEquals(SW_OK, load(buildProof(KEYSET, 50, 3)).getSW());
+        putRecord(CashuApplet.CARD_NOW_OFFSET, new byte[4]);
+        reselect();
+        assertEquals(SW_OK, verify(TEST_PIN));
+        byte[] before = slot(2);
+        assertEquals(SW_NO_TIME, spend(2).getSW(), "a card that cannot know the time does not spend under a limit on a tap");
+        assertArrayEquals(before, slot(2), "nothing burned");
+        assertEquals(0, tapSpent());
+    }
+
+    // =========================================================================
     // The day
     // =========================================================================
 
@@ -2099,14 +2314,18 @@ class CashuAppletTest {
         int commit = body.indexOf("commitTransaction");
         int sign = body.indexOf("schnorrHW.sign");
         int send = body.indexOf("setOutgoingAndSend", commit);
-        assertTrue(refuse > 0 && refuse < begin && refuseTime > 0 && refuseTime < begin, "the refusals come before anything is changed");
+        int refuseTap = body.indexOf("SW_OVER_TAP_LIMIT");
+        int tapWindow = body.indexOf("CARD_TAP_WINDOW_OFFSET", begin);
+        int tapCharge = body.indexOf("CARD_TAP_SPENT_OFFSET", begin);
+        assertTrue(refuse > 0 && refuse < begin && refuseTime > 0 && refuseTime < begin && refuseTap > 0 && refuseTap < begin, "the refusals come before anything is changed");
+        assertTrue(begin < tapWindow && tapWindow < tapCharge && tapCharge < burn, "the tap's window and what it has signed for change in the same transaction as the slot");
         /* Signed into RAM first, then burned, then answered: a card pulled away while it signs (most of
          * a second) has burned nothing and sent nothing, and no signature leaves before the burn. Burned
          * first, a pull-away in that time lost the piece with no signature anywhere. */
         assertTrue(sign > 0 && sign < begin && begin < window && window < charge && charge < burn && burn < commit && commit < send,
             "signed first; the window, what the day has signed for and the slot change between begin and commit; and only then the answer");
         assertEquals(1, count(body, "setOutgoingAndSend"), "the signature leaves the card in one place, after the commit");
-        assertEquals(1, count(body, "Util.arrayCopy(cardRecord"), "a spend begins the window by copying the clock, in the transaction, and writes no other part of the record");
+        assertEquals(2, count(body, "Util.arrayCopy(cardRecord"), "a spend begins the day's window and the tap's by copying the clock, in the transaction, and writes no other part of the record");
     }
 
     private static int count(String s, String what) {
@@ -2575,6 +2794,37 @@ class CashuAppletTest {
         time(out, "the old signer's time is not the time any more", SW_NOT_THE_TIME, SIGNER, T0 + 3 * DAY);
         time(out, "the new signer's, earlier than the old clock was, is", SW_OK, OTHER_SIGNER, T0 + 100);
         say(out, "the clock is the new one's", "exact", SW_OK, info);
+
+        // one tap: a second limit, on what the card signs for within ten seconds of its own clock
+        CommandAPDU infoTap = new CommandAPDU(CLA, INS_GET_INFO, 1, 0, 256);
+        say(out, "the info asked for the tap as well: twelve bytes more, and no limit on a tap", "exact", SW_OK, infoTap);
+        owner(out, "both limits in one command, with a proof for the day's alone", SW_OWNER_PROOF, L_LIMIT, OWNER, u32(0), p -> setLimitsCommand(p, 0, 100));
+        owner(out, "both limits by the owner: none on the day, 100 on a tap", SW_OK, L_LIMIT, OWNER, concat(u32(0), u32(100)), p -> setLimitsCommand(p, 0, 100));
+        say(out, "the info: the tap's limit, and its window begun at the clock", "exact", SW_OK, infoTap);
+        say(out, "and the thirty bytes say nothing of it", "exact", SW_OK, info);
+        for (int i = 0; i < 3; i++) {
+            say(out, "load 50, for the tap", "exact", SW_OK, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 50, 21 + i), 1));
+        }
+        say(out, "spend 50", "sig", SW_OK, new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, 64));
+        say(out, "and 50 more: the tap's limit exactly", "sig", SW_OK, new CommandAPDU(CLA, INS_SPEND_PROOF, 1, 0, 64));
+        say(out, "a third is over the limit on one tap", "exact", SW_OVER_TAP_LIMIT, new CommandAPDU(CLA, INS_SPEND_PROOF, 2, 0, 64));
+        say(out, "the PIN again begins no new tap", "exact", SW_OK, verifyOk);
+        say(out, "still over", "exact", SW_OVER_TAP_LIMIT, new CommandAPDU(CLA, INS_SPEND_PROOF, 2, 0, 64));
+        say(out, "nor does a new SELECT", "exact", SW_OK, select);
+        say(out, "the PIN", "exact", SW_OK, verifyOk);
+        say(out, "still over, after it", "exact", SW_OVER_TAP_LIMIT, new CommandAPDU(CLA, INS_SPEND_PROOF, 2, 0, 64));
+        time(out, "nine seconds on", SW_OK, OTHER_SIGNER, T0 + 109);
+        say(out, "is the same tap", "exact", SW_OVER_TAP_LIMIT, new CommandAPDU(CLA, INS_SPEND_PROOF, 2, 0, 64));
+        time(out, "ten seconds on", SW_OK, OTHER_SIGNER, T0 + 110);
+        say(out, "is the next: the third is signed", "sig", SW_OK, new CommandAPDU(CLA, INS_SPEND_PROOF, 2, 0, 64));
+        say(out, "the info: the tap begun again at the clock, and 50 signed for in it", "exact", SW_OK, infoTap);
+        owner(out, "the tap's limit changed, the day's the same", SW_OK, L_LIMIT, OWNER, concat(u32(0), u32(70)), p -> setLimitsCommand(p, 0, 70));
+        say(out, "the info: 70 on a tap, and a window with nothing in it", "exact", SW_OK, infoTap);
+        owner(out, "the day's limit alone, in four bytes", SW_OK, L_LIMIT, OWNER, u32(900), p -> setLimitCommand(p, 900));
+        say(out, "the info: the tap's limit is left as it was", "exact", SW_OK, infoTap);
+        owner(out, "both taken off", SW_OK, L_LIMIT, OWNER, concat(u32(0), u32(0)), p -> setLimitsCommand(p, 0, 0));
+        say(out, "the info: no limits", "exact", SW_OK, infoTap);
+        say(out, "CLEAR_SPENT: the card is empty again", "exact", SW_OK, clear);
 
         // the owner replaces itself, and locks
         say(out, "SET_OWNER with no proof", "exact", SW_OWNER_PROOF, setOwnerOpenCommand(OTHER_OWNER));
