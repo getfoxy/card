@@ -1502,7 +1502,9 @@ class CashuAppletTest {
         assertEquals(SW_OK, load(buildProof(KEYSET, 16, 1)).getSW());
         assertEquals(SW_OK, spend(0).getSW());
         reselect();
-        reselect();     // the first tap after a payment may load (8.2); this is the one after that
+        // the payment left a change note (8.2); spend it with one no-PIN load so the rest of this test runs with no authority of any kind
+        assertEquals(SW_OK, load(buildProof(KEYSET, 1, 9)).getSW(), "the change note allows one no-PIN load");
+        reselect();
         // no PIN in this tap
         assertEquals(SW_SECURITY_NOT_SATIS, load(buildProof(KEYSET, 8, 2)).getSW());
         assertEquals(SW_SECURITY_NOT_SATIS, clearSpent());
@@ -1510,7 +1512,7 @@ class CashuAppletTest {
         assertEquals(SW_OK, load(buildProof(KEYSET, 8, 2)).getSW(), "a load, with no PIN");
         assertEquals(SW_OK, load(buildProof(KEYSET, 4, 3, 1900000000L)).getSW());
         assertEquals(SW_OK, clearSpent(), "and the used slots cleared");
-        assertEquals(12, balance());
+        assertEquals(13, balance());
         // and nothing else the PIN opens
         assertEquals(SW_SECURITY_NOT_SATIS, spend(0).getSW(), "not a spend");
         assertEquals(SW_SECURITY_NOT_SATIS, spend(1).getSW());
@@ -1519,7 +1521,7 @@ class CashuAppletTest {
         assertEquals(SW_SECURITY_NOT_SATIS, sw(setLimitByPinCommand(1)), "not the limit by PIN");
         assertEquals(SW_SECURITY_NOT_SATIS, lock(), "not the lock");
         assertEquals(0, info()[10]);
-        assertEquals(12, balance(), "nothing was spent");
+        assertEquals(13, balance(), "nothing was spent");
         // the grant is for this tap
         reselect();
         assertEquals(SW_SECURITY_NOT_SATIS, load(buildProof(KEYSET, 8, 4)).getSW(), "a new SELECT ends it");
@@ -1537,7 +1539,7 @@ class CashuAppletTest {
     }
 
     @Test
-    @DisplayName("8.2: the tap after a payment may put pieces on with no PIN, and free the burned places, and nothing else; the tap after that may not")
+    @DisplayName("8.2: the tap that writes the change loads with no PIN and frees the burned places, and nothing else; the load closes the window")
     void testChangeTapNeedsNoPin() {
         readyWithLimit(100000);
         assertEquals(SW_OK, load(buildProof(KEYSET, 16, 1)).getSW());
@@ -1547,25 +1549,28 @@ class CashuAppletTest {
         assertEquals(0, info()[29], "the note is for the next tap, not the one that paid");
         reselect();
         assertEquals(1, info()[29], "the tap after a payment says it may load");
+        assertEquals(SW_OK, clearSpent(), "the place the payment burned is freed, with no PIN");
+        assertEquals(1, info()[29], "freeing a place did not close the window");
         assertEquals(SW_OK, load(buildProof(KEYSET, 4, 3)).getSW(), "the change, with no PIN");
-        assertEquals(SW_OK, clearSpent(), "and the place the payment burned is freed");
-        assertEquals(12, balance());
+        assertEquals(1, info()[29], "the same tap may still load the rest of the change");
+        assertEquals(SW_OK, load(buildProof(KEYSET, 2, 4)).getSW(), "a second piece of the change, still no PIN");
+        assertEquals(14, balance());
         // and nothing else the PIN opens
         assertEquals(SW_SECURITY_NOT_SATIS, spend(1).getSW(), "not a spend");
         assertEquals(SW_OWNER_PROOF, setPin(NEW_PIN), "not the PIN");
         assertEquals(SW_OWNER_PROOF, setCardOpen("https://x.example.com", NO_REFUND, SIGNER), "not the record");
         assertEquals(SW_SECURITY_NOT_SATIS, sw(setLimitByPinCommand(1)), "not the limit by PIN");
         assertEquals(SW_SECURITY_NOT_SATIS, lock(), "not the lock");
-        assertEquals(12, balance(), "nothing was spent");
+        assertEquals(14, balance(), "nothing was spent");
         reselect();
-        assertEquals(0, info()[29], "the tap after that has no grant");
-        assertEquals(SW_SECURITY_NOT_SATIS, load(buildProof(KEYSET, 4, 4)).getSW(), "and loads nothing with no PIN");
+        assertEquals(0, info()[29], "the load closed the window: the next fresh tap has no grant");
+        assertEquals(SW_SECURITY_NOT_SATIS, load(buildProof(KEYSET, 4, 5)).getSW(), "and loads nothing with no PIN");
         assertEquals(SW_SECURITY_NOT_SATIS, clearSpent());
     }
 
     @Test
-    @DisplayName("8.2: the note outlives the card leaving the field, is used up by whichever tap comes next, even one that only reads, and a payment in the change tap makes a new one")
-    void testChangeNoteIsForOneTap() {
+    @DisplayName("8.2: the note survives a glance, a cut-short tap and a fresh session, and closes only when the change lands")
+    void testChangeNoteSurvivesUntilLoaded() {
         readyWithLimit(100000);
         assertEquals(SW_OK, load(buildProof(KEYSET, 16, 1)).getSW());
         assertEquals(SW_OK, load(buildProof(KEYSET, 8, 2)).getSW());
@@ -1574,20 +1579,23 @@ class CashuAppletTest {
         simulator.reset();      // the card left the field: the note is in permanent memory
         reselect();
         assertEquals(1, info()[29], "the next tap, after the card has been away, has the grant");
-        reselect();             // and used it up by only reading
-        assertEquals(0, info()[29]);
-        assertEquals(SW_SECURITY_NOT_SATIS, load(buildProof(KEYSET, 4, 4)).getSW(), "a tap that only read the card used the note up");
+        reselect();             // a tap that only reads the card
+        assertEquals(1, info()[29], "a glance that writes nothing leaves the note standing");
+        simulator.reset();      // the phone opens a fresh session for the write itself
+        reselect();
+        assertEquals(1, info()[29], "and so does a cut-short tap and a fresh session");
+        assertEquals(SW_OK, load(buildProof(KEYSET, 4, 4)).getSW(), "the change goes on at last, with no PIN");
+        reselect();
+        assertEquals(0, info()[29], "and now, the change on, the window is closed");
+        assertEquals(SW_SECURITY_NOT_SATIS, load(buildProof(KEYSET, 2, 5)).getSW(), "a stranger's later tap gets nothing");
+        // a payment in a later tap makes a new note
         assertEquals(SW_OK, verify(TEST_PIN));
         assertEquals(SW_OK, spend(1).getSW(), "a payment, with the PIN");
         reselect();
-        assertEquals(1, info()[29]);
-        assertEquals(SW_OK, load(buildProof(KEYSET, 4, 4)).getSW(), "its change, with no PIN");
-        assertEquals(SW_OK, verify(TEST_PIN));
-        assertEquals(SW_OK, spend(2).getSW(), "a payment in the change tap, with the PIN");
+        assertEquals(1, info()[29], "makes a note for the tap after it");
+        assertEquals(SW_OK, load(buildProof(KEYSET, 2, 5)).getSW(), "its change, with no PIN");
         reselect();
-        assertEquals(SW_OK, load(buildProof(KEYSET, 2, 5)).getSW(), "makes a note for the tap after it");
-        reselect();
-        assertEquals(SW_SECURITY_NOT_SATIS, load(buildProof(KEYSET, 2, 6)).getSW());
+        assertEquals(0, info()[29]);
     }
 
     @Test
@@ -2115,8 +2123,8 @@ class CashuAppletTest {
         assertFalse(verify.contains("scratch"));
         assertFalse(verify.contains("loadGrant"));
         int uses = count(code, "loadGrant[0]");
-        // set once in ALLOW_LOAD, read in the load authority and in CLEAR_SPENT, and nowhere else
-        assertEquals(3, uses, "loadGrant is set by ALLOW_LOAD and read by requireLoadAuthority and CLEAR_SPENT: " + uses);
+        // set once in ALLOW_LOAD, read in the load authority, in CLEAR_SPENT, and in LOAD_PROOF (where a change-grant load clears the note), and nowhere else
+        assertEquals(4, uses, "loadGrant is set by ALLOW_LOAD and read by requireLoadAuthority, CLEAR_SPENT and LOAD_PROOF: " + uses);
         assertTrue(body(code, "private void processAllowLoad(", "private short requireOwnerProof(").contains("loadGrant[0] = (byte) 1"));
         assertTrue(body(code, "private void requireLoadAuthority(", "private void requireNothingUnspent(").contains("loadGrant[0]"));
         assertTrue(body(code, "private void processClearSpent(", "private void processSetCard(").contains("loadGrant[0]"));
@@ -2470,24 +2478,30 @@ class CashuAppletTest {
         say(out, "a piece whose place was freed may be loaded again", "exact", SW_OK, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 600, 1, 1900000000L), 1));
         say(out, "and is then on the card, and not written twice", "exact", SW_PIECE_ON_CARD, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 600, 1, 1900000000L), 1));
 
-        // the tap after a payment may put pieces on with no PIN: the change (8.2)
+        // the tap that writes the change may load with no PIN; the note stands until a load uses it (8.2)
         say(out, "a new tap, after payments", "exact", SW_OK, select);
         say(out, "the info: this tap may load with no PIN", "exact", SW_OK, info);
+        say(out, "a tap that only reads the card", "exact", SW_OK, select);
+        say(out, "still may: a glance did not spend the note", "exact", SW_OK, info);
         say(out, "a piece of 4, with no PIN: change", "exact", SW_OK, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 4, 12), 1));
+        say(out, "the same tap may still load the rest", "exact", SW_OK, info);
         say(out, "CLEAR_SPENT, with no PIN", "exact", SW_OK, clear);
         say(out, "but not a spend", "exact", SW_SECURITY_NOT_SATIS, new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, 64));
         say(out, "nor a limit by PIN", "exact", SW_SECURITY_NOT_SATIS, setLimitByPinCommand(0));
-        say(out, "a new tap: the note was for one tap", "exact", SW_OK, select);
+        say(out, "a new tap: the load closed the window", "exact", SW_OK, select);
         say(out, "which says so", "exact", SW_OK, info);
         say(out, "and loads nothing with no PIN", "exact", SW_SECURITY_NOT_SATIS, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 4, 13), 1));
         say(out, "the PIN", "exact", SW_OK, verifyOk);
         say(out, "a payment: the piece of 8", "sig", SW_OK, new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, 64));
         say(out, "the tap it was paid in gets no grant of its own", "exact", SW_OK, info);
-        say(out, "a tap that only reads the card", "exact", SW_OK, select);
+        say(out, "a tap after it", "exact", SW_OK, select);
         say(out, "has the grant", "exact", SW_OK, info);
-        say(out, "and the tap after it", "exact", SW_OK, select);
+        say(out, "and a glance after that keeps it", "exact", SW_OK, select);
+        say(out, "still has it", "exact", SW_OK, info);
+        say(out, "a load with no PIN takes it", "exact", SW_OK, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 4, 13), 1));
+        say(out, "a new tap after the load", "exact", SW_OK, select);
         say(out, "has none", "exact", SW_OK, info);
-        say(out, "nor loads", "exact", SW_SECURITY_NOT_SATIS, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 4, 13), 1));
+        say(out, "nor loads", "exact", SW_SECURITY_NOT_SATIS, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 2, 14), 1));
         say(out, "the PIN, for the rest", "exact", SW_OK, verifyOk);
 
         say(out, "SIGN_ARBITRARY is not a command", "exact", SW_INS_NOT_SUPPORTED, new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, new byte[32], 64));

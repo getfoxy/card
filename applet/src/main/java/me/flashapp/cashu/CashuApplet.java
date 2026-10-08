@@ -521,17 +521,17 @@ public class CashuApplet extends Applet {
 
     /**
      * A tap begins. The one thing that crosses from the last tap into this
-     * one is that the card paid in it: this tap may then put pieces on with
-     * no PIN (changeGrant), and the note is spent by being taken, so that
-     * no later tap can. The grant is given before the note is cleared: a
-     * card pulled between the two has a note still, and the next tap gets
-     * the grant instead, which is the same thing a tap later.
+     * one is that the card paid since it was last loaded: this tap may then
+     * put pieces on with no PIN (changeGrant, transient, for this tap). The
+     * note (changeDue, persistent) is NOT cleared here — only a load that
+     * uses the grant clears it (processLoadProof). So a tap that reads the
+     * card and does not write, a tap cut short, and a fresh session the phone
+     * opens for the write itself all leave the note standing, and the change
+     * still goes on with no PIN at the tap that writes it. The window closes
+     * the moment the change lands, and a later stranger's tap gets nothing.
      */
     public boolean select() {
-        if (changeDue[0] == (byte) 1) {
-            changeGrant[0] = (byte) 1;
-            changeDue[0] = (byte) 0;
-        }
+        changeGrant[0] = changeDue[0];
         return true;
     }
 
@@ -1080,6 +1080,15 @@ public class CashuApplet extends Applet {
         // in it, which no read looks at and the next LOAD_PROOF overwrites.
         Util.arrayCopy(buf, ISO7816.OFFSET_CDATA, proofStorage, (short)(base + PROOF_KEYSET_OFFSET), PROOF_DATA_LEN);
         proofStorage[(short)(base + PROOF_STATUS_OFFSET)] = STATUS_UNSPENT;
+
+        // A load that the change grant alone allowed (no verified PIN, no
+        // owner grant) is the change going on: the note is spent now, not at
+        // SELECT, so a glance or a cut-short tap before this never lost it.
+        // The rest of the change in this same tap still has changeGrant
+        // (transient) and goes on; the next fresh tap sees the note gone.
+        if (pinVerifiedFlag[0] != (byte) 1 && loadGrant[0] != (byte) 1) {
+            changeDue[0] = (byte) 0;
+        }
 
         buf[0] = (byte) slot;
         apdu.setOutgoingAndSend((short) 0, (short) 1);
