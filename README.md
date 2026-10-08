@@ -1,3 +1,33 @@
+# Foxy card
+
+This is the Foxy fork of [`lnflash/cashu-javacard`](https://github.com/lnflash/cashu-javacard):
+a JavaCard applet that holds Cashu ecash on a card, for the
+[Foxy](https://github.com/getfoxy/iOS) iPhone wallet. It is **not compatible on
+the wire** with upstream's applet, and has an AID of its own so that neither can
+be taken for the other.
+
+What differs from upstream:
+
+- A spend takes no message from the reader: the card builds the slot's secret
+  and signs its hash. `SIGN_ARBITRARY` is gone, and `AUTH` proves the card is
+  the card.
+- Nothing is loaded onto a card with no PIN, or no owner.
+- The card has an owner, a P-256 public key worked out on the holder's phone
+  from its seed. Only that phone can change the PIN, unblock the card, set the
+  limit or add funds with no PIN.
+- The card keeps a daily limit and a clock that only moves forward. The time it
+  is told is interim and weak for now, and the documents say so.
+- A slot carries a date and a refund key; the card records its mint; 64 slots of
+  82 bytes.
+
+The applet has run on one real card, a J3R180. Read [`FORK.md`](FORK.md) first,
+and [`docs/FOXY-CARD-DAILY-LIMIT.md`](docs/FOXY-CARD-DAILY-LIMIT.md) for the daily
+limit, the clock and the owner key in full. Everything under the line below is
+upstream's README as it was at the fork, and describes upstream's wire, as do
+`spec/` and `tools/cardctl`.
+
+---
+
 # cashu-javacard
 
 A JavaCard applet implementing the [Cashu](https://cashu.space) ecash protocol

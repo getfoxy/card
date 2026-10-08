@@ -97,6 +97,9 @@ No hardware required for either.
 ant -f applet/build.xml cap
 ```
 
+In the Foxy fork CI is switched off and the CAP is not tracked (`FORK.md` says
+why); the paragraph below is upstream's. Run `mvn -f applet/pom.xml test`.
+
 CI runs the applet suite on JDK 11 and 17, the `cardctl` suite on Python 3.11
 and 3.13, and the CAP conversion, on every push. The conversion is also
 compared with the CAP tracked at `applet/target/cashu-javacard-0.1.0.cap`: every

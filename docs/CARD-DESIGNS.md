@@ -15,8 +15,8 @@ the old one is still drawn as it was printed.
 | FL1 | Flash, first design: black card, the Flash bolt in a circle at its centre, chip at the top left, BEARER at the bottom right | Flash | yes |
 
 Where the wallet keeps them: `FC_DESIGNS` in `build/app/26f-flashcard.js` of
-the wallet repository, and the drawing itself in `build/markup.html` (the card
-on the FLASHCARD screen).
+the wallet repository (getfoxy/iOS, https://github.com/getfoxy/iOS), and the
+drawing itself in `build/markup.html` there (the card on the FLASHCARD screen).
 
 ## Not decided yet
 

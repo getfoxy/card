@@ -236,12 +236,8 @@ class SlotWriteOrderTest {
         ResponseAPDU select = sim.transmitCommand(new CommandAPDU(
             0x00, 0xA4, 0x04, 0x00, CashuAppletTest.hexToBytes(CashuAppletTest.AID_STR)));
         assertEquals(CashuAppletTest.SW_OK, select.getSW());
-        // the fork loads nothing without a PIN and a card record
-        assertEquals(CashuAppletTest.SW_OK, send(new CommandAPDU(CLA, CashuAppletTest.INS_SET_PIN, 0, 0, CashuAppletTest.TEST_PIN)).getSW());
-        assertEquals(CashuAppletTest.SW_OK, send(new CommandAPDU(CLA, CashuAppletTest.INS_VERIFY_PIN, 0, 0, CashuAppletTest.TEST_PIN)).getSW());
-        byte[] card = new byte[35 + 1];
-        card[34] = 1; card[35] = 'm';
-        assertEquals(CashuAppletTest.SW_OK, send(new CommandAPDU(CLA, CashuAppletTest.INS_SET_CARD, 0, 0, card)).getSW());
+        // the fork loads nothing without a PIN, an owner, a card record and a time; with no limit set it spends what it holds
+        CashuAppletTest.readyOn(sim, 0);
         java.lang.reflect.Field field = CashuApplet.class.getDeclaredField("proofStorage");
         field.setAccessible(true);
         storage = (byte[]) field.get(runtime.appletAt(aid));

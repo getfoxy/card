@@ -1,12 +1,12 @@
 # Flashcard: the screens, as they are built
 
 What each screen is for, what is on it, and its states, in the wallet as it
-stands (the wallet repository, `build/app/26f-flashcard.js` and the FLASHCARD
-block of `build/markup.html`). This was the designer's brief before the
-screens existed; it now describes what was made, and where the two differ the
-app is right. Pictures of every screen: the render snapshots
-(`tests/snapshots/render`, the views named `flashcard…`, `card: …`,
-`stage: …`, `amount, … a card`, `switchMint, …`, `fcMoveConfirm, …`).
+stands (the wallet repository, getfoxy/iOS, https://github.com/getfoxy/iOS:
+`build/app/26f-flashcard.js` and the FLASHCARD block of `build/markup.html`).
+This was the designer's brief before the screens existed; it now describes what
+was made, and where the two differ the app is right. Pictures of every screen:
+the render snapshots (`tests/snapshots/render`, the views named `flashcard…`,
+`card: …`, `stage: …`, `amount, … a card`, `switchMint, …`, `fcMoveConfirm, …`).
 
 Rules the screens keep to:
 - **Nothing new where the app already has it.** Amounts are typed on the
@@ -22,6 +22,9 @@ Rules the screens keep to:
 - **Cards are cash for now.** A card that can be taken back by the phone that
   loaded it is built and switched off (`FC_RECOVERABLE`); what belongs to it
   is listed in E and is on no screen.
+- **The word is daily limit.** The screens call what the card keeps the daily
+  limit, and its row CHANGE LIMIT. The card's screen shows it, what is left of
+  it today and when the day turns.
 
 ## A. Paying by card (the receiver's phone)
 
@@ -45,6 +48,13 @@ One screen, with the amount on it throughout:
 - `WRITING TO THE CARD`
 - `REMOVE THE CARD`
 
+Under the heading a line says what the card is doing now, and the phone's own
+sheet says the same: `Scanning. Hold still.` when the card is found, then
+`Reading the card`, `Signing piece 3 of 9`, `Writing 2 of 4`, and last
+`Done. Remove the card.` The piece is said before the card is asked for it, so the
+line is up for as long as the card works on it. (The sheet's big title is the
+system's and cannot change.)
+
 ### A4. Results
 Each is one of the app's cards: a title, a line or two, one or two buttons.
 
@@ -52,10 +62,12 @@ Each is one of the app's cards: a title, a line or two, one or two buttons.
 |---|---|
 | the paid confirmation | the usual one; the payment's entry is marked as a card's |
 | WRONG PIN | the tries left, and that nothing was taken; TRY AGAIN |
-| CARD BLOCKED | too many wrong PINs |
+| CARD BLOCKED | too many wrong PINs; the card can pay again when its owner sets a new PIN on it |
 | NOT ENOUGH ON THE CARD | what it holds |
-| OVER THE CARD'S LIMIT | the most one PIN entry may spend |
+| OVER THE CARD'S DAILY LIMIT | the card holds enough, but what is left of today's limit cannot cover this payment. Says how much the card can still spend today and when its day turns. Said in plain words after the card is read and before its PIN is sent; nothing was taken |
 | A DIFFERENT MINT | the card's mint and this phone's |
+| NO CHANGE WHILE OFFLINE | this phone has no connection and cannot give change, and the card does not hold pieces that make exactly the price. Said before the PIN is sent; nothing was taken |
+| TAKEN ON TRUST | this phone has no connection, so the mint was not asked: the card's pieces are kept and swapped in when it is online. Not paid until then. Asked first, with the HIGH RISK card (YOU ARE OFFLINE), CONTINUE or REJECT, before the PIN |
 | NO MONEY ON THIS CARD | a card with no PIN, or nothing loaded |
 | NOT A FOXY CARD | it could not be read, or is another kind |
 | NO CARD READER | this phone, or this build, cannot read cards |
@@ -87,48 +99,117 @@ Home's layout, so the two read as one design:
 - **CARD BALANCE**: home's panel and home's pill. The mint's tile and name on
   the left (not a button); the balance on the right, dollars over sats.
   Tapping the balance opens this card's history.
+- **The daily limit**, under the balance: `DAILY LIMIT` and its amount, or
+  `NO LIMIT`; with a limit, `LEFT TODAY` and its amount, and `THE DAY TURNS
+  AT` a time. Dollars first, as the balance is.
 - A line in the warning colour when money is waiting to go onto a card
   (`₿500 is waiting to go onto this card. Press here, then tap it.`).
 - **ADD FUNDS** and **WITHDRAW** where home has RECEIVE and SEND;
-  **CHANGE PIN** and **SET LIMIT** where it has SCAN and PASTE.
+  **CHANGE PIN** and **CHANGE LIMIT** where it has SCAN and PASTE.
 - The connection's banner at the foot, as on home.
 
 A new card has, in place of the pill and the buttons, one line (`This card is
 new. Give it a PIN to put money on it.`) and **SET UP THIS CARD**. A blocked
-card has the pill, a red line saying what is on it cannot be got back, and no
-buttons.
+card has the pill and a red line. On its owner's phone the line says that this
+phone can unblock the card by giving it a new PIN, and there is one button,
+**UNBLOCK**, which is CHANGE PIN (B6); on any other phone the line says that
+only the phone that owns the card can unblock it, and there are no buttons.
 
-The card's limit is not shown on this screen. Neither is how many pieces it
-holds, nor what happens if it is lost.
+How many pieces the card holds, and what happens if it is lost, are not shown
+on this screen.
 
 ### B3. Setting up a new card
 - `CHOOSE A PIN` (`Four to eight digits. The card asks for it every time it
   pays.`), then `TYPE IT AGAIN`; NEXT under each
-- A tap
-- `THE CARD IS READY`: that it is cash, and that a lost card, a forgotten PIN
-  or three wrong PINs in a row lose what is on it. ADD FUNDS, LATER
+- The notice, titled `SET UP THIS CARD`: `This phone can reset this card's PIN
+  and limit. Whoever holds the card and this phone's seed phrase holds its
+  money.` with the buttons CONTINUE and CANCEL. It is the one place that says
+  what making this phone the owner means. For a holder with no phone of their
+  own, the owner is the friend's phone that sets the card up
+- No limit is asked for and none is suggested: a new card has none. A limit is
+  set later from CHANGE LIMIT (B7)
+- A tap, which writes the card's PIN, its record (with the time key) and, last,
+  its owner key. The owner goes in last so that no step needs a proof: a set-up
+  cut off anywhere is finished by the next set-up tap
+- `THE CARD IS READY`: that it is cash, that whoever has the card and its PIN
+  has the money, and that if the card is lost the money on it is gone. ADD
+  FUNDS, LATER
 
 ### B4. Add funds
 - The app's SET AMOUNT screen, NEXT
-- `CARD PIN`, the button `ADD $2.00 TO CARD`
+- On the owner's phone no PIN is asked: the card is given the owner's proof
+  and lets the money in for that tap. On any other phone, `CARD PIN`, the button
+  `ADD $2.00 TO CARD`
+- Putting money on a card does not touch its limit
 - A tap; `GETTING IT READY`, then the states of A3
 - `ON THE CARD` with the new balance; or the card left early and the money
   waits for it (the line of B2); WRONG PIN; THE CARD IS FULL
+- What goes on is cut into as few pieces as it can be, never more than sixteen in
+  a load. An amount that needs more is rounded up a few sats, and `ON THE CARD`
+  says by how much
+- A card at another mint than this phone's: `A DIFFERENT MINT`. If it holds
+  anything: "You need to withdraw all funds on the card before you can switch
+  mints." and CLOSE. If it holds nothing, on its owner's phone: `SWITCH TO <MINT>`,
+  which goes straight to SET AMOUNT; the card is told its new mint with the owner's
+  proof, in the same tap that writes the funds (its PIN, owner, limit and time key
+  stay as they are), and `ON THE CARD` says the card is now at the new mint. On any
+  other phone, the card says only the phone that set it up can switch it
 
 ### B5. Withdraw
 - SET AMOUNT, with `ALL OF IT ($1.31)` under NEXT
 - `ENTER PIN TO WITHDRAW`; a tap
-- `IN YOUR WALLET`; WRONG PIN; OVER THE CARD'S LIMIT (with SET LIMIT);
-  CHECKING
+- `IN YOUR WALLET`; WRONG PIN; CHECKING
+- The limit is no obstacle to the owner's phone: in the same tap it lifts the
+  limit with the owner's proof, spends (the PIN is still asked), and puts the
+  limit back with the owner's proof, even when the spending fails part way. If
+  the card leaves before the limit can be put back, the phone has written the
+  old limit down first and puts it back at the next tap. A phone that does not
+  hold the card's seed phrase cannot lift the limit, and says so in plain
+  words. Renewing and taking everything off a card work the same way.
 
-### B6. Change PIN
-- Three pads in turn: the PIN as it is now, the new one, the new one again; a tap
-- `PIN CHANGED`; WRONG PIN
+### B6. Change PIN, and unblock
+- Two pads in turn: `NEW PIN`, then `NEW PIN AGAIN`; a tap. No old PIN is asked:
+  the owner's phone does not know it, and the card takes the owner's proof in
+  its place
+- `PIN CHANGED`
+- A blocked card, on its owner's phone, has the button **UNBLOCK** (B2). It is
+  the same pads and the same tap, and ends at `CARD UNBLOCKED`
+- On a phone that does not hold the card's seed phrase the change fails, and
+  the screen says so in plain words (`NOT THIS PHONE'S CARD`)
 
-### B7. Set limit
-- SET AMOUNT in sats, with `NO LIMIT` under NEXT
-- The PIN, a tap. The limit is the most one PIN entry may spend; the card
-  has no clock and cannot count a day.
+### B7. Change limit
+The row is CHANGE LIMIT. Three steps, then a tap.
+
+1. **A full-screen warning.** Title `SET DAILY LIMIT`. Body, three paragraphs:
+   - `A daily limit is the most this card will spend in one day. It starts again by itself each day.`
+   - `Only this phone, or a phone restored from its seed phrase, can change or remove the limit.`
+   - `If you lose the seed phrase for this Foxy app, the PIN and the limit on this card can never be changed.`
+
+   Then `Do you wish to continue?` with the buttons CONTINUE and CANCEL.
+2. **The app's SET AMOUNT screen**, dollars first and sats under them, asking
+   `What would you like the daily limit to be?`; NEXT, and under it **NO LIMIT**,
+   which is the way to remove a limit.
+3. **A confirmation**, after NEXT, titled `CONFIRMATION`:
+   - `YOU ARE APPLYING A DAILY LIMIT OF:` and the amount chosen, dollars first
+   - `This card will spend no more than this in one day. The limit starts again by itself each day. Only this phone, or a phone restored from its seed phrase, can change or remove it.`
+
+   with the buttons CONFIRM and CANCEL. After NO LIMIT the confirmation says
+   `YOU ARE REMOVING THIS CARD'S DAILY LIMIT.` over `NO LIMIT`, and
+   `It will be able to spend everything on it.`
+
+Then one tap writes it to the card with the owner's proof; no PIN is asked.
+Set-up (B3) does not ask for a limit and does not suggest one: a new card has
+none. No screen suggests a figure.
+
+What the card does behind these words (specification 5.7): it spends no more
+than the limit in a day, and starts the day again by itself. A terminal that has
+been handed the PIN can take one day's limit per visit, and no more, once the
+time the card is told is real. Today that time is the receiving phone's own
+clock, signed by a key inside the app, so the limit bounds an honest terminal
+and the holder's own spending, and does not stop a terminal built to cheat; no
+screen says otherwise. If the seed phrase is lost, the PIN and the limit can
+never be changed, and a blocked card can never be unblocked. A phone that does
+not hold the card's seed phrase cannot change the limit, and says so.
 
 ### B8. A card's history
 - The app's HISTORY screen, titled `CARD HISTORY`, with only the entries that
@@ -171,5 +252,6 @@ holds, nor what happens if it is lost.
 - The screen before a card is tapped, with `CARDS YOU LOADED` under it
 - Taking a lost card's money back after its date (`TAKE IT BACK?`, `BACK IN
   YOUR WALLET`, `NOTHING WAS LEFT ON IT`)
-- Renewing a card in its last month, from a line on its screen; `CARD NEEDS
-  RENEWING` and `ITS DATE HAS PASSED` at a till
+- Renewing a card in its last month, from a line on its screen (it lifts the
+  limit and puts it back, as B5 does); `CARD NEEDS RENEWING` and `ITS DATE HAS PASSED` at
+  a till
