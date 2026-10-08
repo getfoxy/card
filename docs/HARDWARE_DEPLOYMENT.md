@@ -214,10 +214,9 @@ into.
 
 If `gp --install` fails with `6F00`, that probe is the first thing to suspect —
 and it failing there is the desired outcome. The alternative is discovering it
-at spend time, where `SPEND_PROOF` marks the slot SPENT *before* signing: an
-incompatible card would consume one proof per tap, return `6F00` each time, and
-leave the proofs unredeemable because they are P2PK-locked to a key whose card
-can no longer sign.
+at spend time. `SPEND` now signs before it marks the slot spent, so an
+incompatible card answers `6F00` and burns nothing; but every proof on it is
+still P2PK-locked to a key whose card cannot sign, so none of them can be spent.
 
 ---
 
