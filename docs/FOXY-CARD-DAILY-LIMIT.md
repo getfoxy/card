@@ -651,24 +651,28 @@ phone says it belongs to another phone's words.
   has pieces the mint did not issue for that key, and one that names the real
   card's key cannot sign for it. `AUTH` stays wherever the holder's phone reads a
   card to show it, and in a withdrawal, where the owner's key signs.
-- A set of pieces that comes to exactly the price (and the receiver's fee on
-  them) is taken before any that overpays, even when it has more pieces: it
-  needs no change, so no second tap to write change back and no swap to make it.
-  Only where there is none are the pieces that cover the price with the least over
-  taken, and the difference written back. The set is found by search, fewest
-  pieces first, not by taking the largest that fit.
+- A tap should take under three seconds, and the card signs a piece in most of
+  a second, so an online payment signs as few pieces as it can: the one or two
+  that cover the price (and the receiver's fee on them) with the least over,
+  and where no two do, the fewest that do. What they come to over the price is
+  change, made after the swap and written back at a second tap, with no PIN
+  (`changeDue`). Every card payment is said as two taps, SEND and RECEIVE; one
+  paid exactly is complete at the first. A till with no route takes only an
+  exact set (below), found by search, fewest pieces first.
 - What goes onto a card is cut like the float in a cash drawer: every power of
   two from 1 up to the largest that fits, once, then the rest of the amount in
   powers of two (every price up to the whole is exact then), and then, with the
   pieces left under the cap, the smallest rungs two or three deep, so that a
-  run of payments finds the rungs the first took still there; never the small
-  change the rest of the wallet keeps, and no more pieces than the card has
-  places for, less a few for what a mint's fee may add (an amount that needs
+  run of offline payments finds the rungs the first took still there; never the
+  small change the rest of the wallet keeps, no more than thirty-two pieces (half
+  the card), and no more than the card has places for less a dozen kept for an
+  online payment's change (an amount that needs
   more is rounded up, smallest pieces first, and the screen says by how much; a
   mint whose largest piece is small makes more of that piece). Change written
   back is cut the same way, filling the card's gaps. The card signs a piece in
-  most of a second, so the pieces are what a withdrawal is made of: the
-  holder's choice, for change at every payment.
+  most of a second, so the pieces are what a withdrawal is made of: one cut
+  short keeps what the card signed, in the phone, and the next tap takes the
+  rest.
 - A till with no route may take a card on trust, as plain ecash is taken: the
   HIGH RISK question is put to the person first, in front of the amount, and the
   owner's answer decides. Only an exact set of pieces is taken (a till with no route
