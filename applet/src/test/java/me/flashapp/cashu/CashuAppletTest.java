@@ -2098,9 +2098,14 @@ class CashuAppletTest {
         int burn = body.lastIndexOf("STATUS_SPENT");
         int commit = body.indexOf("commitTransaction");
         int sign = body.indexOf("schnorrHW.sign");
+        int send = body.indexOf("setOutgoingAndSend", commit);
         assertTrue(refuse > 0 && refuse < begin && refuseTime > 0 && refuseTime < begin, "the refusals come before anything is changed");
-        assertTrue(begin > 0 && begin < window && window < charge && charge < burn && burn < commit && commit < sign,
-            "the window, what the day has signed for and the slot change between begin and commit, and the signing is after");
+        /* Signed into RAM first, then burned, then answered: a card pulled away while it signs (most of
+         * a second) has burned nothing and sent nothing, and no signature leaves before the burn. Burned
+         * first, a pull-away in that time lost the piece with no signature anywhere. */
+        assertTrue(sign > 0 && sign < begin && begin < window && window < charge && charge < burn && burn < commit && commit < send,
+            "signed first; the window, what the day has signed for and the slot change between begin and commit; and only then the answer");
+        assertEquals(1, count(body, "setOutgoingAndSend"), "the signature leaves the card in one place, after the commit");
         assertEquals(1, count(body, "Util.arrayCopy(cardRecord"), "a spend begins the window by copying the clock, in the transaction, and writes no other part of the record");
     }
 

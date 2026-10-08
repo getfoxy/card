@@ -910,13 +910,29 @@ public class CashuApplet extends Applet {
          * burn: it changes no state, and a fault in it must not cost a piece. */
         secretHash(base, buf);
 
-        // ATOMIC: mark spent BEFORE signing.
-        // If signing fails, the proof is still consumed — this prevents an
-        // attacker from aborting the transaction to reset the spent flag.
-        // What the day has signed for goes up in the same transaction (and the
-        // window begins, if this piece begins a new day): a card pulled away
-        // here has either done all of it or none, so it never signs for a
-        // piece it did not count, and never counts a piece it did not burn.
+        /* Signed first, into the APDU buffer, which is RAM and leaves the card
+         * only with the answer below; then burned; then answered.
+         *
+         * It was burned first and signed after, so the piece was spent for the
+         * whole of the signing, most of a second, with its signature not yet
+         * made. A card taken away in that time had spent the piece and given
+         * nothing for it: the piece was lost, and a person who pulls a card
+         * away mid-tap does it in that window more often than not (a
+         * payment cut short twice lost 1,024 and then 512).
+         *
+         * The guard is unchanged: no signature leaves the card for a piece that
+         * is not burned, because the answer is sent only after the commit. A
+         * card pulled away before the commit has burned nothing and sent
+         * nothing (the signature dies with the RAM); one pulled away after it
+         * has lost only the few milliseconds of the answer on the air. And no
+         * abort can reset the flag: there is nothing to abort once it is set.
+         *
+         * What the day has signed for goes up in the same transaction as the
+         * burn (and the window begins, if this piece begins a new day): a card
+         * pulled away here has either done all of it or none, so it never
+         * counts a piece it did not burn, and never burns one it did not count. */
+        short sigLen = schnorrHW.sign(cardPrivKey, cardPubKey, scratch, X_MSG, buf, (short) 0);
+
         JCSystem.beginTransaction();
         if (limited) {
             if (newDay) Util.arrayCopy(cardRecord, CARD_NOW_OFFSET, cardRecord, CARD_WINDOW_OFFSET, (short) 4);
@@ -927,7 +943,6 @@ public class CashuApplet extends Applet {
         changeDue[0] = (byte) 1;
         JCSystem.commitTransaction();
 
-        short sigLen = schnorrHW.sign(cardPrivKey, cardPubKey, scratch, X_MSG, buf, (short) 0);
         apdu.setOutgoingAndSend((short) 0, sigLen);
     }
 
