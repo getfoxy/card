@@ -365,9 +365,10 @@ unassigned:
    nothing a terminal that has the PIN can send changes it except by spending.
    (A limit on one PIN entry, kept in RAM, was tried first: a terminal that
    had the PIN sent it again between spends, or set the limit to nothing. It
-   is gone. The limit on one tap that the card has now is not that: it is a
-   second number in permanent memory, counted against ten seconds of the
-   card's own clock, which the PIN, a SELECT and a reset do not begin again.) The whole text is `FOXY-CARD-DAILY-LIMIT.md`, sections 3 and 6.
+   is gone. The limit on one payment that the card has now is not that: it is
+   a second number in permanent memory that refuses nothing and asks no clock;
+   a payment over it waits, by the card's own work, for every limit's worth
+   past the first.) The whole text is `FOXY-CARD-DAILY-LIMIT.md`, sections 3 and 6.
 4. **Three tries**, then blocked, as upstream. The owner's proof unblocks it
    (`CHANGE_PIN`), and a wrong proof costs no tries. The refund path (6) is a
    second way out, for a card set up as recoverable.

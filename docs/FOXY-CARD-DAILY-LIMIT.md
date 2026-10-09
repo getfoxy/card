@@ -159,9 +159,9 @@ time key, the mint and the set flag, and never the limit, the day or `now`
 | now | 4 | the latest signed time the card has accepted, seconds, big-endian; 0 until it has been told one. Written only by `SET_TIME` (and cleared only as rule 4 says) |
 | window start | 4 | when the current day began; written by `SET_LIMIT` and by a `SPEND` that begins a new day |
 | spent today | 4 | what the card has signed for since the window began |
-| tap limit | 4 | the most the card signs for in one tap, in sats, big-endian; **0 is no limit** (section 6a). Not in `GET_CARD`; `GET_INFO` with P1 = 1 says it |
-| tap start | 4 | when the current tap began; written by an eight-byte `SET_LIMIT` that changes the tap's limit and by a `SPEND` that begins a new tap |
-| spent this tap | 4 | what has been signed for since the tap began |
+| limit on one payment | 4 | the most the card signs for in one payment straight away, in sats, big-endian; **0 is no limit**. A larger payment waits (section 6a). Not in `GET_CARD`; `GET_INFO` with P1 = 1 says it |
+| (unused) | 4 | zeros. It was when the current tap began, when the limit above was counted against ten seconds of the clock |
+| (unused) | 4 | zeros. It was what had been signed for in that tap |
 | mint | 1 + up to 80 | the mint's address, as text |
 
 The mint is at most 80 characters, not 96 as it was. The reason is one
@@ -320,57 +320,70 @@ starts a new window with nothing spent, so a withdrawal gives the day back its
 whole limit. That is one extra day's limit, at the moment the owner is holding
 the card, and no more.
 
-## 6a. One tap
+## 6a. One payment
 
-A second limit, kept the same way: the most the card signs for in **one tap**.
-It is there for the same terminal the day is, and for the hold of a card to a
-phone that the day does not bound: with no limit on a tap, whatever the day
-allows goes in one tap, and with no limit on the day either, the whole card.
+A second limit, and unlike the day's it asks no clock: **the most the card
+signs for in one payment straight away.** The card refuses nothing over it. It
+makes a larger payment *wait*.
 
-**A tap is ten seconds of the card's clock** (`TAP_SECONDS`), from the first
-piece signed in it. It is not a PIN entry, a SELECT, or a time in the field. The
-first limit this card had was on one PIN entry (section 0) and bounded nothing,
-because everything that began it again was something a terminal sends. What a
-terminal cannot send is a later time, once the signer is real (5.2); until then
-this limit is exactly as strong as the day's, and no stronger.
+Why not a window, which is what this was (ten seconds of the card's clock, and
+`6A95` over it). The card has no clock that runs. Its "now" is the last time a
+terminal told it, and a terminal chooses what to tell it and when: any limit
+counted against time can be walked forward by whoever holds valid times, and
+with the time key where it is (5.2) that is anyone. A limit that asks no clock
+has nothing to replay.
 
-On `SPEND`, after the day's check and before anything is signed, when the tap
-limit is not 0:
+**The rule.** With a limit of `L` sats and a payment whose pieces are worth
+`S` together (the sum the card takes at `SPEND_ALL_BEGIN`):
 
-1. `now = 0` → `6A92`, as for the day.
-2. If `now ≥ tap start + 10`, the tap is new: it will start at `now` with nothing
-   spent.
-3. spent this tap (0 in a new one) + the piece's amount, with its carry, over the
-   tap limit → **`6A95`**, nothing signed, nothing burned, nothing written.
-4. Otherwise, in the same transaction as the day's count and the burn: the tap
-   start (if new) `= now`; spent this tap `+=` the amount.
+    waits = (ceil(S / L) − 1) × WAIT_SIGNS
 
-**Ten seconds** is longer than a card is held to a phone to pay (a read and two
-signatures are under three), so one hold is one tap; and short enough that the
-next charge, which a person has to type an amount and a PIN for, begins a tap of
-its own. A payment larger than the limit is made as more than one charge. A
-terminal that keeps a card for a minute can take six taps' worth: the bound is
-per ten seconds of holding, and it is written down rather than hidden.
+The first `L` is free; every `L` after it, whole or in part, costs
+`WAIT_SIGNS` (four) *signatures of work*, about three seconds on the chip. `L`
+of 0 is no limit. Past 255 limits a payment waits as 255 do, which is a
+quarter of an hour and so never.
 
-**It counts the pieces signed, not the price**, as the day does.
+**What a wait is.** The card cannot sleep and has no timer. The one thing on it
+whose duration is the chip's own, and that no terminal can shorten, is a
+signature: about three quarters of a second, measured, and very steady. So the
+card waits by signing, over 32 bytes of its own choosing, and throwing the
+signature away. One to a command: while waits remain, `SPEND_ALL_SIGN` does
+one, and answers `9000` with **two bytes**, how many are still to come, in
+place of the signature. The terminal sends `SPEND_ALL_SIGN` again. When none
+remain, the next one burns the pieces and answers the signature (6c). No
+command is longer than one signature, which matters to a phone that gives up
+on a card that is silent for long.
 
-**Setting it.** `SET_LIMIT` takes four bytes or eight, by either form. Four are
-the day's limit, as before, and leave the tap's as it is. Eight are both: the
-day's, then the tap's. In the eight-byte form a limit whose number does not
-change keeps its window and its count, so that setting one does not begin the
-other again; a number that changes begins its window at `now` with nothing
-spent. The owner's proof covers all eight bytes under `FoxyCard/set-limit`. A
-limit on a tap needs a time, as a limit on the day does (`6A92`). The owner's
-own withdrawal lifts both with one command (`0, 0`) and puts both back with one.
+**Nothing is burned, counted or written until the wait is done.** A card
+lifted in the wait has lost nothing and the terminal holds nothing. Any other
+command in the wait drops the payment, as it does at any point between
+`BEGIN` and `SIGN` (6c), and so does a `SELECT` or a reset; `SPEND_ALL_SIGN`
+then answers `6985`, and a new `BEGIN` waits in full again. The count of waits
+is in RAM and cannot be set from outside.
 
-**Reading it.** `GET_INFO` with P1 = 1 answers 42 bytes: the thirty it always
-gave, then the tap limit, the tap start and spent this tap, four bytes each.
-With P1 = 0 it answers the thirty, so a reader that checks for thirty still
-gets them. An applet without this section ignores P1 and answers thirty: that
-is how a phone tells that a card has no limit on a tap to set.
+**Nothing is remembered from one payment to the next.** Two payments of `L`,
+one straight after the other, wait nothing. That is on purpose, and it is the
+whole of what this limit is: a terminal that has the PIN can take `L` for each
+signature it has the card make, a second or so apiece, for as long as the card
+is held, by many small payments or by one large one that waits. It cannot go
+faster, whatever it sends and whatever time it tells. The day's limit (6) is
+the ceiling; this is the rate, and what it buys the holder is that money
+leaves the card about as fast as an honest payment of that size would, so
+that a card lifted when the payment ought to be over has lost about what it
+ought to have paid.
 
-**A different time key** (rule 4) clears the tap start and its count with the
-clock and the day's window. The limit itself stays.
+The wait is charged on what the pieces are worth, not on the price: change
+that a terminal writes back is not something the card can check. A wallet
+that wants the card held no longer than it must chooses the pieces that
+overpay least.
+
+**Setting it.** `SET_LIMIT` with eight bytes of limit (the day's, then this
+one) sets both; four bytes set the day's and leave this one. It needs no time
+(the day's does, unless it is 0). `GET_INFO` with P1 = 1 answers it at bytes
+30 to 33; the eight bytes after it, which were the window and its count, are
+zeros. Bit 3 of `GET_INFO`'s capabilities byte says the card waits and does
+not refuse. The owner's phone lifts it to 0 with its proof to take money off
+its own card, and puts it back, as it does the day's.
 
 ## 6b. The log
 
@@ -380,7 +393,7 @@ needed for, and it is what a holder reads to find out what a tap really took.
 
 **Only the card writes it.** A `SPEND` writes it in the transaction that burns
 the piece: no piece is burned that the log does not have. A `SPEND` refused for
-being over a limit (`6A8F`, `6A95`) writes it and then refuses. No command sets
+being over the day's limit (`6A8F`) writes it and then refuses. No command sets
 it, moves it back or clears it, for the PIN or for the owner, and `CLEAR_SPENT`,
 `SET_LIMIT`, `CHANGE_PIN`, `SET_CARD` and `LOCK_CARD` leave it as it is. The
 counts only go up, and stop at the top of four bytes.
@@ -398,9 +411,9 @@ counts only go up, and stop at the top of four bytes.
 
 **A tap, here, is one time in a reader's field**: from the card being powered
 to its being taken away (a byte of RAM that is gone with the power, and not
-with a SELECT, says whether this one has an entry yet). The limit on one tap
-counts by the clock, because that is what bounds a terminal; the log counts by
-the field, because that is what a person did. A terminal that cuts the field to
+with a SELECT, says whether this one has an entry yet). The log counts by the
+field, because that is what a person did. A tap in which a payment was over
+the limit on one payment, and was waited for (6a), says so: bit 1 of its flags. A terminal that cuts the field to
 begin again shows as more taps, and the counts count every one, so the ring
 being pushed round hides nothing from a phone that remembers the counts it saw.
 
@@ -474,9 +487,10 @@ them:
    (`6A83`), unspent (`6A88` for an empty place, `6985` for a spent one), named
    once (`6A80`), and of the same date as the first (`6A80`): a mint takes one
    signature only for pieces whose secrets agree in everything but the nonce.
-   The limits of sections 6 and 6a are held to what the places are worth
-   **together** (`6A92` with a limit and no time, `6A8F` over the day, `6A95`
-   over the tap, each refusal written to the log of 6b). The card hashes each
+   The day's limit (6) is held to what the places are worth **together**
+   (`6A92` with a daily limit and no time, `6A8F` over the day, the refusal
+   written to the log of 6b), and what the payment will wait (6a) is worked
+   out from the same sum. The card hashes each
    place's secret and `C` itself, from the slot: the terminal names places and
    never supplies a secret. Answers what they are worth, 4 bytes.
 2. `SPEND_ALL_OUTPUTS` (`23`): the swap's outputs, 37 bytes each (amount 4, `B_`
@@ -484,9 +498,11 @@ them:
    hashed as its amount in decimal and its `B_` in hex. `6985` with no payment
    begun; `6700` for a length that is not a multiple of 37, which also drops
    the payment.
-3. `SPEND_ALL_SIGN` (`24`): `6985` with no payment begun. The PIN and the
-   limits again; then the signature is made, and in **one transaction** every
-   place is marked spent, the day's and the tap's counts are charged, the note
+3. `SPEND_ALL_SIGN` (`24`): `6985` with no payment begun. The PIN; then, while
+   the payment has waits to do (6a), one of them and two bytes in answer, how
+   many are still to come, with nothing burned; sent again until none are
+   left. Then the day's limit again; then the signature is made, and in **one
+   transaction** every place is marked spent, the day's count is charged, the note
    that the card has paid is set (8.2), the log gains the payment, and the
    signature is kept. `6A96` if the transaction cannot hold it, with nothing
    changed. Only then is the signature answered, 64 bytes.
@@ -634,9 +650,9 @@ or changed from `FOXY-CARD-SPEC.md` 5.2 and the allowance draft.
 | `17` | **GET_PIECES** | | P1 = the first slot to report | one page: the first slot the page does not cover (1), then for each slot in the range that is not empty a tag (1) and, for an unspent slot, its 81 bytes (8.1). `6A83` for a P1 of 64 or more |
 | `18` | **GET_LOG** | the PIN verified in this tap, or the owner's grant; nothing on a card with no PIN yet | | the card's own log (6b): 16 bytes of counts, then up to eight taps of 12 bytes, newest first. `6982` to anyone else |
 | `20` | ~~SPEND_PROOF~~ | | | gone with format 4 (6c): `6D00`. Up to format 3: P1 = the slot, the 64-byte signature over that piece's secret alone |
-| `22` | **SPEND_ALL_BEGIN** | PIN, if one is set; a time, if a limit is set | the places, a byte each, 1 to 32 | what they are worth (4). `6700` none; `6A96` more than 32; `6A83`, `6A88`, `6985` for a place out of range, empty, spent; `6A80` named twice, or of another date than the first; `6A92`, `6A8F`, `6A95` as the limits have it, on the sum (6c) |
+| `22` | **SPEND_ALL_BEGIN** | PIN, if one is set; a time, if a limit is set | the places, a byte each, 1 to 32 | what they are worth (4). `6700` none; `6A96` more than 32; `6A83`, `6A88`, `6985` for a place out of range, empty, spent; `6A80` named twice, or of another date than the first; `6A92`, `6A8F` as the day's limit has it, on the sum (6c) |
 | `23` | **SPEND_ALL_OUTPUTS** | a payment begun, and nothing sent since but these | 37 bytes for each output: amount (4), blinded message (33) | `6985` with no payment begun; `6700` for a length not a multiple of 37, and the payment is dropped |
-| `24` | **SPEND_ALL_SIGN** | a payment begun; PIN; the limits again | | the one 64-byte signature over every piece and every output; every place burned, the counts charged and the log written in the same transaction. `6985` with no payment begun; `6A96` if the transaction cannot hold it. **Not** opened by `ALLOW_LOAD`, nor by the tap after a payment. Notes, in permanent memory, that the card has paid: the next tap may load with no PIN (8.2) |
+| `24` | **SPEND_ALL_SIGN** | a payment begun; PIN; the day's limit again | | while the payment is over the limit on one payment: two bytes, the waits still to come, and nothing burned (6a); sent again. Then the one 64-byte signature over every piece and every output; every place burned, the counts charged and the log written in the same transaction. `6985` with no payment begun; `6A96` if the transaction cannot hold it. **Not** opened by `ALLOW_LOAD`, nor by the tap after a payment. Notes, in permanent memory, that the card has paid: the next tap may load with no PIN (8.2) |
 | `25` | **SPEND_ALL_AGAIN** | PIN, if one is set | | the last signature `24` gave, again; `6A88` if none |
 | `30` | **LOAD_PROOF** | an owner; a PIN set, and verified or `ALLOW_LOAD` given in this tap or this tap being the one after a payment (8.2); a card record; a time | 81 bytes | `6982` with no verified PIN and no grant (the gate comes first); then `6A90` with no owner; `6A92` with no time; `6A94` for a piece whose nonce is already in a slot, spent or not (checked last, after the length and the piece itself, and before anything is written) |
 | `31` | **CLEAR_SPENT** | the PIN, if one is set, or `ALLOW_LOAD` given in this tap, or the tap after a payment | | |
@@ -656,7 +672,9 @@ or changed from `FOXY-CARD-SPEC.md` 5.2 and the allowance draft.
 `FORMAT` 3 with this design; a phone that knows only format 2 refuses the card,
 as it does for anything but its own. With one signature for a payment (6c) the
 version is 1.4 and `FORMAT` 4: a phone that knows only format 3 refuses such a
-card, and a phone that knows both pays with either.
+card, and a phone that knows both pays with either. With the limit on one
+payment a wait and not a window (6a) the version is 1.5, the format is still
+4, and bit 3 of the capabilities byte says so.
 
 **Every command in every state: the rule of section 3 worked through.** "Open"
 means nothing is needed beyond what the command's own row says; "refused" means
@@ -691,7 +709,7 @@ Status words, in the part of `6Axx` ISO 7816-4 leaves unassigned:
 |---|---|
 | `6A8D` | card in use: a thing that is set only on an empty card, on a card with an unspent piece |
 | `6A8F` | over the day: this piece would take today past its limit. Nothing signed, nothing burned |
-| `6A95` | over the tap: this piece would take this tap past the limit on one tap (6a). Nothing signed, nothing burned |
+| `6A95` | unused. It was "over the limit on one tap", when that was a window and refused; a payment over the limit on one payment now waits (6a) |
 | `6A90` | no owner: a command that needs the owner's proof, or `GET_NONCE`, or a load, on a card that has none |
 | `6A91` | the owner's proof is missing or is not the owner's, or this command is not open to a card with an owner. Costs no PIN tries, changes nothing, does not end the PIN session |
 | `6A92` | no time: the card has never been told the time, and this needs one |

@@ -37,7 +37,7 @@ import javacardx.crypto.*;
  *   0x31  CLEAR_SPENT      — free spent slots (PIN, or the owner's grant)
  *   0x32  SET_CARD         — write the card record (open card: PIN; owned card: the owner's proof; only with nothing unspent)
  *   0x33  SET_LIMIT        — the daily limit, by PIN: an open card only (no owner, nothing unspent)
- *   0x34  SET_LIMIT        — the daily limit, by the owner's proof; with eight bytes, the limit on one tap as well
+ *   0x34  SET_LIMIT        — the daily limit, by the owner's proof; with eight bytes, the limit on one payment as well
  *   0x35  SET_TIME         — tell the card the time, under the time key's signature
  *   0x40  VERIFY_PIN       — verify the PIN
  *   0x41  SET_PIN          — set or replace the PIN: an open card only (no owner, nothing unspent)
@@ -103,10 +103,11 @@ public class CashuApplet extends Applet {
     // FORMAT is what a reader checks before it reads a slot: 3 for this design
     // (2 was the allowance draft and the first limit).
     static final byte VERSION_MAJOR = (byte) 0x01;
-    // 1.3 is the limit on one tap (docs/FOXY-CARD-DAILY-LIMIT.md, section 6a).
+    // 1.3 was a limit on one tap, a window of ten seconds that refused. 1.5 makes it the limit on one
+    // payment, which asks no clock and is waited for (docs/FOXY-CARD-DAILY-LIMIT.md, section 6a).
     // 1.4 is one signature for a whole payment (NUT-11 SIG_ALL): format 4, in
     // which every piece's secret carries the flag and SPEND_PROOF is gone.
-    static final byte VERSION_MINOR = (byte) 0x04;
+    static final byte VERSION_MINOR = (byte) 0x05;
     static final byte FORMAT        = (byte) 0x04;
 
     // -------------------------------------------------------------------------
@@ -202,10 +203,14 @@ public class CashuApplet extends Applet {
     // When the current day began, and what has been signed for since.
     static final short CARD_WINDOW_OFFSET  = (short) 189;
     static final short CARD_SPENT_OFFSET   = (short) 193;
-    // The most the card signs for in one tap, sats, big-endian; 0 is NO limit.
-    // A tap, to the card, is TAP_SECONDS of its own clock: nothing a terminal
-    // can send (the PIN again, a new SELECT, a reset) begins a new one, only
-    // time. When the current one began, and what has been signed for in it.
+    // The most the card signs for in one payment without making the terminal
+    // wait, sats, big-endian; 0 is NO limit. It is not counted against a clock
+    // and nothing is remembered of it from one payment to the next: a payment
+    // is judged by its own size, and every limit's worth past the first costs
+    // WAIT_SIGNS signatures of the card's own work before it signs (6a). The
+    // two fields after it held a ten-second window and its count, when this
+    // was a limit a clock turned; they are kept as zeros, so the record and
+    // GET_INFO are the lengths they were.
     static final short CARD_TAP_LIMIT_OFFSET  = (short) 197;
     static final short CARD_TAP_WINDOW_OFFSET = (short) 201;
     static final short CARD_TAP_SPENT_OFFSET  = (short) 205;
@@ -232,9 +237,8 @@ public class CashuApplet extends Applet {
     // and stop at the top of four bytes.
     //
     // A tap, here, is one time in a reader's field: from the card being
-    // powered to its being taken away. (The limit on one tap counts by the
-    // clock, because that bounds a terminal; this counts by the field,
-    // because that is what a person did.) A terminal that cuts the field to
+    // powered to its being taken away: it counts by the field, because that
+    // is what a person did. A terminal that cuts the field to
     // begin again shows as more taps, and the totals count them all.
     // -------------------------------------------------------------------------
     static final short LOG_TAPS_OFFSET      = (short) 0;   // taps in which anything was signed for or refused, ever
@@ -251,8 +255,9 @@ public class CashuApplet extends Applet {
     static final short LOG_E_SATS           = (short) 4;   // sats signed for in it (4)
     static final short LOG_E_PIECES         = (short) 8;   // pieces signed (1, stops at 255)
     static final short LOG_E_REFUSED        = (short) 9;   // spends refused in it for being over a limit (1, stops at 255)
-    static final short LOG_E_FLAGS          = (short) 10;  // bit 0: the third refusal of a run, or one after it, was in this tap
+    static final short LOG_E_FLAGS          = (short) 10;  // bit 0: the third refusal of a run, or one after it, was in this tap; bit 1: a payment in it waited (6a)
     static final byte  LOG_FLAG_TAMPER      = (byte) 0x01;
+    static final byte  LOG_FLAG_WAITED      = (byte) 0x02; // a payment in this tap was over the limit on one payment, and was waited for
     static final short LOG_LEN              = (short) 117; // LOG_HEAD_LEN + LOG_ENTRIES * LOG_ENTRY_LEN
     // GET_LOG's answer: the four counts, then the taps the ring holds, newest first
     static final short LOG_ANSWER_HEAD      = (short) 16;
@@ -289,7 +294,7 @@ public class CashuApplet extends Applet {
     static final short SW_NO_TIME               = (short) 0x6A92; // the card has never been told the time, and this needs one
     static final short SW_NOT_THE_TIME          = (short) 0x6A93; // SET_TIME whose signature is not the time key's
     static final short SW_PIECE_ON_CARD         = (short) 0x6A94; // LOAD_PROOF of a piece whose nonce is already in a slot, spent or not
-    static final short SW_OVER_TAP_LIMIT        = (short) 0x6A95; // the piece would take this tap past the limit on one tap
+    // 6A95 was "over the limit on one tap", when that was refused; it is now waited for (6a) and the word is unused
     static final short SW_TOO_MANY              = (short) 0x6A96; // more pieces than one signature can burn at once
 
     // LOCK_CARD confirmation byte
@@ -461,12 +466,11 @@ public class CashuApplet extends Applet {
 
     private static final byte[] ONE = { (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x01 };
 
-    /**
-     * 10 seconds, big-endian: how long a tap is, for the limit on one tap.
-     * Longer than a card is held to a phone to pay, so one tap is one window;
-     * short enough that a second tap, for the rest of a payment larger than
-     * the limit or for the next payment, begins a window of its own.
-     */
+    /** What one limit's worth past the first costs a payment: this many signatures of work, about three seconds on the chip. */
+    static final short WAIT_SIGNS = (short) 4;
+    /** The most a payment is counted over its limit: past this it waits as long as this does (a quarter of an hour). */
+    static final short WAIT_UNITS_MOST = (short) 255;
+    /** 10 seconds, big-endian: how close together refusals are one run of them, in the card's own log (6b). */
     private static final byte[] TAP_SECONDS = { (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x0A };
 
     // -------------------------------------------------------------------------
@@ -657,7 +661,8 @@ public class CashuApplet extends Applet {
         sha             = MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
         shaAll          = MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
         allSlots        = JCSystem.makeTransientByteArray(ALL_MOST, JCSystem.CLEAR_ON_DESELECT);
-        allState        = JCSystem.makeTransientByteArray((short) 2, JCSystem.CLEAR_ON_DESELECT);
+        // [0] a payment is begun, [1] its places, [2..3] the signatures of work still to be done before it is signed, [4] it waited
+        allState        = JCSystem.makeTransientByteArray((short) 5, JCSystem.CLEAR_ON_DESELECT);
         allSum          = JCSystem.makeTransientByteArray((short) 4, JCSystem.CLEAR_ON_DESELECT);
         lastSig         = new byte[(short) 65];
         rng             = RandomData.getInstance(RandomData.ALG_SECURE_RANDOM);
@@ -819,7 +824,7 @@ public class CashuApplet extends Applet {
         //   bit0 = secp256k1 native key generation (set — ENG-181 complete)
         //   bit1 = BIP-340 Schnorr signing (set — ENG-181 complete)
         //   bit2 = PIN supported (always set)
-        buf[6] = (byte) 0x07; // secp256k1 + Schnorr + PIN
+        buf[6] = (byte) 0x0F; // secp256k1 + Schnorr + PIN + the limit on one payment is waited for, not refused
         buf[7] = pinState[0];
         // The fork's: the first eight bytes are upstream's, so a reader that
         // knows only those still reads them right.
@@ -836,8 +841,8 @@ public class CashuApplet extends Applet {
         Util.arrayCopyNonAtomic(cardRecord, CARD_SPENT_OFFSET, buf, (short) 25, (short) 4);
         // and whether this tap, being the one after a payment, may put pieces on with no PIN
         buf[29] = changeGrant[0];
-        /* P1 = 1 asks for the limit on one tap as well: the limit, when the
-         * current tap began, and what has been signed for in it. Asked for,
+        /* P1 = 1 asks for the limit on one payment as well: the limit, and
+         * eight bytes that were a window and its count and are zeros. Asked for,
          * and not simply appended, so that a reader that knows the thirty
          * bytes and checks for them still gets thirty. */
         if (p1 == (byte) 1) {
@@ -1020,9 +1025,10 @@ public class CashuApplet extends Applet {
      * The PIN, as any spend. Every place named once, holding an unspent piece,
      * and all of one date (pieces with different dates have different lock
      * conditions, and a mint takes no one signature for those: `6A80`). The
-     * limits are held to what the pieces are worth together, before anything
-     * is hashed: over the day, `6A8F`; over the tap, `6A95`; each written down
-     * in the log before it is refused, as a spend over a limit always is.
+     * day's limit is held to what the pieces are worth together, before
+     * anything is hashed: over it, `6A8F`, written down in the log before it
+     * is refused. What the payment will wait for being over the limit on one
+     * payment is worked out from the same sum (`waitsFor`), and paid at SIGN.
      * Answers what the pieces are worth (4, big-endian).
      */
     private void processSpendAllBegin(APDU apdu) {
@@ -1056,6 +1062,10 @@ public class CashuApplet extends Applet {
         // a sum that wraps is past any limit, and past what four bytes can say: not a payment
         if (carry != 0) Util.arrayFillNonAtomic(allSum, (short) 0, (short) 4, (byte) 0xFF);
         requireUnderLimits(carry);
+        // what this payment costs in time, worked out now and paid at SIGN before anything is burned
+        short waits = waitsFor(carry);
+        Util.setShort(allState, (short) 2, waits);
+        allState[4] = (byte)(waits > 0 ? 1 : 0);
 
         shaAll.reset();
         for (short i = 0; i < n; i++) {
@@ -1112,18 +1122,39 @@ public class CashuApplet extends Applet {
     private void processSpendAllSign(APDU apdu) {
         if (allState[0] != (byte) 1) ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
         requirePinIfSet();
+        byte[] buf = apdu.getBuffer();
+
+        /* The wait, where the payment is over the limit on one payment (6a).
+         * The card has no clock that runs and cannot sleep, so its wait is
+         * work: one signature, over bytes of its own choosing, thrown away.
+         * That is the one thing here whose time is the chip's and no
+         * terminal's. One to a command, so that no command is longer than a
+         * signature (a phone gives up on a card that is silent for long), and
+         * the answer is how many are still to come, two bytes, in place of
+         * the signature. Nothing is burned and nothing counted until they
+         * are done: a card lifted in the wait has lost nothing, and whatever
+         * else is sent drops the payment and the wait with it. */
+        short waits = Util.getShort(allState, (short) 2);
+        if (waits > 0) {
+            rng.generateData(scratch, X_MSG, (short) 32);
+            schnorrHW.sign(cardPrivKey, cardPubKey, scratch, X_MSG, buf, (short) 0);
+            Util.arrayFillNonAtomic(buf, (short) 0, (short) 64, (byte) 0);
+            waits--;
+            Util.setShort(allState, (short) 2, waits);
+            Util.setShort(buf, (short) 0, waits);
+            apdu.setOutgoingAndSend((short) 0, (short) 2);
+            return;
+        }
+
         // one signature for one beginning
         allState[0] = (byte) 0;
         short n = (short)(allState[1] & 0xFF);
-        byte[] buf = apdu.getBuffer();
 
-        /* The limits again, as they stand now: what the day and the tap would
-         * have signed for is left in scratch (X_SUM, X_TAP) for the commit. */
+        /* The day's limit again, as it stands now: what the day would have
+         * signed for is left in scratch (X_SUM) for the commit. */
         requireUnderLimits((short) 0);
         boolean limited = !isZero(cardRecord, CARD_LIMIT_OFFSET, (short) 4);
-        boolean tapLimited = !isZero(cardRecord, CARD_TAP_LIMIT_OFFSET, (short) 4);
         boolean newDay = limited && dayIsOver();
-        boolean newTap = tapLimited && windowIsOver(cardRecord, CARD_TAP_WINDOW_OFFSET, TAP_SECONDS);
 
         shaAll.doFinal(buf, (short) 0, (short) 0, scratch, X_MSG);
         short sigLen = schnorrHW.sign(cardPrivKey, cardPubKey, scratch, X_MSG, buf, (short) 0);
@@ -1133,10 +1164,6 @@ public class CashuApplet extends Applet {
             if (limited) {
                 if (newDay) Util.arrayCopy(cardRecord, CARD_NOW_OFFSET, cardRecord, CARD_WINDOW_OFFSET, (short) 4);
                 Util.arrayCopy(scratch, X_SUM, cardRecord, CARD_SPENT_OFFSET, (short) 4);
-            }
-            if (tapLimited) {
-                if (newTap) Util.arrayCopy(cardRecord, CARD_NOW_OFFSET, cardRecord, CARD_TAP_WINDOW_OFFSET, (short) 4);
-                Util.arrayCopy(scratch, X_TAP, cardRecord, CARD_TAP_SPENT_OFFSET, (short) 4);
             }
             for (short i = 0; i < n; i++) {
                 short base = (short)((short)(allSlots[i] & 0xFF) * PROOF_SIZE);
@@ -1150,6 +1177,8 @@ public class CashuApplet extends Applet {
             short pieces = (short)((short)(cardLog[(short)(entry + LOG_E_PIECES)] & 0xFF) + n);
             cardLog[(short)(entry + LOG_E_PIECES)] = (byte)(pieces > (short) 255 ? (short) 255 : pieces);
             addUint32Stop(cardLog, LOG_SATS_OFFSET, allSum, (short) 0);
+            // a payment that was over the limit on one payment says so in the card's account of the tap
+            if (allState[4] == (byte) 1) cardLog[(short)(entry + LOG_E_FLAGS)] |= LOG_FLAG_WAITED;
             // and the signature itself, for the terminal whose answer is lost on the air (SPEND_ALL_AGAIN)
             Util.arrayCopy(buf, (short) 0, lastSig, (short) 1, (short) 64);
             lastSig[0] = (byte) 1;
@@ -1184,25 +1213,22 @@ public class CashuApplet extends Applet {
     }
 
     /**
-     * The limits, held to what the pieces named at SPEND_ALL_BEGIN are worth
-     * together (`allSum`; `carry` where that sum wrapped). Leaves in scratch
-     * what the day (X_SUM) and the tap (X_TAP) would have signed for with them.
+     * The day's limit, held to what the pieces named at SPEND_ALL_BEGIN are
+     * worth together (`allSum`; `carry` where that sum wrapped). Leaves in
+     * scratch what the day (X_SUM) would have signed for with them.
      *
      * A terminal that has the PIN picks the places, and nothing on the card
      * can tell its request from the holder's, so what bounds it is a number in
-     * permanent memory, counted against a window that only time can end: the
-     * day, and the tap (ten seconds of the card's clock; not a PIN entry, a
-     * SELECT or a time in the field, which a terminal begins again as it
-     * likes). The pieces are charged at their whole worth, not at the price of
-     * the payment: change that a terminal writes back is not something the
-     * card can check. A limit of 0 is no limit: nothing is checked, and
-     * nothing counted. Over either, the spend is written down and refused.
+     * permanent memory, counted against a window that only time can end. The
+     * pieces are charged at their whole worth, not at the price of the
+     * payment: change that a terminal writes back is not something the card
+     * can check. A limit of 0 is no limit: nothing is checked, and nothing
+     * counted. Over it, the spend is written down and refused.
      */
     private void requireUnderLimits(short carry) {
         boolean limited = !isZero(cardRecord, CARD_LIMIT_OFFSET, (short) 4);
-        boolean tapLimited = !isZero(cardRecord, CARD_TAP_LIMIT_OFFSET, (short) 4);
-        // never been told the time: a card that cannot know the day does not spend under a limit
-        if ((limited || tapLimited) && isZero(cardRecord, CARD_NOW_OFFSET, (short) 4)) ISOException.throwIt(SW_NO_TIME);
+        // never been told the time: a card that cannot know the day does not spend under a daily limit
+        if (limited && isZero(cardRecord, CARD_NOW_OFFSET, (short) 4)) ISOException.throwIt(SW_NO_TIME);
         if (limited) {
             if (dayIsOver()) {
                 Util.arrayFillNonAtomic(scratch, X_SUM, (short) 4, (byte) 0);
@@ -1214,16 +1240,41 @@ public class CashuApplet extends Applet {
                 refuseOverLimit(SW_OVER_LIMIT);
             }
         }
-        if (tapLimited) {
-            if (windowIsOver(cardRecord, CARD_TAP_WINDOW_OFFSET, TAP_SECONDS)) {
-                Util.arrayFillNonAtomic(scratch, X_TAP, (short) 4, (byte) 0);
-            } else {
-                Util.arrayCopyNonAtomic(cardRecord, CARD_TAP_SPENT_OFFSET, scratch, X_TAP, (short) 4);
-            }
-            short over = addUint32Carry(scratch, X_TAP, allSum, (short) 0);
-            if (carry != 0 || over != 0 || cmpUint32(scratch, X_TAP, cardRecord, CARD_TAP_LIMIT_OFFSET) > 0) {
-                refuseOverLimit(SW_OVER_TAP_LIMIT);
-            }
+    }
+
+    /**
+     * What the payment begun costs in time: the signatures of work to be done
+     * at SPEND_ALL_SIGN before it is signed (6a).
+     *
+     * With a limit on one payment of L and pieces worth S together, the first
+     * L is free and every L after it, whole or in part, is WAIT_SIGNS
+     * signatures: (ceil(S / L) - 1) * WAIT_SIGNS. Nothing is remembered from
+     * one payment to the next and no clock is asked, so there is nothing a
+     * terminal can replay or reset to make it less: a payment of ten limits
+     * waits for nine, today and at any other time. What a terminal can do is
+     * take the money a limit at a time, each a signature of its own, which is
+     * the rate this limit holds it to. No limit, or a payment within it: 0.
+     */
+    private short waitsFor(short carry) {
+        if (isZero(cardRecord, CARD_TAP_LIMIT_OFFSET, (short) 4)) return (short) 0;
+        if (carry != 0) return (short)(WAIT_UNITS_MOST * WAIT_SIGNS);
+        Util.arrayCopyNonAtomic(allSum, (short) 0, scratch, X_TAP, (short) 4);
+        short units = 0;
+        // what is left after each limit's worth is taken off: while more than a limit is left, another has to be waited for
+        while (units < WAIT_UNITS_MOST && cmpUint32(scratch, X_TAP, cardRecord, CARD_TAP_LIMIT_OFFSET) > 0) {
+            subUint32(scratch, X_TAP, cardRecord, CARD_TAP_LIMIT_OFFSET);
+            units++;
+        }
+        return (short)(units * WAIT_SIGNS);
+    }
+
+    /** a -= b, four bytes each, big-endian; a is not less than b. */
+    private static void subUint32(byte[] a, short aOff, byte[] b, short bOff) {
+        short borrow = 0;
+        for (short i = 3; i >= 0; i--) {
+            short d = (short)((short)(a[(short)(aOff + i)] & 0xFF) - (short)(b[(short)(bOff + i)] & 0xFF) - borrow);
+            if (d < 0) { d += (short) 256; borrow = 1; } else { borrow = 0; }
+            a[(short)(aOff + i)] = (byte) d;
         }
     }
 
@@ -1533,16 +1584,17 @@ public class CashuApplet extends Applet {
      */
     /*
      * `len` is 4 or 8. Four bytes are the day's limit, as they always were,
-     * and the limit on one tap is left as it is. Eight are both: the day's,
-     * then the tap's. In that form a limit whose number is not changed keeps
-     * its window and what was signed for in it, so that setting one of the
-     * two does not begin the other again; a number that changes begins its
-     * window at `now` with nothing spent, as the four-byte form always does.
+     * and the limit on one payment is left as it is. Eight are both: the
+     * day's, then that one. In that form a day's limit whose number is not
+     * changed keeps its window and what was signed for in it, so that setting
+     * the other does not begin the day again; a day's number that changes
+     * begins its window at `now` with nothing spent, as the four-byte form
+     * always does. The limit on one payment has no window to begin.
      */
     private void writeLimit(byte[] src, short at, short len) {
         boolean both = len == (short) 8;
-        boolean anyLimit = !isZero(src, at, (short) 4) || (both && !isZero(src, (short)(at + 4), (short) 4));
-        if (anyLimit && isZero(cardRecord, CARD_NOW_OFFSET, (short) 4)) {
+        // the day's limit is counted against the clock, and needs one; the limit on one payment asks no clock
+        if (!isZero(src, at, (short) 4) && isZero(cardRecord, CARD_NOW_OFFSET, (short) 4)) {
             ISOException.throwIt(SW_NO_TIME);
         }
         boolean dayChanged = !both || !sameBytes(src, at, cardRecord, CARD_LIMIT_OFFSET, (short) 4);
@@ -1555,8 +1607,6 @@ public class CashuApplet extends Applet {
         }
         if (tapChanged) {
             Util.arrayCopy(src, (short)(at + 4), cardRecord, CARD_TAP_LIMIT_OFFSET, (short) 4);
-            Util.arrayCopy(cardRecord, CARD_NOW_OFFSET, cardRecord, CARD_TAP_WINDOW_OFFSET, (short) 4);
-            Util.arrayFillNonAtomic(cardRecord, CARD_TAP_SPENT_OFFSET, (short) 4, (byte) 0);
         }
         JCSystem.commitTransaction();
     }
