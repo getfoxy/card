@@ -223,7 +223,13 @@ mint, or without it, as a phone that knows none sends it: then the card has
 none.
 
 Kept apart from the record: the **owner key**, 65 bytes uncompressed, and a
-flag that one has been given (`GET_INFO` byte 16). See 5.6. Kept in RAM, gone
+flag that one has been given (`GET_INFO` byte 16). See 5.6. And, from software
+1.12, the **openings of the card's own change**: eight places of 80 bytes (the
+amount, the keyset, the date, the nonce and the blinding factor of a change
+output the card made for itself at `SPEND_ALL_CHANGE`), each with a state
+(empty; drafted for a payment not yet signed for, let go at the next
+`SPEND_ALL_BEGIN`; pending, signed for and waiting for its piece), read by
+`GET_CHANGE` and let go when a piece with that nonce is written on. Kept in RAM, gone
 with the tap: the **nonce** the card last gave for an owner's proof and whether
 it is still live, and whether `ALLOW_LOAD` has been given in this tap.
 
@@ -294,7 +300,9 @@ has most of them as commands and answers):
 | `16` | GET_CARD | | | format, record set, unit, limit (4), refund key (33), time key (65), mint length, mint |
 | `17` | GET_PIECES | | P1 = the first slot to report | one page: the first slot the page does not cover (1), then for each slot in the range that is not empty a tag (1) and, for an unspent slot, its 81 bytes (FOXY-CARD-DAILY-LIMIT.md 8.1). `6A83` for a P1 of 64 or more |
 | `20` | ~~SPEND_PROOF~~ | | | gone with format 4: `6D00`. Up to format 3 it signed for one slot, over that piece's secret alone |
-| `22` `23` `24` | SPEND_ALL_BEGIN, SPEND_ALL_OUTPUTS, SPEND_ALL_SIGN | PIN, if one is set; a time, if a limit is set | the places of a payment; then the swap's outputs, 37 bytes each; then nothing | **one** 64-byte signature over every piece and every output (NUT-11 `SIG_ALL`), with every place burned in the same transaction. The limits are held to the sum. Not opened by `ALLOW_LOAD` (FOXY-CARD-DAILY-LIMIT.md 6c) |
+| `22` `23` `24` | SPEND_ALL_BEGIN, SPEND_ALL_OUTPUTS, SPEND_ALL_SIGN | PIN, if one is set; a time, if a limit is set | the places of a payment; then the swap's outputs, 37 bytes each; then nothing | **one** 64-byte signature over every piece and every output (NUT-11 `SIG_ALL`), with every place burned in the same transaction. The limits are held to what leaves the card: the pieces less the card's own change (`26`), worked out at the first SIGN, where the day refuses (`6A8F`) and the wait begins (00 01, "not yet"). Not opened by `ALLOW_LOAD` (FOXY-CARD-DAILY-LIMIT.md 6c) |
+| `26` | SPEND_ALL_CHANGE | as `22`; a payment begun, its outputs (`23`) all given | the amount (4) | one change output the card makes for itself (software 1.12): a fresh nonce, the secret in the card's own form (its key, the payment's date and refund key, `SIG_ALL`), hashed to the curve as NUT-00 says and blinded with a fresh factor; hashed into the message as an output, after the terminal's; the opening (amount, keyset, date, nonce, blinding factor) is kept until the piece is written back. Answers the blinded message, 33 bytes. At most 8 openings on a card. `6985` with no payment begun; `6A80` for nothing, or more change than the pieces come to; `6A84` with no opening free; the terminal's outputs after it are `6985`, and the payment is given up |
+| `19` | GET_CHANGE | nothing | P1 = the page, from 0 | the openings of the change the card has made for itself and not yet been handed, three to a page: a count (1), then for each the amount (4), the keyset (8), the date (4), the nonce (32) and the blinding factor (32). An opening whose piece is on the card by now is let go first. The phone that owes the change finishes the pieces with these; the owner's phone finishes change a till never handed over (NUT-09 restore). What they say lets a reader finish a piece locked to the card's key, which nobody but the card can spend |
 | `25` | SPEND_ALL_AGAIN | PIN, if one is set | | the last signature given, again, for a terminal that never heard it |
 | `30` | LOAD_PROOF | an owner; a PIN set, and verified or `ALLOW_LOAD` given in this tap; a card record; a time | 81 bytes | `6982` with no verified PIN and no grant (the gate comes first); then `6A90` with no owner; `6A92` with no time; `6A94` for a piece whose nonce is already in a slot, spent or not (checked last, before anything is written) |
 | `31` | CLEAR_SPENT | the PIN, if one is set, or `ALLOW_LOAD` given in this tap | | |
@@ -581,10 +589,14 @@ unspent (and with the owner's proof, if the card has an owner), sets `now` and
 the window back to 0. A far-future time signed by mistake would otherwise freeze
 a card's day until real time caught up.
 
-**It counts the pieces signed, not the price paid.** The card cannot check
-change that a terminal writes back, so change loaded onto the card gives the day
-nothing back. A payment of 300 sats made with one piece of 1,000 costs the day
-1,000, and a till picks pieces as near the price as it can (8.1). A window is a
+**It counts what leaves the card, not the price paid.** From software 1.12 a
+payment's change is the card's own (`SPEND_ALL_CHANGE`): outputs the card
+builds and locks to its own key, which no terminal can take, so the day is
+charged the pieces less that change. Change a terminal writes back by other
+means the card cannot check, and gives the day nothing back. A payment of 300
+sats made with one piece of 1,000 and 700 of the card's own change costs the
+day 300; before 1.12 it cost 1,000, and a till picks pieces as near the price
+as it can either way (8.1). A window is a
 fixed day from its start, so a terminal that straddles one boundary can take up
 to two days' limit in a short span. That is the bound, and it is written down
 and not hidden.

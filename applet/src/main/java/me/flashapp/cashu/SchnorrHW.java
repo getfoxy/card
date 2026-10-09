@@ -138,6 +138,7 @@ final class SchnorrHW {
     // ── Crypto objects (allocated once) ───────────────────────────────────
     private final MessageDigest sha256;
     private final KeyAgreement  ecdh;      // ALG_EC_SVDP_DH_PLAIN_XY
+    private final KeyAgreement  gm;        // ALG_EC_PACE_GM: [s]G + H, the chip's point addition, for a change output's blinding (1.12)
     private final ECPrivateKey  tmpPriv;   // reused temp key for k
     private final RandomData    rng;       // BIP-340 auxiliary randomness (step 2)
     // NB: there is deliberately no ECPublicKey for the generator. R = k*G is
@@ -178,6 +179,7 @@ final class SchnorrHW {
         setECParams(tmpPriv, null);
 
         ecdh = KeyAgreement.getInstance(KeyAgreement.ALG_EC_SVDP_DH_PLAIN_XY, false);
+        gm   = KeyAgreement.getInstance(KeyAgreement.ALG_EC_PACE_GM, false);
 
         // BIP-340 auxiliary randomness. Allocated once, like everything else on
         // the signing path.
@@ -484,12 +486,27 @@ final class SchnorrHW {
     }
 
     /**
+     * out = [s]G + H by the chip (TR-03111's generic mapping, which is a
+     * scalar multiplication and a point addition in one): 65 bytes,
+     * 04 || x || y. `s` is 32 bytes under n; `h` a point on the curve, 65
+     * bytes uncompressed. For a change output's blinding (1.12).
+     */
+    void addToG(byte[] s, short sOff, byte[] h, short hOff, byte[] out, short outOff) {
+        tmpPriv.setS(s, sOff, (short) 32);
+        gm.init(tmpPriv);
+        short len = gm.generateSecret(h, hOff, (short) 65, out, outOff);
+        if (len != (short) 65 || out[outOff] != (byte) 0x04) {
+            ISOException.throwIt(CashuApplet.SW_CRYPTO_ERROR);
+        }
+    }
+
+    /**
      * Compute a mod n in-place (a is 32 bytes, big-endian).
      *
      * If a ≥ n, subtracts n (at most once, since callers guarantee a < 2n
      * after the tagged-hash reduction step).
      */
-    private static void reduceModN(byte[] a, short aOff) {
+    static void reduceModN(byte[] a, short aOff) {
         if (cmp32(a, aOff, N, (short)0) >= 0) {
             sub32(a, aOff, N, (short)0, a, aOff);
         }

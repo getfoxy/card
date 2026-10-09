@@ -296,11 +296,15 @@ card with no limit needs no time to spend. **A new card's limit is 0, and
 set-up does not ask for one**; a limit is set later from CHANGE LIMIT, to any
 amount, and removed the same way (section 10).
 
-**It counts the pieces signed, not the price paid**, as the draft's allowance
-did and for the same reason: the card cannot check what a terminal writes back,
-so change does not give the day anything back. A 300-sat payment made with one
-piece of 1,000 costs the day 1,000. A till picks pieces as near the price as it
-can (`FOXY-CARD-SPEC.md` 8.1), and the holder's phone loads a card in pieces
+**It counts what leaves the card, not the price paid.** From software 1.12 a
+payment's change is the card's own (`SPEND_ALL_CHANGE`, 6d): outputs the card
+builds and locks to its own key, which no terminal can take, so the day is
+charged the pieces less that change, and a 300-sat payment made with one
+piece of 1,000 and 700 of the card's own change costs the day 300. Change a
+terminal writes back by other means the card cannot check, as the draft's
+allowance could not, and it gives the day nothing back: before 1.12 that
+payment cost the day 1,000. A till picks pieces as near the price as it can
+(`FOXY-CARD-SPEC.md` 8.1), and the holder's phone loads a card in pieces
 small enough for the limit to be useful.
 
 **The edge of a window.** A window is a fixed day from its start, so a terminal
@@ -333,15 +337,21 @@ counted against time can be walked forward by whoever holds valid times, and
 with the time key where it is (5.2) that is anyone. A limit that asks no clock
 has nothing to replay.
 
-**The rule.** With a limit of `L` sats and a payment whose pieces are worth
-`S` together (the sum the card takes at `SPEND_ALL_BEGIN`):
+**The rule.** With a limit of `L` sats and a payment of which `S` sats leave
+the card for good — the pieces named at `SPEND_ALL_BEGIN`, less the change the
+card makes for itself (`SPEND_ALL_CHANGE`, software 1.12; section 6d) — worked
+out at the first `SPEND_ALL_SIGN`, when the change is known:
 
-    waits = (ceil(S / L) − 1) × WAIT_SIGNS
+    waits = 0                          when S ≤ L and the payment makes no change
+    waits = ceil(S / L) × WAIT_SIGNS   otherwise
 
-The first `L` is free; every `L` after it, whole or in part, costs
-`WAIT_SIGNS` (four) *signatures of work*, about three seconds on the chip. `L`
-of 0 is no limit. Past 255 limits a payment waits as 255 do, which is a
-quarter of an hour and so never.
+A payment within the limit that makes no change goes at once. Otherwise every
+`L` of what leaves the card, whole or in part, costs `WAIT_SIGNS` (four)
+*signatures of work*, about three seconds on the chip: within the limit but
+with change, three seconds; over it and up to twice it, six; up to three
+times, nine; and so on. `L` of 0 is no limit. Past 255 limits a payment waits
+as 255 do, which is a quarter of an hour and so never. (Before 1.12 the first
+`L` was free and the pieces were counted whole: `(ceil(S / L) − 1) × WAIT_SIGNS`.)
 
 **What a wait is.** The card cannot sleep and has no timer. The one thing on it
 whose duration is the chip's own, and that no terminal can shorten, is a
@@ -374,8 +384,9 @@ leaves the card about as fast as an honest payment of that size would, so
 that a card lifted when the payment ought to be over has lost about what it
 ought to have paid.
 
-The wait is charged on what the pieces are worth, not on the price: change
-that a terminal writes back is not something the card can check. A wallet
+The wait is charged on what leaves the card, not on the price: the pieces,
+less the change the card makes for itself (6d; before 1.12 the pieces whole,
+since change a terminal writes back is not something the card can check). A wallet
 that wants the card held no longer than it must chooses the pieces that
 overpay least.
 

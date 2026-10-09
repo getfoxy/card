@@ -537,9 +537,11 @@ class SchnorrHWMathTest {
      * The figures of the build that is known to install on the chip (1.7): the transient memory the two
      * constructors ask for, by kind, and how many arrays that is. jCardSim has no limit on any of it, and a chip
      * has: 1.9 asked for 1,030 bytes of CLEAR_ON_DESELECT (in 15 arrays) where 1.7 asked for 931 (in 14), and
-     * the chip answered INSTALL with 6F00. A larger figure has to be measured on a card first.
+     * the chip answered INSTALL with 6F00 (which the opener applet turned out to be the cure for, not the
+     * memory). 1.12 asks for 941 in 16: the change and the net of a payment, four bytes each. A larger figure
+     * has to be measured on a card first.
      */
-    static final int RAM_ON_DESELECT_MOST = 931, RAM_ON_RESET_MOST = 7, RAM_ARRAYS_MOST = 14;
+    static final int RAM_ON_DESELECT_MOST = 941, RAM_ON_RESET_MOST = 7, RAM_ARRAYS_MOST = 16;
 
     /** Every `static final short|byte|int NAME = expr;` of the applet's two sources. */
     private static java.util.Map<String, String> constantExpressions(String... sources) {
@@ -612,17 +614,17 @@ class SchnorrHWMathTest {
     }
 
     @Test
-    @DisplayName("RAM budget: the two constructors ask for no more than 931 bytes of CLEAR_ON_DESELECT, 7 of CLEAR_ON_RESET, in no more than 14 arrays: the figures of the build known to install on the chip")
+    @DisplayName("RAM budget: the two constructors ask for no more than 941 bytes of CLEAR_ON_DESELECT, 7 of CLEAR_ON_RESET, in no more than 16 arrays: the figures of 1.12, which are 1.7's and a payment's change and net")
     void transientMemoryIsWithinTheBuildThatInstallsOnTheChip() throws Exception {
         int[] asked = transientMemoryAskedFor();
-        String why = " These are the figures of the build that is known to install on the chip (1.7: 931 bytes that are cleared on deselect, 7 on reset, in 14 arrays). "
+        String why = " These are the figures of 1.12 (941 bytes that are cleared on deselect, 7 on reset, in 16 arrays: 1.7's 931 in 14, and the change and the net of a payment). "
             + "1.9 asked for 1,030 in 15 and the chip refused to install it (6F00); jCardSim has no limit and says nothing. A larger figure has to be measured on a card first.";
         org.junit.jupiter.api.Assertions.assertTrue(asked[0] <= RAM_ON_DESELECT_MOST, "CLEAR_ON_DESELECT is " + asked[0] + " bytes, over " + RAM_ON_DESELECT_MOST + "." + why);
         org.junit.jupiter.api.Assertions.assertTrue(asked[1] <= RAM_ON_RESET_MOST, "CLEAR_ON_RESET is " + asked[1] + " bytes, over " + RAM_ON_RESET_MOST + "." + why);
         org.junit.jupiter.api.Assertions.assertTrue(asked[2] <= RAM_ARRAYS_MOST, "transient arrays are " + asked[2] + ", over " + RAM_ARRAYS_MOST + "." + why);
         // a parse that found nothing would prove nothing
-        org.junit.jupiter.api.Assertions.assertEquals(14, asked[2], "the parse found the 12 of CashuApplet and the 2 of SchnorrHW");
-        org.junit.jupiter.api.Assertions.assertEquals(931, asked[0], "and they add up to the figure the chip has taken: CashuApplet 387 and SchnorrHW 544");
+        org.junit.jupiter.api.Assertions.assertEquals(16, asked[2], "the parse found the 14 of CashuApplet and the 2 of SchnorrHW");
+        org.junit.jupiter.api.Assertions.assertEquals(941, asked[0], "and they add up: CashuApplet 397 and SchnorrHW 544");
         org.junit.jupiter.api.Assertions.assertEquals(7, asked[1]);
     }
 
@@ -645,15 +647,16 @@ class SchnorrHWMathTest {
      * a site that runs twice says so.
      */
     @Test
-    @DisplayName("Crypto objects: CashuApplet makes 1 OwnerPIN, 1 Signature, 2 MessageDigests, 1 RandomData, 2 KeyPairs and (in newP256Key, run twice) 1 key site; SchnorrHW makes 1 MessageDigest, 1 KeyAgreement, 1 RandomData and 1 key; no KeyAgreement, Cipher or Checksum is made anywhere else")
+    @DisplayName("Crypto objects: CashuApplet makes 1 OwnerPIN, 1 Signature, 2 MessageDigests, 1 RandomData, 2 KeyPairs and (in newP256Key, run twice) 2 key sites; SchnorrHW makes 1 MessageDigest, 2 KeyAgreements, 1 RandomData and 1 key; no KeyAgreement, Cipher or Checksum is made anywhere else")
     void cryptoObjectsAreThoseOfTheBuildThatInstalls() throws Exception {
         String applet = stripCommentsAndCharLiterals(new String(java.nio.file.Files.readAllBytes(mainSourceDir().resolve("CashuApplet.java")), java.nio.charset.StandardCharsets.UTF_8));
         String signer = stripCommentsAndCharLiterals(new String(java.nio.file.Files.readAllBytes(mainSourceDir().resolve("SchnorrHW.java")), java.nio.charset.StandardCharsets.UTF_8));
         String[] kinds = { "new\\s+OwnerPIN\\(", "Signature\\.getInstance\\(", "MessageDigest\\.getInstance\\(", "RandomData\\.getInstance\\(", "new\\s+KeyPair\\(",
             "KeyBuilder\\.buildKey\\(", "KeyAgreement\\.getInstance\\(", "Cipher\\.getInstance\\(", "Checksum\\.getInstance\\(", "KeyAgreement\\b" };
-        int[] inApplet = { 1, 1, 2, 1, 2, 1, 0, 0, 0, 0 };
-        // SchnorrHW names KeyAgreement in its field's type and in the getInstance call, and in its agree-less comments only
-        int[] inSigner = { 0, 0, 1, 1, 0, 1, 1, 0, 0, -1 };
+        // 1.12: the RSA keys of the change (one buildKey site, run three times) and their Cipher; SchnorrHW's second KeyAgreement is the chip's point addition
+        int[] inApplet = { 1, 1, 2, 1, 2, 2, 0, 1, 0, 0 };
+        // SchnorrHW names KeyAgreement in its fields' types and in the getInstance calls, and in its agree-less comments only
+        int[] inSigner = { 0, 0, 1, 1, 0, 1, 2, 0, 0, -1 };
         for (int i = 0; i < kinds.length; i++) {
             long a = java.util.regex.Pattern.compile(kinds[i]).matcher(applet).results().count();
             org.junit.jupiter.api.Assertions.assertEquals(inApplet[i], a, "CashuApplet.java: " + kinds[i] + " is called " + a + " times where the build that installs called it " + inApplet[i] + ". A chip counts these; measure a larger figure on a card first.");

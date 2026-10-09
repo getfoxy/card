@@ -29,8 +29,10 @@ import javacardx.crypto.*;
  *   0x16  GET_CARD         — the card record: mint, unit, refund key, limit, time key
  *   0x17  GET_PIECES       — every slot's state and every unspent piece, a page at a time (P1 = the first slot)
  *   0x18  GET_LOG          — the card's own account of its taps: what it signed for, what it refused
+ *   0x19  GET_CHANGE       — the change the card made for itself and has not been handed: the openings, a page at a time
  *   0x22  SPEND_ALL_BEGIN  — the places a payment is made of, in order (one signature for all: NUT-11 SIG_ALL)
  *   0x23  SPEND_ALL_OUTPUTS — the swap's outputs, 37 bytes each, hashed into the message as they come
+ *   0x26  SPEND_ALL_CHANGE — one change output the card makes for itself, locked to its own key; answers the blinded message
  *   0x24  SPEND_ALL_SIGN   — the one signature; every piece named is burned as it is given
  *   0x25  SPEND_ALL_AGAIN  — the last signature given, again, for an answer lost on the air
  *   0x30  LOAD_PROOF       — store new proof (an owner, a time, and a PIN or the owner's grant)
@@ -118,7 +120,11 @@ public class CashuApplet extends Applet {
     // payment, which asks no clock and is waited for (docs/FOXY-CARD-DAILY-LIMIT.md, section 6a).
     // 1.4 is one signature for a whole payment (NUT-11 SIG_ALL): format 4, in
     // which every piece's secret carries the flag and SPEND_PROOF is gone.
-    static final byte VERSION_MINOR = (byte) 0x0B;
+    // 1.12 makes a payment's change itself (SPEND_ALL_CHANGE): outputs locked to the card's own key,
+    // built by the card, so that nothing a terminal names can take them; the limits and the wait are
+    // held to what leaves the card for good, the pieces less that change; and the openings of change
+    // not yet handed back can be read (GET_CHANGE) by any phone that would finish the pieces.
+    static final byte VERSION_MINOR = (byte) 0x0C;
     static final byte FORMAT        = (byte) 0x04;
 
     // -------------------------------------------------------------------------
@@ -134,6 +140,7 @@ public class CashuApplet extends Applet {
     static final byte INS_GET_CARD         = (byte) 0x16;
     static final byte INS_GET_PIECES       = (byte) 0x17;
     static final byte INS_GET_LOG          = (byte) 0x18;
+    static final byte INS_GET_CHANGE       = (byte) 0x19;
     // 0x20 was SPEND_PROOF: one piece, one signature over its secret alone. A
     // piece of format 4 says SIG_ALL in its secret, and a mint takes no such
     // signature for it. It answers 6D00 and stays unassigned.
@@ -141,6 +148,7 @@ public class CashuApplet extends Applet {
     static final byte INS_SPEND_ALL_OUTPUTS = (byte) 0x23;
     static final byte INS_SPEND_ALL_SIGN    = (byte) 0x24;
     static final byte INS_SPEND_ALL_AGAIN   = (byte) 0x25;
+    static final byte INS_SPEND_ALL_CHANGE  = (byte) 0x26;
     // 0x21 was SIGN_ARBITRARY. It answers 6D00 and must stay unassigned.
     static final byte INS_LOAD_PROOF       = (byte) 0x30;
     static final byte INS_CLEAR_SPENT      = (byte) 0x31;
@@ -276,6 +284,22 @@ public class CashuApplet extends Applet {
     // their number (`finishBurn`).
     static final short ALL_MOST            = MAX_PROOFS;
     static final short ALL_OUTPUT_LEN      = (short) 37;
+
+    // The change a payment makes for itself (1.12): the card's own change outputs, kept open from the
+    // moment they are made until the piece is written back. An opening is the amount (4), the keyset
+    // (8), the date (4), the nonce (32) and the blinding factor (32); its state is a byte of `openState`,
+    // kept apart so that a payment's SIGN flips every opening it made in one write of its transaction.
+    static final short CHANGE_MOST   = (short) 8;    // openings a card keeps; a payment makes at most this many change outputs
+    static final short OPEN_LEN      = (short) 80;
+    static final short OPEN_AMOUNT   = (short) 0;
+    static final short OPEN_KEYSET   = (short) 4;
+    static final short OPEN_DATE     = (short) 12;
+    static final short OPEN_NONCE    = (short) 16;
+    static final short OPEN_R        = (short) 48;
+    static final byte  OPEN_EMPTY    = (byte) 0;
+    static final byte  OPEN_DRAFT    = (byte) 1;   // made for a payment not yet signed for: let go at the next BEGIN
+    static final byte  OPEN_PENDING  = (byte) 2;   // signed for; the piece is to come back
+    static final short CHANGE_PAGE   = (short) 3;  // openings to one GET_CHANGE answer (80 bytes each, after a count)
 
     // -------------------------------------------------------------------------
     // The log (persistent): the card's own account of what it has signed for
@@ -432,6 +456,43 @@ public class CashuApplet extends Applet {
     // -------------------------------------------------------------------------
 
     /** P-256 field prime p */
+    /** NUT-00's domain for hashing a secret to the curve: "Secp256k1_HashToCurve_Cashu_". */
+    private static final byte[] H2C_DOMAIN = {
+        'S','e','c','p','2','5','6','k','1','_','H','a','s','h','T','o','C','u','r','v','e','_','C','a','s','h','u','_'
+    };
+    /*
+     * The field's arithmetic for a change output (1.12) is the chip's RSA: a
+     * private key whose modulus is p*p (512 bits, as the chip wants a
+     * modulus) and whose exponent is whatever power is wanted, the answer
+     * taken mod p after. The cube (x^3, for x^3 + 7), Euler's test (v^((p-1)/2):
+     * 1 for a square) and the root (v^((p+1)/4), which for a square is the
+     * root; the exponent used is (p+1)/4 + (p-1)/2, odd as an RSA exponent
+     * should be, and v^((p-1)/2) is 1 for a square, so the same root).
+     */
+    private static final byte[] RSA_PP = {
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFD,(byte)0xFF,(byte)0xFF,(byte)0xF8,(byte)0x5E,
+        (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,
+        (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,
+        (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x01,
+        (byte)0x00,(byte)0x00,(byte)0x07,(byte)0xA2,(byte)0x00,(byte)0x0E,(byte)0x90,(byte)0xA1
+    };
+    private static final byte[] RSA_D_CUBE  = { (byte) 0x03 };
+    private static final byte[] RSA_D_ROOT = {
+        (byte)0xBF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0x3F,(byte)0xFF,(byte)0xFD,(byte)0x23
+    };
+    private static final byte[] RSA_D_EULER = {
+        (byte)0x7F,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,
+        (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0x7F,(byte)0xFF,(byte)0xFE,(byte)0x17
+    };
+
     private static final byte[] P256_P = {
         (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x01,
         (byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,(byte)0x00,
@@ -707,6 +768,15 @@ public class CashuApplet extends Applet {
     private byte[] allState;
     /** What those pieces are worth together. Gone with a SELECT. */
     private byte[] allSum;
+    /** What the change the payment in hand makes for itself comes to (RAM), and what leaves the card for good: the pieces less it. */
+    private byte[] allChange;
+    private byte[] allNet;
+    /** The openings of the change the card has made for itself (CHANGE_MOST of OPEN_LEN), and their states. Permanent. */
+    private byte[] changeOpen;
+    private byte[] openState;
+    /** The chip's RSA, for the field's arithmetic (see RSA_PP). */
+    private Cipher rsa;
+    private RSAPrivateKey rsaCube, rsaRoot, rsaEuler;
     /**
      * The last signature given (64), and whether there has been one (1).
      * Permanent, and written in the transaction that burns the pieces it is
@@ -783,10 +853,19 @@ public class CashuApplet extends Applet {
         sha             = MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
         shaAll          = MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
         allSlots        = JCSystem.makeTransientByteArray(ALL_MOST, JCSystem.CLEAR_ON_DESELECT);
-        // [0] a payment is begun, [1] its places, [2..3] the signatures of work still to be done before it is signed, [4] it waited,
-        // [5] its first output is kept (`allOut`)
-        allState        = JCSystem.makeTransientByteArray((short) 6, JCSystem.CLEAR_ON_DESELECT);
+        // [0] a payment is begun, [1] its places, [2..3] the signatures of work still to be done before it is signed (-1: not
+        // yet worked out), [4] it waited, [5] its first output is kept (`allOut`), [6] the change outputs it made for itself,
+        // [7] its sum wrapped
+        allState        = JCSystem.makeTransientByteArray((short) 8, JCSystem.CLEAR_ON_DESELECT);
         allSum          = JCSystem.makeTransientByteArray((short) 4, JCSystem.CLEAR_ON_DESELECT);
+        allChange       = JCSystem.makeTransientByteArray((short) 4, JCSystem.CLEAR_ON_DESELECT);
+        allNet          = JCSystem.makeTransientByteArray((short) 4, JCSystem.CLEAR_ON_DESELECT);
+        changeOpen      = new byte[(short)(CHANGE_MOST * OPEN_LEN)];
+        openState       = new byte[CHANGE_MOST];
+        rsa             = Cipher.getInstance(Cipher.ALG_RSA_NOPAD, false);
+        rsaCube         = fieldKey(RSA_D_CUBE);
+        rsaRoot         = fieldKey(RSA_D_ROOT);
+        rsaEuler        = fieldKey(RSA_D_EULER);
         lastSig         = new byte[(short) 65];
         burnList        = new byte[(short)(MAX_PROOFS + 1)];
         burnPending     = new byte[1];
@@ -915,7 +994,8 @@ public class CashuApplet extends Applet {
         /* A payment begun (SPEND_ALL_BEGIN) is given up by anything that is not
          * its next step: nothing may come between the pieces being named and
          * their being burned and signed for, that could change either. */
-        if (buf[ISO7816.OFFSET_INS] != INS_SPEND_ALL_OUTPUTS && buf[ISO7816.OFFSET_INS] != INS_SPEND_ALL_SIGN) {
+        if (buf[ISO7816.OFFSET_INS] != INS_SPEND_ALL_OUTPUTS && buf[ISO7816.OFFSET_INS] != INS_SPEND_ALL_CHANGE
+            && buf[ISO7816.OFFSET_INS] != INS_SPEND_ALL_SIGN) {
             allState[0] = (byte) 0;
         }
 
@@ -930,8 +1010,10 @@ public class CashuApplet extends Applet {
             case INS_GET_CARD:         processGetCard(apdu);        break;
             case INS_GET_PIECES:       processGetPieces(apdu);      break;
             case INS_GET_LOG:          processGetLog(apdu);         break;
+            case INS_GET_CHANGE:       processGetChange(apdu);      break;
             case INS_SPEND_ALL_BEGIN:   processSpendAllBegin(apdu);   break;
             case INS_SPEND_ALL_OUTPUTS: processSpendAllOutputs(apdu); break;
+            case INS_SPEND_ALL_CHANGE:  processSpendAllChange(apdu);  break;
             case INS_SPEND_ALL_SIGN:    processSpendAllSign(apdu);    break;
             case INS_SPEND_ALL_AGAIN:   processSpendAllAgain(apdu);   break;
             case INS_LOAD_PROOF:       processLoadProof(apdu);      break;
@@ -1365,12 +1447,23 @@ public class CashuApplet extends Applet {
         }
         // a sum that wraps is past any limit, and past what four bytes can say: not a payment
         if (carry != 0) Util.arrayFillNonAtomic(allSum, (short) 0, (short) 4, (byte) 0xFF);
-        requireUnderLimits(carry);
-        // what this payment costs in time, worked out now and paid at SIGN before anything is burned
-        short waits = waitsFor(carry);
-        Util.setShort(allState, (short) 2, waits);
-        allState[4] = (byte)(waits > 0 ? 1 : 0);
+        /* The day's limit and the wait (6a) are held to what leaves the card
+         * for good: the pieces less the change the card makes for itself
+         * (1.12), which is not known until SIGN, where both are worked out,
+         * before anything is burned. A sum that wraps is past any day there
+         * is, whatever its change, and is refused here, before anything is
+         * hashed. */
+        if (carry != 0) requireUnderLimits(allSum, (short) 0, carry);
+        Util.setShort(allState, (short) 2, (short) -1);
+        allState[4] = (byte) 0;
         allState[5] = (byte) 0;
+        allState[6] = (byte) 0;
+        allState[7] = (byte) carry;
+        Util.arrayFillNonAtomic(allChange, (short) 0, (short) 4, (byte) 0);
+        // change made for a payment that was never signed for is let go
+        for (short k = 0; k < CHANGE_MOST; k++) {
+            if (openState[k] == OPEN_DRAFT) openState[k] = OPEN_EMPTY;
+        }
 
         /* The message's half that is the card's to build. Every piece of a
          * payment has the same key and the same date, so everything in a
@@ -1397,6 +1490,11 @@ public class CashuApplet extends Applet {
      */
     private void processSpendAllOutputs(APDU apdu) {
         if (allState[0] != (byte) 1) ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+        // the terminal's outputs come before the card's own change, as the swap will name them: none after it
+        if (allState[6] != (byte) 0) {
+            allState[0] = (byte) 0;
+            ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+        }
         short len = apdu.setIncomingAndReceive();
         if (len < ALL_OUTPUT_LEN || (short)(len % ALL_OUTPUT_LEN) != (short) 0) {
             allState[0] = (byte) 0;
@@ -1414,6 +1512,306 @@ public class CashuApplet extends Applet {
             short digits = decimalBefore(buf, at, (short)(X_OUT + 10));
             hexInto(buf, (short)(at + 4), (short) 33, (short)(X_OUT + 10));
             shaAll.update(scratch, (short)(X_OUT + 10 - digits), (short)(digits + 66));
+        }
+    }
+
+    /**
+     * SPEND_ALL_CHANGE: one change output the card makes for itself (1.12),
+     * after the outputs the terminal names and before the signature. The
+     * amount (4, big-endian). The card draws a nonce, builds the secret as
+     * its inputs' are (its own key, the payment's date and refund key,
+     * SIG_ALL), hashes it to the curve as the mint will (NUT-00), draws a
+     * blinding factor and blinds the point (`blindChange`); the amount and
+     * the blinded message go into the message as an output of the terminal's
+     * would, and the opening is kept until the piece is written back.
+     * Answers the blinded message, 33 bytes. A terminal names only how much:
+     * nothing in the output is its to choose, so nothing it chooses can take
+     * the change, and the limits are held to what leaves the card for good.
+     * `6985` with no payment begun; `6A80` for nothing, or for more change
+     * than the pieces come to; `6A84` with no opening free.
+     */
+    private void processSpendAllChange(APDU apdu) {
+        if (allState[0] != (byte) 1) ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+        short len = apdu.setIncomingAndReceive();
+        byte[] buf = apdu.getBuffer();
+        if (len != (short) 4) {
+            allState[0] = (byte) 0;
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+        // the change, with this, may not come to more than the pieces: what leaves the card cannot be less than nothing
+        Util.arrayCopyNonAtomic(allChange, (short) 0, scratch, X_TAP, (short) 4);
+        if (isZero(buf, ISO7816.OFFSET_CDATA, (short) 4)
+            || addUint32Carry(scratch, X_TAP, buf, ISO7816.OFFSET_CDATA) != 0
+            || cmpUint32(scratch, X_TAP, allSum, (short) 0) > 0) {
+            allState[0] = (byte) 0;
+            ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+        }
+        short which = (short) -1;
+        for (short k = 0; k < CHANGE_MOST; k++) {
+            if (openState[k] == OPEN_EMPTY) {
+                which = k;
+                break;
+            }
+        }
+        if (which < 0) {
+            allState[0] = (byte) 0;
+            ISOException.throwIt(SW_NO_SPACE);
+        }
+        short open = (short)(which * OPEN_LEN);
+        // the opening's amount, keyset and date: the payment's, as every piece of it has them
+        short first = (short)((short)(allSlots[0] & 0xFF) * PROOF_SIZE);
+        Util.arrayCopyNonAtomic(buf, ISO7816.OFFSET_CDATA, changeOpen, (short)(open + OPEN_AMOUNT), (short) 4);
+        Util.arrayCopyNonAtomic(proofStorage, (short)(first + PROOF_KEYSET_OFFSET), changeOpen, (short)(open + OPEN_KEYSET), (short) 8);
+        Util.arrayCopyNonAtomic(proofStorage, (short)(first + PROOF_DATE_OFFSET), changeOpen, (short)(open + OPEN_DATE), (short) 4);
+        try {
+            blindChange(first, open, buf);
+        } catch (CryptoException e) {
+            allState[0] = (byte) 0;
+            ISOException.throwIt(SW_CRYPTO_ERROR);
+        }
+        // the opening is the payment's until it is signed for (SIGN) or given up (BEGIN)
+        openState[which] = OPEN_DRAFT;
+        Util.arrayCopyNonAtomic(scratch, X_TAP, allChange, (short) 0, (short) 4);
+        allState[6] = (byte)(allState[6] + 1);
+        // into the message as an output: the amount in decimal, then the blinded message in hex, as the terminal's go
+        short digits = decimalBefore(changeOpen, (short)(open + OPEN_AMOUNT), (short)(X_OUT + 10));
+        hexInto(buf, (short) 0, (short) 33, (short)(X_OUT + 10));
+        shaAll.update(scratch, (short)(X_OUT + 10 - digits), (short)(digits + 66));
+        apdu.setOutgoingAndSend((short) 0, (short) 33);
+    }
+
+    /**
+     * The blinded message of a change output, made as the mint will read it.
+     * The secret is `["P2PK",{"nonce":"<nonce>"` and then what every piece
+     * of this payment has after its nonce (`secretTail`: the card's key, the
+     * date, the refund key, SIG_ALL). It is hashed to the curve as NUT-00
+     * says: x is SHA-256 of SHA-256(domain || secret) and a counter from 0,
+     * little-endian; the first x under p for which x^3 + 7 has a square root
+     * is the point's, with the even root for y. The cube, Euler's test and
+     * the root are the chip's RSA over p*p (RSA_PP, `powModP`), each taken mod p after.
+     * Then B_ = Y + r*G, by the chip, r fresh and under n. The nonce and r
+     * go into the opening at `open`; B_, compressed, into buf[0..33).
+     *
+     * The APDU buffer is the card's for the length of it: the secret's text
+     * to begin with, and after it is hashed the RSA's input (64, at 32: zeros
+     * and then the value), its output (64, at 96), the point Y (65, at 160)
+     * and the counter (4, at 225). Scratch holds the hashes and the working
+     * room of the reduction (X_OUT).
+     */
+    private void blindChange(short first, short open, byte[] buf) {
+        // the secret's tail, as every piece of this payment has it; the key's hex passes through X_HEX on the way
+        short tail = secretTail(buf, first);
+        // a fresh nonce into the opening, and its hex into X_HEX, which secretTail is done with
+        rng.generateData(changeOpen, (short)(open + OPEN_NONCE), (short) 32);
+        toHex(changeOpen, (short)(open + OPEN_NONCE), (short) 32);
+        sha.reset();
+        sha.update(H2C_DOMAIN, (short) 0, (short) H2C_DOMAIN.length);
+        sha.update(SECRET_1, (short) 0, (short) SECRET_1.length);
+        sha.update(scratch, X_HEX, (short) 64);
+        sha.doFinal(buf, (short) 0, tail, scratch, X_MSG);
+        Util.arrayFillNonAtomic(buf, (short) 32, (short) 32, (byte) 0);
+        Util.arrayFillNonAtomic(buf, (short) 225, (short) 4, (byte) 0);
+        while (true) {
+            sha.reset();
+            sha.update(scratch, X_MSG, (short) 32);
+            sha.doFinal(buf, (short) 225, (short) 4, buf, (short) 64);
+            // the counter moves on now, for the next round should this x not be the one
+            for (short i = 225; i < 229; i++) {
+                buf[i] = (byte)(buf[i] + 1);
+                if (buf[i] != (byte) 0) break;
+            }
+            if (cmp256(buf, (short) 64, SECP256K1_P, (short) 0) >= 0) continue;
+            Util.arrayCopyNonAtomic(buf, (short) 64, buf, (short) 161, (short) 32);
+            // x^3 + 7 mod p, kept at 0 for the root
+            powModP(rsaCube, buf);
+            add7ModP(buf, (short) 128);
+            Util.arrayCopyNonAtomic(buf, (short) 128, buf, (short) 0, (short) 32);
+            // Euler: a square, or the next counter
+            Util.arrayCopyNonAtomic(buf, (short) 128, buf, (short) 64, (short) 32);
+            powModP(rsaEuler, buf);
+            if (!isZero(buf, (short) 128, (short) 31) || buf[159] != (byte) 1) continue;
+            // the root, the even one
+            Util.arrayCopyNonAtomic(buf, (short) 0, buf, (short) 64, (short) 32);
+            powModP(rsaRoot, buf);
+            if ((buf[159] & 1) != 0) negateModP(buf, (short) 128);
+            buf[160] = (byte) 0x04;
+            Util.arrayCopyNonAtomic(buf, (short) 128, buf, (short) 193, (short) 32);
+            break;
+        }
+        // r: fresh and under n, into the opening
+        do {
+            rng.generateData(scratch, X_OUT, (short) 32);
+            SchnorrHW.reduceModN(scratch, X_OUT);
+        } while (isZero(scratch, X_OUT, (short) 32));
+        Util.arrayCopyNonAtomic(scratch, X_OUT, changeOpen, (short)(open + OPEN_R), (short) 32);
+        // B_ = Y + r*G, by the chip; compressed by the parity of its y
+        schnorrHW.addToG(scratch, X_OUT, buf, (short) 160, buf, (short) 0);
+        buf[0] = (byte)(((buf[64] & 1) == 0) ? 0x02 : 0x03);
+    }
+
+    /**
+     * The value at buf[64..96) (buf[32..64) zeros) to the key's power, mod p,
+     * into buf[128..160): the chip's RSA over p*p, then the reduction. An
+     * answer may come back shorter than the modulus, without its leading
+     * zeros (the simulator's does; a chip's is the modulus' length): it is
+     * taken by the length answered and set right-aligned in the 64 bytes.
+     */
+    private void powModP(RSAPrivateKey key, byte[] buf) {
+        rsa.init(key, Cipher.MODE_DECRYPT);
+        short n = rsa.doFinal(buf, (short) 32, (short) 64, buf, (short) 96);
+        if (n < (short) 64) {
+            Util.arrayCopyNonAtomic(buf, (short) 96, buf, (short)(160 - n), n);
+            Util.arrayFillNonAtomic(buf, (short) 96, (short)(64 - n), (byte) 0);
+        }
+        reduceModP(buf, (short) 96, scratch, X_OUT);
+    }
+
+    /** The chip's RSA key for one power over p*p (RSA_PP). */
+    private static RSAPrivateKey fieldKey(byte[] d) {
+        RSAPrivateKey k = (RSAPrivateKey) KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_PRIVATE, KeyBuilder.LENGTH_RSA_512, false);
+        k.setModulus(RSA_PP, (short) 0, (short) 64);
+        k.setExponent(d, (short) 0, (short) d.length);
+        return k;
+    }
+
+    /**
+     * v[off..off+64) mod p, left in its low 32 bytes. 2^256 is 2^32 + 977
+     * mod p, so the high half times that, added to the low half, is the same
+     * number mod p and 223 bits shorter; twice over it is under 2^257, and
+     * then p is taken off while it is p or more. `w`: 40 bytes of working
+     * room.
+     */
+    private static void reduceModP(byte[] v, short off, byte[] w, short wOff) {
+        for (short pass = 0; pass < 2; pass++) {
+            Util.arrayFillNonAtomic(w, wOff, (short) 40, (byte) 0);
+            Util.arrayCopyNonAtomic(v, (short)(off + 32), w, (short)(wOff + 8), (short) 32);     // the low half
+            mulAddByte(w, (short)(wOff + 36), v, off, (short) 32, (byte) 0x01);                 // + the high half * 2^32
+            mulAddByte(w, (short)(wOff + 40), v, off, (short) 32, (byte) 0xD1);                 // + the high half * 977 (0x03D1)
+            mulAddByte(w, (short)(wOff + 39), v, off, (short) 32, (byte) 0x03);
+            Util.arrayFillNonAtomic(v, off, (short) 24, (byte) 0);
+            Util.arrayCopyNonAtomic(w, wOff, v, (short)(off + 24), (short) 40);
+        }
+        while (!isZero(v, off, (short) 32) || cmp256(v, (short)(off + 32), SECP256K1_P, (short) 0) >= 0) {
+            subP64(v, off);
+        }
+    }
+
+    /** w, ending at `wEnd` (exclusive), += a (`len` bytes) times the byte m, the last byte of the product at w[wEnd - 1]; the carry runs left as far as it goes. */
+    private static void mulAddByte(byte[] w, short wEnd, byte[] a, short aOff, short len, byte m) {
+        short mm = (short)(m & 0xFF);
+        short carry = 0;
+        short pos = (short)(wEnd - 1);
+        for (short i = (short)(len - 1); i >= 0; i--, pos--) {
+            short prod = (short)((short)((short)(a[(short)(aOff + i)] & 0xFF) * mm) + (short)(w[pos] & 0xFF) + carry);
+            w[pos] = (byte)(prod & 0xFF);
+            carry = (short)((prod >> 8) & 0xFF);
+        }
+        while (carry != 0 && pos >= 0) {
+            short sum = (short)((short)(w[pos] & 0xFF) + carry);
+            w[pos] = (byte)(sum & 0xFF);
+            carry = (short)((sum >> 8) & 0xFF);
+            pos--;
+        }
+    }
+
+    /** v[off..off+64) -= p, as one 64-byte number. */
+    private static void subP64(byte[] v, short off) {
+        short borrow = 0;
+        for (short i = 63; i >= 0; i--) {
+            short pb = i >= 32 ? (short)(SECP256K1_P[(short)(i - 32)] & 0xFF) : (short) 0;
+            short d = (short)((short)(v[(short)(off + i)] & 0xFF) - pb - borrow);
+            if (d < 0) { d += (short) 256; borrow = 1; } else { borrow = 0; }
+            v[(short)(off + i)] = (byte) d;
+        }
+    }
+
+    /** The 32 bytes at a against the 32 at b, as unsigned numbers: -1, 0 or 1. */
+    private static short cmp256(byte[] a, short aOff, byte[] b, short bOff) {
+        for (short i = 0; i < 32; i++) {
+            short x = (short)(a[(short)(aOff + i)] & 0xFF), y = (short)(b[(short)(bOff + i)] & 0xFF);
+            if (x != y) return x < y ? (short) -1 : (short) 1;
+        }
+        return (short) 0;
+    }
+
+    /** The 32 bytes at off, under p: += 7, mod p. */
+    private static void add7ModP(byte[] v, short off) {
+        short carry = 7;
+        for (short i = 31; i >= 0 && carry != 0; i--) {
+            short sum = (short)((short)(v[(short)(off + i)] & 0xFF) + carry);
+            v[(short)(off + i)] = (byte)(sum & 0xFF);
+            carry = (short)((sum >> 8) & 0xFF);
+        }
+        // under 2p before, so one taking of p at most; the sum cannot pass 2^256 (p + 7 does not)
+        if (cmp256(v, off, SECP256K1_P, (short) 0) >= 0) {
+            short borrow = 0;
+            for (short i = 31; i >= 0; i--) {
+                short d = (short)((short)(v[(short)(off + i)] & 0xFF) - (short)(SECP256K1_P[i] & 0xFF) - borrow);
+                if (d < 0) { d += (short) 256; borrow = 1; } else { borrow = 0; }
+                v[(short)(off + i)] = (byte) d;
+            }
+        }
+    }
+
+    /** The 32 bytes at off, under p and not zero: p - v. */
+    private static void negateModP(byte[] v, short off) {
+        short borrow = 0;
+        for (short i = 31; i >= 0; i--) {
+            short d = (short)((short)(SECP256K1_P[i] & 0xFF) - (short)(v[(short)(off + i)] & 0xFF) - borrow);
+            if (d < 0) { d += (short) 256; borrow = 1; } else { borrow = 0; }
+            v[(short)(off + i)] = (byte) d;
+        }
+    }
+
+    /**
+     * GET_CHANGE: the change the card has made for itself and not yet been
+     * handed, three openings to a page (P1 = the page, from 0): a count, then
+     * for each the amount (4), the keyset (8), the date (4), the nonce (32)
+     * and the blinding factor (32). An opening whose piece is on the card by
+     * now is let go first. No PIN: what it says lets a reader finish the
+     * piece, which is locked to the card's key and nobody's to spend; the
+     * phone that owes the change finishes it here, and the owner's phone
+     * finishes change a till never handed over (NUT-09).
+     */
+    private void processGetChange(APDU apdu) {
+        byte[] buf = apdu.getBuffer();
+        short skip = (short)((short)(buf[ISO7816.OFFSET_P1] & 0xFF) * CHANGE_PAGE);
+        short n = 0, at = 1;
+        for (short k = 0; k < CHANGE_MOST && n < CHANGE_PAGE; k++) {
+            short open = (short)(k * OPEN_LEN);
+            if (openState[k] != OPEN_PENDING) continue;
+            if (slotWithNonce(changeOpen, (short)(open + OPEN_NONCE)) >= 0) {
+                openState[k] = OPEN_EMPTY;
+                continue;
+            }
+            if (skip > 0) { skip--; continue; }
+            Util.arrayCopyNonAtomic(changeOpen, open, buf, at, OPEN_LEN);
+            at += OPEN_LEN;
+            n++;
+        }
+        buf[0] = (byte) n;
+        apdu.setOutgoingAndSend((short) 0, at);
+    }
+
+    /** The place holding a piece with the 32-byte nonce at `off` in `a`, spent or not, or -1. */
+    private short slotWithNonce(byte[] a, short off) {
+        for (short i = 0; i < MAX_PROOFS; i++) {
+            short at = (short)(i * PROOF_SIZE);
+            if (proofStorage[(short)(at + PROOF_STATUS_OFFSET)] != STATUS_EMPTY
+                && Util.arrayCompare(proofStorage, (short)(at + PROOF_NONCE_OFFSET), a, off, (short) 32) == 0) {
+                return i;
+            }
+        }
+        return (short) -1;
+    }
+
+    /** An opening whose nonce is the 32 bytes at `off` in `a` is let go: its piece is on the card. */
+    private void clearOpening(byte[] a, short off) {
+        for (short k = 0; k < CHANGE_MOST; k++) {
+            if (openState[k] != OPEN_EMPTY
+                && Util.arrayCompare(changeOpen, (short)(k * OPEN_LEN + OPEN_NONCE), a, off, (short) 32) == 0) {
+                openState[k] = OPEN_EMPTY;
+            }
         }
     }
 
@@ -1451,7 +1849,25 @@ public class CashuApplet extends Applet {
          * the answer is "not yet", two bytes, in place of the signature. Nothing is burned and nothing counted until they
          * are done: a card lifted in the wait has lost nothing, and whatever
          * else is sent drops the payment and the wait with it. */
+        /* What leaves the card for good: the pieces less the change the card
+         * made for itself (1.12). The day's limit and the wait are held to
+         * it, and worked out at the first SIGN, when the change is known;
+         * neither burns anything. */
+        Util.arrayCopyNonAtomic(allSum, (short) 0, allNet, (short) 0, (short) 4);
+        subUint32(allNet, (short) 0, allChange, (short) 0);
         short waits = Util.getShort(allState, (short) 2);
+        if (waits < 0) {
+            // refused by the day (or for want of a time), the payment is gone, as it was when BEGIN asked
+            try {
+                requireUnderLimits(allNet, (short) 0, (short) 0);
+            } catch (ISOException e) {
+                allState[0] = (byte) 0;
+                throw e;
+            }
+            waits = waitsFor(allNet, (short) 0, allState[6] != (byte) 0, allState[7] != (byte) 0);
+            Util.setShort(allState, (short) 2, waits);
+            allState[4] = (byte)(waits > 0 ? 1 : 0);
+        }
         if (waits > 0) {
             rng.generateData(scratch, X_MSG, (short) 32);
             schnorrHW.sign(cardPrivKey, cardPubKey, scratch, X_MSG, buf, (short) 0);
@@ -1473,7 +1889,7 @@ public class CashuApplet extends Applet {
 
         /* The day's limit again, as it stands now: what the day would have
          * signed for is left in scratch (X_SUM) for the commit. */
-        requireUnderLimits((short) 0);
+        requireUnderLimits(allNet, (short) 0, (short) 0);
         boolean limited = !isZero(cardRecord, CARD_LIMIT_OFFSET, (short) 4);
         boolean newDay = limited && dayIsOver();
 
@@ -1486,6 +1902,10 @@ public class CashuApplet extends Applet {
          * burned nothing. */
         burnList[0] = (byte) n;
         Util.arrayCopyNonAtomic(allSlots, (short) 0, burnList, (short) 1, n);
+        // the openings' states as they will be, the payment's change signed for: one write in the transaction (X_OUT is free now)
+        for (short k = 0; k < CHANGE_MOST; k++) {
+            scratch[(short)(X_OUT + k)] = openState[k] == OPEN_DRAFT ? OPEN_PENDING : openState[k];
+        }
 
         try {
             JCSystem.beginTransaction();
@@ -1501,10 +1921,12 @@ public class CashuApplet extends Applet {
             changeDue[0] = (byte) 1;
             // and the card's own account of it, with the burn: no piece is burned that the log does not have
             short entry = logEntry();
-            addUint32Stop(cardLog, (short)(entry + LOG_E_SATS), allSum, (short) 0);
+            addUint32Stop(cardLog, (short)(entry + LOG_E_SATS), allNet, (short) 0);
             short pieces = (short)((short)(cardLog[(short)(entry + LOG_E_PIECES)] & 0xFF) + n);
             cardLog[(short)(entry + LOG_E_PIECES)] = (byte)(pieces > (short) 255 ? (short) 255 : pieces);
-            addUint32Stop(cardLog, LOG_SATS_OFFSET, allSum, (short) 0);
+            addUint32Stop(cardLog, LOG_SATS_OFFSET, allNet, (short) 0);
+            // the change the card made for itself is signed for now: its openings stay until the pieces are back
+            if (allState[6] != (byte) 0) Util.arrayCopy(scratch, X_OUT, openState, (short) 0, CHANGE_MOST);
             // a payment that was over the limit on one payment says so in the card's account of the tap
             if (allState[4] == (byte) 1) cardLog[(short)(entry + LOG_E_FLAGS)] |= LOG_FLAG_WAITED;
             // and the signature itself, for the terminal whose answer is lost on the air (SPEND_ALL_AGAIN)
@@ -1526,7 +1948,7 @@ public class CashuApplet extends Applet {
         short slot = (short)((cardReceipts[3] & 0x0F) * RECEIPT_LEN + RECEIPTS_HEAD);
         JCSystem.beginTransaction();
         Util.arrayCopy(cardRecord, CARD_NOW_OFFSET, cardReceipts, slot, (short) 4);
-        Util.arrayCopy(allSum, (short) 0, cardReceipts, (short)(slot + 4), (short) 4);
+        Util.arrayCopy(allNet, (short) 0, cardReceipts, (short)(slot + 4), (short) 4);
         Util.arrayCopy(scratch, X_MSG, cardReceipts, (short)(slot + 8), (short) 32);
         if (allState[5] == (byte) 1) {
             Util.arrayCopy(allOut, (short) 0, cardReceipts, (short)(slot + 40), (short) 33);
@@ -1607,7 +2029,7 @@ public class CashuApplet extends Applet {
      * can check. A limit of 0 is no limit: nothing is checked, and nothing
      * counted. Over it, the spend is written down and refused.
      */
-    private void requireUnderLimits(short carry) {
+    private void requireUnderLimits(byte[] sum, short sumOff, short carry) {
         boolean limited = !isZero(cardRecord, CARD_LIMIT_OFFSET, (short) 4);
         // never been told the time: a card that cannot know the day does not spend under a daily limit
         if (limited && isZero(cardRecord, CARD_NOW_OFFSET, (short) 4)) ISOException.throwIt(SW_NO_TIME);
@@ -1617,7 +2039,7 @@ public class CashuApplet extends Applet {
             } else {
                 Util.arrayCopyNonAtomic(cardRecord, CARD_SPENT_OFFSET, scratch, X_SUM, (short) 4);
             }
-            short over = addUint32Carry(scratch, X_SUM, allSum, (short) 0);
+            short over = addUint32Carry(scratch, X_SUM, sum, sumOff);
             if (carry != 0 || over != 0 || cmpUint32(scratch, X_SUM, cardRecord, CARD_LIMIT_OFFSET) > 0) {
                 refuseOverLimit(SW_OVER_LIMIT);
             }
@@ -1637,16 +2059,18 @@ public class CashuApplet extends Applet {
      * take the money a limit at a time, each a signature of its own, which is
      * the rate this limit holds it to. No limit, or a payment within it: 0.
      */
-    private short waitsFor(short carry) {
+    private short waitsFor(byte[] sum, short sumOff, boolean change, boolean carry) {
         if (isZero(cardRecord, CARD_TAP_LIMIT_OFFSET, (short) 4)) return (short) 0;
-        if (carry != 0) return (short)(WAIT_UNITS_MOST * WAIT_SIGNS);
-        Util.arrayCopyNonAtomic(allSum, (short) 0, scratch, X_TAP, (short) 4);
+        if (carry) return (short)(WAIT_UNITS_MOST * WAIT_SIGNS);
+        Util.arrayCopyNonAtomic(sum, sumOff, scratch, X_TAP, (short) 4);
         short units = 0;
-        // what is left after each limit's worth is taken off: while more than a limit is left, another has to be waited for
+        // every whole limit's worth is a unit...
         while (units < WAIT_UNITS_MOST && cmpUint32(scratch, X_TAP, cardRecord, CARD_TAP_LIMIT_OFFSET) > 0) {
             subUint32(scratch, X_TAP, cardRecord, CARD_TAP_LIMIT_OFFSET);
             units++;
         }
+        // ...and so is what is left over one, and so is a payment within the limit that makes change
+        if (units < WAIT_UNITS_MOST && (change || (units > 0 && !isZero(scratch, X_TAP, (short) 4)))) units++;
         return (short)(units * WAIT_SIGNS);
     }
 
@@ -1859,14 +2283,7 @@ public class CashuApplet extends Applet {
          * that CLEAR_SPENT has freed holds nothing, so that piece may be
          * loaded again then, if its signature was lost. (One of the pieces
          * before it in the same command is in a slot by now, and is seen.) */
-        for (short i = 0; i < MAX_PROOFS; i++) {
-            short at = (short)(i * PROOF_SIZE);
-            if (proofStorage[(short)(at + PROOF_STATUS_OFFSET)] != STATUS_EMPTY
-                && Util.arrayCompare(proofStorage, (short)(at + PROOF_NONCE_OFFSET),
-                                     buf, (short)(in + PROOF_NONCE_OFFSET - 1), (short) 32) == 0) {
-                return SW_PIECE_ON_CARD;
-            }
-        }
+        if (slotWithNonce(buf, (short)(in + PROOF_NONCE_OFFSET - 1)) >= 0) return SW_PIECE_ON_CARD;
         short base = (short)(slot * PROOF_SIZE);
         short hex = (short)(slot * HEX_LEN);
         // its nonce and its C as the text a payment hashes (`slotHex`): before the data, and long before the status byte
@@ -1882,6 +2299,8 @@ public class CashuApplet extends Applet {
         // in it, which no read looks at and the next LOAD_PROOF overwrites.
         Util.arrayCopy(buf, in, proofStorage, (short)(base + PROOF_KEYSET_OFFSET), PROOF_DATA_LEN);
         proofStorage[(short)(base + PROOF_STATUS_OFFSET)] = STATUS_UNSPENT;
+        // change the card made for itself, back on the card: its opening is let go (1.12)
+        clearOpening(buf, (short)(in + PROOF_NONCE_OFFSET - 1));
 
         // A load that the change grant alone allowed (no verified PIN, no
         // owner grant) is the change going on: the note is spent now, not at
