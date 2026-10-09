@@ -766,6 +766,16 @@ find the PIN key, and with it the PIN of any tap that was also recorded. The
 key the card signs with is another key, and nothing but a PIN is sealed to
 this one. A block that is not a block is `6700`.
 
+**Its working room is not its own.** A sealed command needs ninety-nine bytes
+of working memory, and uses the first ninety-nine of the scratch the applet
+already had; its key agreement is the signer's own. As first built it had an
+array and a key agreement of its own, the applet then asked for 1,030 bytes of
+memory that is cleared when another applet is chosen where it had asked for
+931, and the chip would not install it (`6F00`). No simulator has a limit
+there. A test now adds up every transient array and every crypto object the
+two classes make, and fails on any more than the build that is known to
+install.
+
 **What it is for, and what it is not.** It keeps a PIN from somebody
 listening to a tap, now or with a recording later. It does nothing about the
 terminal the PIN was typed on, which has it; and a false card can still ask

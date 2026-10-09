@@ -7847,7 +7847,9 @@ class CashuAppletTest {
         String code = appletCode();
         String flat = code.replaceAll("\\s+", " ");
         assertTrue(flat.contains("pinKeySig = new byte[(short) 65];"), "pinKeySig is a persistent array");
-        assertTrue(flat.contains("seal = JCSystem.makeTransientByteArray(S_LEN, JCSystem.CLEAR_ON_DESELECT);"), "and seal is a transient one");
+        assertTrue(flat.contains("seal = scratch;"), "and seal is the applet's scratch by another name, RAM that a SELECT clears, and not an array of its own");
+        assertFalse(flat.contains("seal = JCSystem.makeTransientByteArray"), "which would be 99 more bytes of the memory the chip limits");
+        assertSame(appletObject("scratch"), appletObject("seal"), "the same array");
         assertTrue(flat.contains("pinKeyPair = new KeyPair(KeyPair.ALG_EC_FP, KeyBuilder.LENGTH_EC_FP_256);"), "the PIN key is a KeyPair made of its own");
     }
 
@@ -7913,6 +7915,297 @@ class CashuAppletTest {
         assertEquals(3, tries());
     }
 
+    /** { bytes, arrays } of byte arrays this runtime holds as transient, by kind: { CLEAR_ON_DESELECT, CLEAR_ON_RESET }. */
+    private static long[][] transientHeld(SimulatorRuntime rt) throws Exception {
+        com.licel.jcardsim.base.TransientMemory memory = rt.getTransientMemory();
+        long[][] held = new long[2][2];
+        String[] lists = { "clearOnDeselect", "clearOnReset" };
+        for (int k = 0; k < 2; k++) {
+            java.lang.reflect.Field f = com.licel.jcardsim.base.TransientMemory.class.getDeclaredField(lists[k]);
+            f.setAccessible(true);
+            for (Object o : (java.util.List<?>) f.get(memory)) {
+                if (o instanceof byte[]) { held[k][0] += ((byte[]) o).length; held[k][1]++; }
+            }
+        }
+        return held;
+    }
+
+    @Test
+    @DisplayName("jCardSim's own count: what installing the applet adds to the transient byte arrays the simulator holds as cleared on deselect is 931 bytes in 12 arrays (CashuApplet's 10 and SchnorrHW's 2), the figure of the build that installs on the chip; the two it clears on reset are 7 bytes. A larger build has to be measured on a card to exceed it")
+    void testInstallingAsksForNoMoreTransientMemoryThanTheBuildThatInstalls() throws Exception {
+        ExposedRuntime fresh = new ExposedRuntime();
+        long[][] before = transientHeld(fresh);
+        CardSimulator sim = new CardSimulator(fresh);
+        sim.installApplet(AIDUtil.create(AID_HEX), CashuApplet.class);
+        long[][] after = transientHeld(fresh);
+        long deselect = after[0][0] - before[0][0], arrays = after[0][1] - before[0][1];
+        String why = " These are the figures of the build that is known to install on the chip (931 bytes cleared on deselect, 7 on reset, 14 arrays in all); a larger figure has to be measured on a card first.";
+        assertTrue(deselect <= 931, "installing holds " + deselect + " bytes that are cleared on deselect, over 931." + why);
+        assertTrue(arrays <= 12, "installing makes " + arrays + " arrays that are cleared on deselect, over 12." + why);
+        // the arrays the applet clears on reset are two of the simulator's list of such, which also holds what its own crypto and PIN objects keep (not the chip's count)
+        Applet installed = fresh.appletAt(AIDUtil.create(AID_HEX));
+        java.lang.reflect.Field fTold = CashuApplet.class.getDeclaredField("timeTold"), fOpen = CashuApplet.class.getDeclaredField("tapOpen");
+        fTold.setAccessible(true); fOpen.setAccessible(true);
+        byte[] timeTold = (byte[]) fTold.get(installed), tapOpen = (byte[]) fOpen.get(installed);
+        assertEquals(7, timeTold.length + tapOpen.length, "the applet's own arrays that are cleared on reset: 6 and 1");
+        com.licel.jcardsim.base.TransientMemory memory = fresh.getTransientMemory();
+        java.lang.reflect.Field onReset = com.licel.jcardsim.base.TransientMemory.class.getDeclaredField("clearOnReset");
+        onReset.setAccessible(true);
+        boolean a = false, b = false;
+        for (Object o : (java.util.List<?>) onReset.get(memory)) { a |= o == timeTold; b |= o == tapOpen; }
+        assertTrue(a && b, "and both are in the simulator's list");
+        // a count that found nothing would prove nothing, and the source's figure is the simulator's
+        assertEquals(931, deselect, "the simulator holds what the source asks for");
+        assertEquals(12, arrays);
+        assertEquals(SchnorrHWMathTest.transientMemoryAskedFor()[0], (int) deselect, "and the source's sum is the simulator's count");
+    }
+
+    // ---- the sealing room is the scratch (1.9): what that may and may not touch ----------------------------------
+
+    @Test
+    @DisplayName("A sealed command between the steps of a payment drops the payment (SPEND_ALL_SIGN is then 6985) and leaves the next one sound: a sealed VERIFY_PIN, a sealed CHANGE_PIN (three blocks of keystream) and GET_NONCE with P1 = 1 each, then a payment that signs and verifies, with the log and the receipt as they should be")
+    void testASealedCommandBetweenThePaymentsStepsDropsItAndLeavesTheNextOneSound() throws Exception {
+        for (int variant = 0; variant < 3; variant++) {
+            String what = new String[] { "a sealed VERIFY_PIN", "a sealed CHANGE_PIN", "GET_NONCE P1 = 1" }[variant];
+            simulator = freshCard();
+            ownPinKey();
+            ready();
+            byte[][] sent = loadMany(6, i -> buildProof(KEYSET, 10 + i, i + 1));
+            PinKey k = variant == 2 ? null : askPinKey();
+            byte[][] outputs = { output(3, blinded(1)) };
+            assertEquals(SW_OK, sw(beginCommand(0, 1, 2)), what);
+            assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_SPEND_ALL_OUTPUTS, 0, 0, concat(outputs))), what);
+            if (variant == 0) assertEquals(SW_OK, sendSealed(VERIFY_INS, envelope(EPH[0], k.key, k.nonce, VERIFY_INS, pinBlock(TEST_PIN))).getSW(), what);
+            if (variant == 1) assertEquals(SW_OK, sendSealed(CHANGE_INS, envelope(EPH[0], k.key, k.nonce, CHANGE_INS, changeClear(k.nonce, NEW_PIN))).getSW(), what);
+            if (variant == 2) askPinKey();
+            assertEquals(SW_CONDITIONS_NOT_SATIS, sw(SIGN_ALL), what + ": the payment was dropped");
+            assertEquals(6 * 10 + 15, balance() + 0, what + ": nothing burned");
+            if (variant == 1) assertEquals(SW_OK, verify(NEW_PIN), what + ": the new PIN");
+            else if (variant == 0) assertTrue(verified());
+            // a fresh payment of other places, with one output
+            ResponseAPDU r = spendAll(new int[] { 3, 4, 5 }, outputs);
+            assertEquals(SW_OK, r.getSW(), what);
+            byte[][] named = { asSlot(sent[3]), asSlot(sent[4]), asSlot(sent[5]) };
+            assertTrue(signedForAll(r.getData(), named, outputs, REFUND), what + ": the signature is over the places named");
+            assertEquals(75 - 13 - 14 - 15, balance(), what);
+            assertArrayEquals(new long[] { T0, 13 + 14 + 15, 3, 0, 0 }, logTap(0), what + ": the log");
+            assertEquals(SW_OK, allowLoad(), what);
+            Held held = heldReceipts();
+            assertEquals(1, held.count, what + ": one receipt, the dropped payment's is none");
+            assertArrayEquals(receiptFor(T0, 13 + 14 + 15, named, outputs), held.receipts.get(0), what + ": the receipt");
+        }
+    }
+
+    @Test
+    @DisplayName("GET_NONCE with P1 = 1 between LOAD_PROOFs, and a sealed VERIFY_PIN right before a LOAD_PROOF of three pieces, leave the hex text in slotHex and everything else a load writes as a load with nothing between writes them, and the pieces pay and verify")
+    void testTheSealingRoomDoesNotTouchWhatALoadWrites() throws Exception {
+        java.util.Map<String, byte[]> reference = null;
+        for (boolean interleaved : new boolean[] { false, true }) {
+            simulator = freshCard();
+            ownPinKey();
+            ready();
+            byte[][] pieces = new byte[7][];
+            for (int i = 0; i < 7; i++) pieces[i] = buildProof(KEYSET, 20 + i, i + 1, i == 2 ? 1900000000L : 0);
+            for (int i = 0; i < 4; i++) {
+                if (interleaved) askPinKey();
+                assertEquals(i, load(pieces[i]).getData()[0], "piece " + i);
+            }
+            if (interleaved) {
+                PinKey k = askPinKey();
+                assertEquals(SW_OK, sendSealed(VERIFY_INS, envelope(EPH[1], k.key, k.nonce, VERIFY_INS, pinBlock(TEST_PIN))).getSW());
+            }
+            ResponseAPDU batch = loadBatch(pieces[4], pieces[5], pieces[6]);
+            assertEquals(SW_OK, batch.getSW());
+            assertArrayEquals(new byte[] { 4, 5, 6 }, batch.getData());
+            byte[][] outputs = { output(5, blinded(2)) };
+            ResponseAPDU r = spendAll(new int[] { 0, 1, 3, 4, 5, 6 }, outputs);
+            assertEquals(SW_OK, r.getSW());
+            byte[][] named = new byte[7][];
+            for (int i = 0; i < 7; i++) named[i] = asSlot(pieces[i]);
+            assertTrue(signedForAll(r.getData(), new byte[][] { named[0], named[1], named[3], named[4], named[5], named[6] }, outputs, REFUND), "the payment, which hashes the hex text of the places, is signed over the text as it was sent");
+            ResponseAPDU dated = spendAll(new int[] { 2 }, outputs);
+            assertEquals(SW_OK, dated.getSW());
+            assertTrue(signedForAll(dated.getData(), new byte[][] { named[2] }, outputs, REFUND), "and so is the one piece with a date, which a payment of its own has to be");
+            java.util.Map<String, byte[]> state = persistent();
+            if (!interleaved) {
+                reference = state;
+            } else {
+                for (String name : new String[] { "proofStorage", "slotHex", "cardLog", "cardReceipts", "cardRecord", "burnList" }) {
+                    assertArrayEquals(reference.get(name), state.get(name), name + ": the same with the sealing room used between the loads");
+                }
+            }
+        }
+    }
+
+    /** One conversation that uses every kind of scratch, with sealed commands among it; answers written down, and what lasts at the end. */
+    private java.util.List<String> aConversationInTheScratch(long poisonSeed) throws Exception {
+        simulator = freshCard();
+        scratchPoison = poisonSeed < 0 ? null : new java.util.Random(poisonSeed);
+        answersRecorded = new java.util.ArrayList<>();
+        ownPinKey();
+        ready();
+        byte[][] pieces = new byte[9][];
+        for (int i = 0; i < 9; i++) pieces[i] = buildProof(KEYSET, 30 + 7 * i, i + 1, i == 1 || i == 7 ? 1900000000L : 0);
+        assertEquals(0, load(pieces[0]).getData()[0]);
+        PinKey k = askPinKey();
+        assertEquals(1, load(pieces[1]).getData()[0]);
+        assertEquals(SW_OK, loadBatch(pieces[2], pieces[3], pieces[4]).getSW());
+        assertEquals(SW_OK, sendSealed(VERIFY_INS, envelope(EPH[0], k.key, k.nonce, VERIFY_INS, pinBlock(TEST_PIN))).getSW());
+        assertEquals(SW_OK, loadBatch(pieces[5], pieces[6], pieces[7]).getSW());
+        info(); infoTap(); pieces(0); shortPieces(0); somePieces(new byte[] { 1, 2 }); slot(3); balance();
+        transmit(new CommandAPDU(CLA, INS_GET_SLOT_STATUS, 0, 0, 256));
+        assertEquals(SW_OK, spendAll(new int[] { 0, 2 }, new byte[][] { output(9, blinded(1)) }).getSW());
+        transmit(new CommandAPDU(CLA, INS_SPEND_ALL_AGAIN, 0, 0, 64));
+        assertEquals(SW_OK, spendAll(new int[] { 1 }, new byte[][] { output(2, blinded(5)) }).getSW());
+        transmit(new CommandAPDU(CLA, INS_AUTH, 0, 0, hexToBytes("a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"), 80));
+        assertEquals(SW_OK, setTime(T0 + 5));
+        k = askPinKey();
+        assertEquals(0x63C2, sendSealed(VERIFY_INS, spoiled(envelope(EPH[1], k.key, k.nonce, VERIFY_INS, pinBlock(TEST_PIN)), "point")).getSW());
+        assertEquals(SW_OK, verify(TEST_PIN));
+        k = askPinKey();
+        assertEquals(SW_OK, sendSealed(CHANGE_INS, envelope(EPH[2], k.key, k.nonce, CHANGE_INS, changeClear(k.nonce, NEW_PIN))).getSW());
+        assertEquals(SW_OK, verify(NEW_PIN));
+        assertEquals(SW_OK, spendAll(new int[] { 3, 4, 5 }, new byte[][] { output(4, blinded(2)), output(6, blinded(3)) }).getSW());
+        logAnswer();
+        assertEquals(SW_OK, allowLoad());
+        heldReceipts();
+        assertEquals(SW_OK, clearSpent());
+        assertEquals(SW_OK, load(pieces[8]).getSW());
+        assertEquals(SW_OK, setLimits(0, 40));
+        ResponseAPDU waited = spendAll(new int[] { 6, 0 }, new byte[][] { output(7, blinded(4)) });   // the piece loaded last lies in the first place CLEAR_SPENT freed
+        assertEquals(SW_OK, waited.getSW());
+        assertTrue(waitsTaken() > 0, "a payment that waits uses the scratch for the work of every wait");
+        k = askPinKey();
+        assertEquals(SW_OK, sendSealed(VERIFY_INS, envelope(EPH[3], k.key, k.nonce, VERIFY_INS, pinBlock(NEW_PIN))).getSW());
+        transmit(new CommandAPDU(CLA, INS_AUTH, 0, 0, hexToBytes("b0b1b2b3b4b5b6b7b8b9babbbcbdbebf"), 80));
+        logAnswer();
+        java.util.List<String> said = answersRecorded;
+        java.util.Map<String, byte[]> state = persistent();
+        for (java.util.Map.Entry<String, byte[]> e : state.entrySet()) said.add(e.getKey() + "=" + toHex(e.getValue()));
+        scratchPoison = null;
+        answersRecorded = null;
+        return said;
+    }
+
+    @Test
+    @DisplayName("Nothing reads what an earlier command left in the scratch: one conversation of every kind of command, with sealed ones among them, is answered byte for byte the same, signatures and all, and leaves the card in the same state, with the whole scratch filled with other rubbish before every command (three different kinds) as with it as it was")
+    void testNoCommandReadsWhatAnEarlierOneLeftInTheScratch() throws Exception {
+        java.util.List<String> clean = aConversationInTheScratch(-1);
+        assertTrue(clean.size() > 60, "the conversation is long: " + clean.size());
+        for (long seed : new long[] { 1, 2, 3 }) {
+            java.util.List<String> poisoned = aConversationInTheScratch(seed);
+            assertEquals(clean.size(), poisoned.size(), "seed " + seed);
+            for (int i = 0; i < clean.size(); i++) assertEquals(clean.get(i), poisoned.get(i), "seed " + seed + ": answer or state " + i);
+        }
+    }
+
+    @Test
+    @DisplayName("Sealed VERIFY_PIN, sealed CHANGE_PIN and a point that is no point, alternated with payments over and over, never spoil a signature: SchnorrHW.agree sets its key for the key agreement and the signer sets its own before every use; and AUTH, which signs from the same scratch, verifies after each")
+    void testSigningAfterAKeyAgreementStillVerifies() throws Exception {
+        simulator = freshCard();
+        ownPinKey();
+        ready();
+        byte[][] sent = loadMany(12, i -> buildProof(KEYSET, 10 + i, i + 1));
+        for (int round = 0; round < 6; round++) {
+            String what = "round " + round;
+            PinKey k = askPinKey();
+            if (round % 3 == 0) assertEquals(SW_OK, sendSealed(VERIFY_INS, envelope(EPH[round % 6], k.key, k.nonce, VERIFY_INS, pinBlock(TEST_PIN))).getSW(), what + ": a sealed VERIFY_PIN");
+            else if (round % 3 == 1) assertEquals(0x63C2, sendSealed(VERIFY_INS, spoiled(envelope(EPH[round % 6], k.key, k.nonce, VERIFY_INS, pinBlock(TEST_PIN)), "point")).getSW(), what + ": a point that is no point");
+            else assertEquals(SW_OK, sendSealed(CHANGE_INS, envelope(EPH[round % 6], k.key, k.nonce, CHANGE_INS, changeClear(k.nonce, TEST_PIN))).getSW(), what + ": a sealed CHANGE_PIN");
+            assertEquals(SW_OK, verify(TEST_PIN), what);
+            byte[][] outputs = { output(1 + round, blinded(round)) };
+            ResponseAPDU r = spendAll(new int[] { 2 * round, 2 * round + 1 }, outputs);
+            assertEquals(SW_OK, r.getSW(), what);
+            assertTrue(signedForAll(r.getData(), new byte[][] { asSlot(sent[2 * round]), asSlot(sent[2 * round + 1]) }, outputs, REFUND), what + ": the payment's signature verifies");
+            byte[] reader = new byte[16];
+            reader[0] = (byte) round;
+            ResponseAPDU auth = transmit(new CommandAPDU(CLA, INS_AUTH, 0, 0, reader, 80));
+            assertEquals(SW_OK, auth.getSW(), what);
+            byte[] key = cardKey();
+            assertTrue(schnorrVerify(extractPubkeyX(key), authMessage(reader, Arrays.copyOfRange(auth.getData(), 0, 16), key), Arrays.copyOfRange(auth.getData(), 16, 80)), what + ": and so does AUTH's");
+        }
+    }
+
+    /** The method bodies of a stripped source, by name. */
+    private static java.util.Map<String, String> methodBodies(String code) {
+        java.util.Map<String, String> bodies = new java.util.LinkedHashMap<>();
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("(?m)^    (?:(?:public|private|protected|static|final)\\s+)+[\\w.\\[\\]]+\\s+(\\w+)\\s*\\([^)]*\\)\\s*\\{").matcher(code);
+        while (m.find()) {
+            int depth = 1, at = m.end();
+            while (depth > 0) {
+                char c = code.charAt(at++);
+                if (c == '{') depth++; else if (c == '}') depth--;
+            }
+            bodies.put(m.group(1), code.substring(m.start(), at));
+        }
+        return bodies;
+    }
+
+    /** Every method a command can reach, by name, itself included. */
+    private static java.util.Set<String> reached(String entry, java.util.Map<String, String> bodies) {
+        java.util.Set<String> seen = new java.util.LinkedHashSet<>();
+        java.util.ArrayDeque<String> todo = new java.util.ArrayDeque<>();
+        todo.add(entry);
+        while (!todo.isEmpty()) {
+            String name = todo.poll();
+            if (!seen.add(name)) continue;
+            java.util.regex.Matcher c = java.util.regex.Pattern.compile("(?<![.\\w])(\\w+)\\s*\\(").matcher(bodies.get(name));
+            while (c.find()) if (bodies.containsKey(c.group(1)) && !seen.contains(c.group(1))) todo.add(c.group(1));
+        }
+        return seen;
+    }
+
+    private static int shortConstant(String name) throws Exception {
+        java.lang.reflect.Field f = CashuApplet.class.getDeclaredField(name);
+        f.setAccessible(true);
+        return f.getShort(null);
+    }
+
+    @Test
+    @DisplayName("The sealing room in the source: it is the first 99 bytes of the scratch and no more (S_LEN <= X_LEN), its parts are disjoint, X_NUM, X_SUM, X_TAP and X_OUT lie past it; only VERIFY_PIN, SET_PIN, CHANGE_PIN and GET_NONCE reach it, none of the first three reaches any scratch offset at all, and GET_NONCE's key leaves the room before the digest writes X_MSG, which does not overlap what the key occupied")
+    void testWhoUsesTheSealingRoomAndWhatElseLivesWhereItIs() throws Exception {
+        // ---- the layout
+        int sPoint = shortConstant("S_POINT"), sHash = shortConstant("S_HASH"), sI = shortConstant("S_I"), sIns = shortConstant("S_INS"), sLen = shortConstant("S_LEN"), xLen = shortConstant("X_LEN");
+        assertEquals(0, sPoint);
+        assertEquals(sPoint + 65, sHash, "the shared point (65 bytes) then a block of the hash (32)");
+        assertEquals(sHash + 32, sI, "then the counter");
+        assertEquals(sI + 1, sIns, "then the instruction");
+        assertEquals(sIns + 1, sLen, "and that is the room");
+        assertEquals(99, sLen);
+        assertTrue(sLen <= xLen, "the room is within the scratch");
+        int xHex = shortConstant("X_HEX"), xMsg = shortConstant("X_MSG"), xDec = shortConstant("X_DEC"), xNum = shortConstant("X_NUM"), xSum = shortConstant("X_SUM"), xTap = shortConstant("X_TAP"), xOut = shortConstant("X_OUT");
+        for (int x : new int[] { xNum, xSum, xTap, xOut }) assertTrue(x >= sLen, "an offset the room does not reach: " + x);
+        assertTrue(xHex < sLen && xMsg < sLen && xDec < sLen, "the hex text, the message and a date's digits are the offsets the room does overlap");
+        // ---- who reaches the room, and what else they reach
+        String code = appletCode();
+        java.util.Map<String, String> bodies = methodBodies(code);
+        java.util.Set<String> inRoom = new java.util.TreeSet<>(), commands = new java.util.TreeSet<>();
+        java.util.regex.Matcher dispatched = java.util.regex.Pattern.compile("case INS_\\w+:\\s*(process\\w+)\\(apdu\\)").matcher(bodies.get("process"));
+        while (dispatched.find()) commands.add(dispatched.group(1));
+        assertTrue(commands.size() >= 25, "the commands found in the dispatch: " + commands.size());
+        for (String command : commands) {
+            boolean seals = false, scratches = false;
+            for (String name : reached(command, bodies)) {
+                String body = bodies.get(name);
+                if (java.util.regex.Pattern.compile("\\bseal\\b|\\bS_(?:POINT|HASH|I|INS|LEN)\\b").matcher(body).find()) seals = true;
+                if (java.util.regex.Pattern.compile("\\bscratch\\b|\\bX_[A-Z]+\\b").matcher(body).find()) scratches = true;
+            }
+            if (seals) inRoom.add(command);
+            if (seals && !command.equals("processGetNonce")) assertFalse(scratches, command + " uses the room and must use no scratch offset at all");
+        }
+        assertEquals(new java.util.TreeSet<>(Arrays.asList("processVerifyPin", "processSetPin", "processChangePin", "processGetNonce")), inRoom, "the commands that reach the room");
+        // ---- GET_NONCE's key, and the digest
+        String pk = bodies.get("processGetPinKey").replaceAll("\\s+", " ");
+        int keyOut = pk.indexOf("Util.arrayCopyNonAtomic(seal, (short) 0, buf, at, len);"), digest = pk.indexOf("sha.doFinal(buf, at, len, scratch, X_MSG);"), signs = pk.indexOf("schnorrHW.sign(cardPrivKey, cardPubKey, scratch, X_MSG, buf, sigAt);");
+        assertTrue(pk.indexOf("short len = toCompressed(seal, pinPubKey.getW(seal, (short) 0));") >= 0 && keyOut > 0 && keyOut < digest && digest < signs, "the key is compressed in the room and copied out of it before the digest is written to X_MSG, and signed after");
+        assertTrue(xMsg >= 33, "and the digest's place, " + xMsg + " to " + (xMsg + 32) + ", is past the 33 bytes the key took");
+        java.util.Set<String> scratchInGetPinKey = new java.util.TreeSet<>();
+        java.util.regex.Matcher tokens = java.util.regex.Pattern.compile("\\bX_[A-Z]+\\b").matcher(pk);
+        while (tokens.find()) scratchInGetPinKey.add(tokens.group());
+        assertEquals(new java.util.TreeSet<>(Arrays.asList("X_MSG")), scratchInGetPinKey, "GET_NONCE's key uses X_MSG of the scratch and no other part");
+        assertEquals(2, count(pk, "scratch,"), "and passes the scratch twice, to the digest and to the signer");
+    }
+
     @Test
     @DisplayName("The sealed path in the source: the length, then the nonce (spent where the caller says so, refused where it is not live), then the tag against block 0 before anything is opened, and a failed opening uses the nonce up and returns -1 before the first XOR; the keystream counter begins at 1 and the tag block is 0; the sum has the label, the counter, the shared x, E, the nonce and the instruction; the three callers; GET_NONCE's two forms")
     void testTheSealedPathIsInTheSourceWhatItsDescriptionSays() throws Exception {
@@ -7930,8 +8223,7 @@ class CashuAppletTest {
             "if (!live) ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);",
             "seal[S_INS] = buf[ISO7816.OFFSET_INS];",
             "if (buf[e] == (byte) 0x04) {",
-            "pinEcdh.init(pinPrivKey);",
-            "short got = pinEcdh.generateSecret(buf, e, EC_POINT_LEN, seal, S_POINT);",
+            "short got = schnorrHW.agree(pinPrivKey, buf, e, EC_POINT_LEN, seal, S_POINT);",
             "sealBlock(buf, e, (byte) 0, buf, ct, n);",
             "good = sameBytes(seal, S_HASH, buf, tag, SEAL_TAG_LEN);",
             "if (!good) { nonceLive[0] = (byte) 0; return (short) -1; }",
@@ -8039,11 +8331,19 @@ class CashuAppletTest {
         // ---- the PIN key
         String init = body(code, "private void initPinKey(", "private static ECPublicKey newP256Key(").replaceAll("\\s+", " ");
         assertTrue(init.contains("pinKeyPair = new KeyPair(KeyPair.ALG_EC_FP, KeyBuilder.LENGTH_EC_FP_256);") && init.contains("pinPrivKey = (ECPrivateKey) pinKeyPair.getPrivate();")
-            && init.contains("pinPubKey = (ECPublicKey) pinKeyPair.getPublic();") && init.contains("setSecp256k1Params(pinPubKey, pinPrivKey);") && init.contains("pinKeyPair.genKeyPair();")
-            && init.contains("pinEcdh = KeyAgreement.getInstance(KeyAgreement.ALG_EC_SVDP_DH_PLAIN_XY, false);"), "a key pair of its own on secp256k1, and a plain key agreement");
+            && init.contains("pinPubKey = (ECPublicKey) pinKeyPair.getPublic();") && init.contains("setSecp256k1Params(pinPubKey, pinPrivKey);") && init.contains("pinKeyPair.genKeyPair();"), "a key pair of its own on secp256k1");
+        assertFalse(init.contains("KeyAgreement"), "and no key agreement of its own");
         assertFalse(init.contains("cardKeyPair") || init.contains("cardPrivKey") || init.contains("cardPubKey"), "made of nothing the card key is");
-        assertEquals(1, count(code, "pinEcdh.init("), "the agreement is initialised with the PIN key's private half, in unseal and nowhere else");
-        assertFalse(code.contains("pinEcdh.init(cardPrivKey)"));
+        assertEquals(0, count(code, "KeyAgreement"), "the applet makes no key agreement: the signer's is the one on the card");
+        assertEquals(0, count(code, "pinEcdh"));
+        assertEquals(1, count(code, "schnorrHW.agree("), "it agrees with the PIN key's private half, in unseal and nowhere else");
+        assertFalse(code.contains("agree(cardPrivKey"));
+        String hw = new String(java.nio.file.Files.readAllBytes(SchnorrHWMathTest.mainSourceDir().resolve("SchnorrHW.java")), StandardCharsets.UTF_8);
+        String hwCode = SchnorrHWMathTest.stripCommentsAndCharLiterals(hw).replaceAll("\\s+", " ");
+        int agree = hwCode.indexOf("short agree(ECPrivateKey priv, byte[] pub, short pubOff, short pubLen, byte[] out, short outOff) {");
+        assertTrue(agree > 0 && hwCode.indexOf("ecdh.init(priv); return ecdh.generateSecret(pub, pubOff, pubLen, out, outOff); }", agree) == hwCode.indexOf("ecdh.init(priv);", agree), "SchnorrHW.agree: sets the given key, then agrees, and does no more");
+        assertEquals(3, count(hwCode, "ecdh.init("), "the signer's agreement is initialised in the install probe, in sign (its own key, every time) and in agree");
+        assertTrue(hwCode.indexOf("tmpPriv.setS(sc, SC_K, (short)32); ecdh.init(tmpPriv);") > 0, "sign sets its own key and initialises the agreement with it before every use, so that agree leaves nothing behind");
     }
 
     // ---- the transcript ------------------------------------------------------
@@ -8763,9 +9063,22 @@ class CashuAppletTest {
     // Helpers
     // =========================================================================
 
+    /** Where, if set, every command is preceded by this much rubbish in the applet's scratch (the room a sealed command works in is the first 99 bytes of it). */
+    private java.util.Random scratchPoison;
+    /** Where, if set, every answer is written down: its status, a colon, its data. */
+    private java.util.List<String> answersRecorded;
+
     private ResponseAPDU transmit(CommandAPDU apdu) {
+        if (scratchPoison != null) {
+            try {
+                scratchPoison.nextBytes(field("scratch"));
+            } catch (Exception e) {
+                throw new IllegalStateException(e);
+            }
+        }
         ResponseAPDU r = simulator.transmitCommand(apdu);
         answered.add(r.getSW());
+        if (answersRecorded != null) answersRecorded.add(String.format("%04x:%s", r.getSW(), toHex(r.getData())));
         return r;
     }
 

@@ -258,7 +258,7 @@ public class CashuApplet extends Applet {
     private static final byte[] PINKEY_LABEL = {
         'F', 'o', 'x', 'y', 'C', 'a', 'r', 'd', '/', 'p', 'i', 'n', 'k', 'e', 'y'
     };
-    // `seal` (RAM): the point the two keys share (65), a block of the hash (32), and the two single bytes the hash takes (a counter, the instruction)
+    // `seal` (RAM; the first S_LEN bytes of `scratch`): the point the two keys share (65), a block of the hash (32), and the two single bytes the hash takes (a counter, the instruction)
     private static final short S_POINT = (short) 0;
     private static final short S_HASH  = (short) 65;
     private static final short S_I     = (short) 97;
@@ -723,10 +723,9 @@ public class CashuApplet extends Applet {
     private KeyPair      pinKeyPair;
     private ECPrivateKey pinPrivKey;
     private ECPublicKey  pinPubKey;
-    private KeyAgreement pinEcdh;
     /** The card key's signature over the PIN key: [0] is 1 once it has been made, then its 64 bytes. Made once, at the first asking. */
     private byte[] pinKeySig;
-    /** Working room for a sealed command (RAM). */
+    /** Working room for a sealed command (RAM): `scratch`, by another name. */
     private byte[] seal;
     private RandomData rng;
 
@@ -789,7 +788,13 @@ public class CashuApplet extends Applet {
         burnList        = new byte[(short)(MAX_PROOFS + 1)];
         burnPending     = new byte[1];
         pinKeySig       = new byte[(short) 65];
-        seal            = JCSystem.makeTransientByteArray(S_LEN, JCSystem.CLEAR_ON_DESELECT);
+        /* A sealed command's working room is the scratch the applet already
+         * has, by another name: its first S_LEN bytes, which nothing else is
+         * using while a PIN command runs. Not an array of its own. With one,
+         * the applet asked for 1,030 bytes of memory that is cleared when
+         * another applet is chosen, where it had asked for 931, and the chip
+         * refused to install it (6F00). No simulator has a limit there. */
+        seal            = scratch;
         rng             = RandomData.getInstance(RandomData.ALG_SECURE_RANDOM);
         sha.reset();
         sha.doFinal(AUTH_TAG, (short) 0, (short) AUTH_TAG.length, authTagHash, (short) 0);
@@ -823,9 +828,10 @@ public class CashuApplet extends Applet {
     }
 
     /**
-     * The key a PIN is sealed to: a second secp256k1 pair, made on the card,
-     * and the key agreement that uses it (the same algorithm the signer's
-     * k·G runs on, which is what this chip is known to have).
+     * The key a PIN is sealed to: a second secp256k1 pair, made on the card
+     * as the card's own key is. The key agreement that uses it is the
+     * signer's own (`SchnorrHW.agree`): one on the card, and the one this
+     * chip is known to have.
      */
     private void initPinKey() {
         pinKeyPair = new KeyPair(KeyPair.ALG_EC_FP, KeyBuilder.LENGTH_EC_FP_256);
@@ -833,7 +839,6 @@ public class CashuApplet extends Applet {
         pinPubKey  = (ECPublicKey)  pinKeyPair.getPublic();
         setSecp256k1Params(pinPubKey, pinPrivKey);
         pinKeyPair.genKeyPair();
-        pinEcdh    = KeyAgreement.getInstance(KeyAgreement.ALG_EC_SVDP_DH_PLAIN_XY, false);
     }
 
     /**
@@ -2426,8 +2431,7 @@ public class CashuApplet extends Applet {
         boolean good = false;
         try {
             if (buf[e] == (byte) 0x04) {
-                pinEcdh.init(pinPrivKey);
-                short got = pinEcdh.generateSecret(buf, e, EC_POINT_LEN, seal, S_POINT);
+                short got = schnorrHW.agree(pinPrivKey, buf, e, EC_POINT_LEN, seal, S_POINT);
                 if (got == EC_POINT_LEN && seal[S_POINT] == (byte) 0x04) {
                     sealBlock(buf, e, (byte) 0, buf, ct, n);
                     good = sameBytes(seal, S_HASH, buf, tag, SEAL_TAG_LEN);

@@ -528,6 +528,141 @@ class SchnorrHWMathTest {
         org.junit.jupiter.api.Assertions.assertEquals(1, constructed, "and once");
     }
 
+    // ── The memory the applet asks of the chip at install ─────────────────
+
+    /**
+     * The figures of the build that is known to install on the chip (1.7): the transient memory the two
+     * constructors ask for, by kind, and how many arrays that is. jCardSim has no limit on any of it, and a chip
+     * has: 1.9 asked for 1,030 bytes of CLEAR_ON_DESELECT (in 15 arrays) where 1.7 asked for 931 (in 14), and
+     * the chip answered INSTALL with 6F00. A larger figure has to be measured on a card first.
+     */
+    static final int RAM_ON_DESELECT_MOST = 931, RAM_ON_RESET_MOST = 7, RAM_ARRAYS_MOST = 14;
+
+    /** Every `static final short|byte|int NAME = expr;` of the applet's two sources. */
+    private static java.util.Map<String, String> constantExpressions(String... sources) {
+        java.util.Map<String, String> m = new java.util.HashMap<>();
+        java.util.regex.Matcher c = java.util.regex.Pattern.compile("static\\s+final\\s+(?:short|byte|int)\\s+(\\w+)\\s*=\\s*([^;]+);").matcher(String.join("\n", sources));
+        while (c.find()) m.put(c.group(1), c.group(2).trim());
+        return m;
+    }
+
+    /** An integer expression of numbers, constants, + - * and parentheses, casts ignored. */
+    private static int evaluated(String expr, java.util.Map<String, String> constants) {
+        String e = expr.replaceAll("\\(\\s*(?:short|byte|int)\\s*\\)", "").replaceAll("\\s+", "");
+        int[] at = { 0 };
+        int v = sum(e, at, constants);
+        if (at[0] != e.length()) throw new IllegalStateException("not an integer expression: " + expr);
+        return v;
+    }
+    private static int sum(String e, int[] at, java.util.Map<String, String> k) {
+        int v = product(e, at, k);
+        while (at[0] < e.length() && (e.charAt(at[0]) == '+' || e.charAt(at[0]) == '-')) {
+            char op = e.charAt(at[0]++);
+            int w = product(e, at, k);
+            v = op == '+' ? v + w : v - w;
+        }
+        return v;
+    }
+    private static int product(String e, int[] at, java.util.Map<String, String> k) {
+        int v = factor(e, at, k);
+        while (at[0] < e.length() && e.charAt(at[0]) == '*') { at[0]++; v *= factor(e, at, k); }
+        return v;
+    }
+    private static int factor(String e, int[] at, java.util.Map<String, String> k) {
+        if (e.charAt(at[0]) == '(') {
+            at[0]++;
+            int v = sum(e, at, k);
+            at[0]++;
+            return v;
+        }
+        int from = at[0];
+        while (at[0] < e.length() && (Character.isLetterOrDigit(e.charAt(at[0])) || e.charAt(at[0]) == '_')) at[0]++;
+        String token = e.substring(from, at[0]);
+        if (Character.isDigit(token.charAt(0))) return Integer.decode(token);
+        if (!k.containsKey(token)) throw new IllegalStateException("a constant with no definition: " + token);
+        return evaluated(k.get(token), k);
+    }
+
+    /** { bytes CLEAR_ON_DESELECT, bytes CLEAR_ON_RESET, arrays } asked for by every JCSystem.makeTransientByteArray in the two sources. */
+    static int[] transientMemoryAskedFor() throws Exception {
+        String applet = stripCommentsAndCharLiterals(new String(java.nio.file.Files.readAllBytes(mainSourceDir().resolve("CashuApplet.java")), java.nio.charset.StandardCharsets.UTF_8));
+        String signer = stripCommentsAndCharLiterals(new String(java.nio.file.Files.readAllBytes(mainSourceDir().resolve("SchnorrHW.java")), java.nio.charset.StandardCharsets.UTF_8));
+        java.util.Map<String, String> constants = constantExpressions(applet, signer);
+        int onDeselect = 0, onReset = 0, arrays = 0;
+        for (String source : new String[] { applet, signer }) {
+            org.junit.jupiter.api.Assertions.assertEquals(
+                java.util.regex.Pattern.compile("makeTransient").matcher(source).results().count(),
+                java.util.regex.Pattern.compile("JCSystem\\.makeTransientByteArray\\(").matcher(source).results().count(),
+                "the only transient memory made is byte arrays through JCSystem: a boolean, short or object array is not counted here");
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile("JCSystem\\.makeTransientByteArray\\(\\s*([^,]+?)\\s*,\\s*JCSystem\\.(CLEAR_ON_DESELECT|CLEAR_ON_RESET)\\s*\\)").matcher(source);
+            while (m.find()) {
+                int size = evaluated(m.group(1), constants);
+                if (m.group(2).equals("CLEAR_ON_DESELECT")) onDeselect += size; else onReset += size;
+                arrays++;
+            }
+            org.junit.jupiter.api.Assertions.assertEquals(
+                java.util.regex.Pattern.compile("JCSystem\\.makeTransientByteArray\\(").matcher(source).results().count(),
+                java.util.regex.Pattern.compile("JCSystem\\.makeTransientByteArray\\(\\s*[^,]+?\\s*,\\s*JCSystem\\.(?:CLEAR_ON_DESELECT|CLEAR_ON_RESET)\\s*\\)").matcher(source).results().count(),
+                "every makeTransientByteArray names its size and one of the two kinds the parse knows");
+        }
+        return new int[] { onDeselect, onReset, arrays };
+    }
+
+    @Test
+    @DisplayName("RAM budget: the two constructors ask for no more than 931 bytes of CLEAR_ON_DESELECT, 7 of CLEAR_ON_RESET, in no more than 14 arrays: the figures of the build known to install on the chip")
+    void transientMemoryIsWithinTheBuildThatInstallsOnTheChip() throws Exception {
+        int[] asked = transientMemoryAskedFor();
+        String why = " These are the figures of the build that is known to install on the chip (1.7: 931 bytes that are cleared on deselect, 7 on reset, in 14 arrays). "
+            + "1.9 asked for 1,030 in 15 and the chip refused to install it (6F00); jCardSim has no limit and says nothing. A larger figure has to be measured on a card first.";
+        org.junit.jupiter.api.Assertions.assertTrue(asked[0] <= RAM_ON_DESELECT_MOST, "CLEAR_ON_DESELECT is " + asked[0] + " bytes, over " + RAM_ON_DESELECT_MOST + "." + why);
+        org.junit.jupiter.api.Assertions.assertTrue(asked[1] <= RAM_ON_RESET_MOST, "CLEAR_ON_RESET is " + asked[1] + " bytes, over " + RAM_ON_RESET_MOST + "." + why);
+        org.junit.jupiter.api.Assertions.assertTrue(asked[2] <= RAM_ARRAYS_MOST, "transient arrays are " + asked[2] + ", over " + RAM_ARRAYS_MOST + "." + why);
+        // a parse that found nothing would prove nothing
+        org.junit.jupiter.api.Assertions.assertEquals(14, asked[2], "the parse found the 12 of CashuApplet and the 2 of SchnorrHW");
+        org.junit.jupiter.api.Assertions.assertEquals(931, asked[0], "and they add up to the figure the chip has taken: CashuApplet 387 and SchnorrHW 544");
+        org.junit.jupiter.api.Assertions.assertEquals(7, asked[1]);
+    }
+
+    @Test
+    @DisplayName("The parse of the RAM budget can say no: a source with a hundred bytes more, or another array, is over it")
+    void theRamBudgetCanSayNo() throws Exception {
+        java.util.Map<String, String> k = constantExpressions("static final short X_LEN = (short) 196; static final short ALL = MAX; static final short MAX = (short) 128;");
+        org.junit.jupiter.api.Assertions.assertEquals(196, evaluated("X_LEN", k));
+        org.junit.jupiter.api.Assertions.assertEquals(128, evaluated("(short) ALL", k));
+        org.junit.jupiter.api.Assertions.assertEquals(10496, evaluated("(short)(MAX * 82)", k));
+        org.junit.jupiter.api.Assertions.assertEquals(129, evaluated("(short)(MAX + 1)", k));
+        int[] asked = transientMemoryAskedFor();
+        org.junit.jupiter.api.Assertions.assertTrue(asked[0] + 100 > RAM_ON_DESELECT_MOST, "a hundred bytes more is over");
+        org.junit.jupiter.api.Assertions.assertTrue(asked[2] + 1 > RAM_ARRAYS_MOST, "and so is one array more");
+    }
+
+    /**
+     * What the two constructors create that a chip counts: crypto engines, key pairs and keys, a PIN object, a random source. Another of
+     * any of them is memory the chip has not been shown to give (the failed 1.9 build had a second key agreement). Counted by call site;
+     * a site that runs twice says so.
+     */
+    @Test
+    @DisplayName("Crypto objects: CashuApplet makes 1 OwnerPIN, 1 Signature, 2 MessageDigests, 1 RandomData, 2 KeyPairs and (in newP256Key, run twice) 1 key site; SchnorrHW makes 1 MessageDigest, 1 KeyAgreement, 1 RandomData and 1 key; no KeyAgreement, Cipher or Checksum is made anywhere else")
+    void cryptoObjectsAreThoseOfTheBuildThatInstalls() throws Exception {
+        String applet = stripCommentsAndCharLiterals(new String(java.nio.file.Files.readAllBytes(mainSourceDir().resolve("CashuApplet.java")), java.nio.charset.StandardCharsets.UTF_8));
+        String signer = stripCommentsAndCharLiterals(new String(java.nio.file.Files.readAllBytes(mainSourceDir().resolve("SchnorrHW.java")), java.nio.charset.StandardCharsets.UTF_8));
+        String[] kinds = { "new\\s+OwnerPIN\\(", "Signature\\.getInstance\\(", "MessageDigest\\.getInstance\\(", "RandomData\\.getInstance\\(", "new\\s+KeyPair\\(",
+            "KeyBuilder\\.buildKey\\(", "KeyAgreement\\.getInstance\\(", "Cipher\\.getInstance\\(", "Checksum\\.getInstance\\(", "KeyAgreement\\b" };
+        int[] inApplet = { 1, 1, 2, 1, 2, 1, 0, 0, 0, 0 };
+        // SchnorrHW names KeyAgreement in its field's type and in the getInstance call, and in its agree-less comments only
+        int[] inSigner = { 0, 0, 1, 1, 0, 1, 1, 0, 0, -1 };
+        for (int i = 0; i < kinds.length; i++) {
+            long a = java.util.regex.Pattern.compile(kinds[i]).matcher(applet).results().count();
+            org.junit.jupiter.api.Assertions.assertEquals(inApplet[i], a, "CashuApplet.java: " + kinds[i] + " is called " + a + " times where the build that installs called it " + inApplet[i] + ". A chip counts these; measure a larger figure on a card first.");
+            if (inSigner[i] >= 0) {
+                long h = java.util.regex.Pattern.compile(kinds[i]).matcher(signer).results().count();
+                org.junit.jupiter.api.Assertions.assertEquals(inSigner[i], h, "SchnorrHW.java: " + kinds[i] + " is called " + h + " times where the build that installs called it " + inSigner[i] + ". A chip counts these; measure a larger figure on a card first.");
+            }
+        }
+        // and the EC key objects that exist: the card's pair, the PIN key's pair, the signer's temporary key, the owner's and the time signer's keys
+        org.junit.jupiter.api.Assertions.assertEquals(2, java.util.regex.Pattern.compile("\\bnewP256Key\\(\\)").matcher(applet).results().count() - 1, "newP256Key is run for the owner key and the time key, and for no more");
+    }
+
     @Test
     @DisplayName("mul256x256 (raw 512-bit product) matches BigInteger a*b")
     void mul256x256MatchesBigInteger() throws Exception {

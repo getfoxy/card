@@ -468,6 +468,18 @@ final class SchnorrHW {
     // ── Modular arithmetic ────────────────────────────────────────────────
 
     /**
+     * The point a private key and a public point share (04 || X || Y), by this
+     * class's own key agreement. For the applet's PIN key: one key agreement
+     * object on the card, and the one whose framing was checked at install.
+     * Signing sets its own key before every use, so nothing is left over
+     * from this.
+     */
+    short agree(ECPrivateKey priv, byte[] pub, short pubOff, short pubLen, byte[] out, short outOff) {
+        ecdh.init(priv);
+        return ecdh.generateSecret(pub, pubOff, pubLen, out, outOff);
+    }
+
+    /**
      * Compute a mod n in-place (a is 32 bytes, big-endian).
      *
      * If a ≥ n, subtracts n (at most once, since callers guarantee a < 2n
