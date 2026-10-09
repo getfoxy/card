@@ -19,6 +19,11 @@ What differs from upstream:
   is told is interim and weak for now, and the documents say so.
 - A slot carries a date and a refund key; the card records its mint; 128 slots
   of 82 bytes (64 before software 1.7).
+- A payment is one signature for as many pieces as it is made of (NUT-11
+  SIG_ALL), and its pieces are marked spent outside the transaction that
+  commits it, so the number is not bounded by the chip's transaction (1.8).
+- The PIN is taken sealed: enciphered to a key the card keeps for that alone,
+  under sixteen bytes of the card's that are good once (1.9).
 
 The applet has run on one real card, a J3R180. Read [`FORK.md`](FORK.md) first,
 and [`docs/FOXY-CARD-DAILY-LIMIT.md`](docs/FOXY-CARD-DAILY-LIMIT.md) for the daily

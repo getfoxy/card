@@ -686,7 +686,10 @@ So the transaction is now the same size whatever the payment:
    next tap may put change on, the log, and the signature kept for
    `SPEND_ALL_AGAIN`. **From the moment it commits, the pieces are spent.**
 4. `finishBurn`: each place in the list has its status byte set to spent, one
-   plain write each, and `burnPending` is cleared.
+   plain write each, and `burnPending` is cleared (from 1.9 in a transaction
+   of its own, one byte: a commit is the one write a chip must have made
+   lasting before it goes on, so the status bytes are in place before the
+   note that they are owed is gone).
 5. The receipt, in a transaction of its own, and then the answer.
 
 A card that leaves the field before step 3 commits has a list nobody reads,
@@ -701,6 +704,76 @@ and none in which a piece is marked spent for a payment that did not commit.
 Bit 6 of the capabilities byte says a card burns so, and a terminal may then
 name as many places in one payment as the card has. A terminal that reads a
 card without it should name few: eight, by what was seen on the chip.
+
+## 6e. The PIN, sealed
+
+A PIN typed at a terminal crossed the air to the card as it was typed, and
+whoever was listening to the tap had it; the PIN, and later the card, is all a
+thief needs. A bank card's PIN is enciphered to a key of the card's. From 1.9
+so is this one, and bit 7 of the capabilities byte says so.
+
+**The PIN key.** A second secp256k1 key pair, made on the card at install and
+used for this and nothing else. It is not the key the card signs payments
+with: a terminal puts points of its own choosing to this key, and whatever
+that could ever tell it, it tells it nothing of the key the money is locked
+to. `GET_NONCE` with P1 = 1 answers, on any card and with no PIN,
+
+    nonce (16)    fresh at every asking, and good once
+    PIN key (33)  compressed
+    signature (64) BIP-340, by the card's own key, over
+                  SHA-256("FoxyCard/pinkey" || the PIN key)
+
+A terminal that knows the card's key (it reads it at every tap, and the
+owner's phone has it on file) holds the PIN key to it by the signature, which
+is made once, at the first asking, and kept.
+
+**A sealed command.** `VERIFY_PIN`, `SET_PIN` and `CHANGE_PIN` with P1 = 1
+carry, in place of their clear data,
+
+    E (65)        the sender's public key for this one message, 04 || X || Y
+    ct (n)        the data under a keystream
+    tag (16)
+
+    secret      = the x of the point E and the PIN key share (32 bytes)
+    block(i, m) = SHA-256("FoxyCard/seal" || i (1) || secret || E || nonce
+                          || the instruction (1) || m)
+    tag         = the first 16 bytes of block(0, ct)
+    keystream   = block(1) || block(2) || ...
+
+The card checks the tag before it opens anything. The sender makes a new key
+pair for every message, so no two keystreams are the same; the nonce is the
+card's, so what was recorded at one tap cannot be played to the card at
+another; and the instruction is in the sum, so an envelope made for one
+command is none for another.
+
+**What is sealed** is the clear form's data with the PIN as a block of nine
+bytes: its length (4 to 8), the PIN, and zeros to eight. An envelope is the
+same length for a PIN of four digits as for one of eight. For `VERIFY_PIN`
+and `SET_PIN` the block is all of it. For `CHANGE_PIN` it follows the owner's
+proof, which is over the PIN itself and the same nonce, exactly as in the
+clear form: one asking for a nonce serves the proof and the seal, the seal
+leaves the nonce for the proof, and the proof uses it up.
+
+**What a failure costs.** With no nonce asked for in this tap, `6985`, and
+nothing else. An envelope that does not open (a point that is no point, a tag
+that is not this sum's) has used the nonce up, and on `VERIFY_PIN` it **costs
+a try of the PIN**, as a wrong PIN does: without that a terminal could put
+points to the PIN key without end. On `SET_PIN` and `CHANGE_PIN` it is
+`6A80` and changes nothing. Those two have no try to cost, which leaves a
+terminal free to put points to the PIN key through them: were the chip's key
+agreement not to check that a point is on the curve, enough askings could
+find the PIN key, and with it the PIN of any tap that was also recorded. The
+key the card signs with is another key, and nothing but a PIN is sealed to
+this one. A block that is not a block is `6700`.
+
+**What it is for, and what it is not.** It keeps a PIN from somebody
+listening to a tap, now or with a recording later. It does nothing about the
+terminal the PIN was typed on, which has it; and a false card can still ask
+for a PIN, signing a PIN key of its own with a key of its own. The clear forms
+remain, for a terminal that knows no other: a card cannot unsend a PIN that
+was sent to it in the clear, and refusing one would only add a failure to the
+exposure. A phone that knows the sealed form uses no other with a card that
+has it.
 
 ## 7. The owner
 
@@ -820,11 +893,11 @@ or changed from `FOXY-CARD-SPEC.md` 5.2 and the allowance draft.
 | `33` | **SET_LIMIT, PIN form** | **a card with no owner**: PIN set and verified; nothing unspent; a time, unless the limit is 0 | limit (4) | `6A91` on a card with an owner (use `34`); `6A8D` if anything is unspent; `6A92` with no time Eight bytes set the limit on one tap as well (6a). |
 | `34` | **SET_LIMIT, owner's form** | the owner's proof; a time, unless the limit is 0. **No PIN**, any funds | proof length (1), proof (DER), limit (4) | `6A90`, `6A91`, `6A92`; `6986` on a locked card Eight bytes of limit (the day's, then the tap's) set both (6a). |
 | `35` | **SET_TIME** | nothing | time (4), signature length (1), signature (DER) | the card's `now` (4); `6A93` for a signature not the time key's; `6A8C` with no record |
-| `40` | VERIFY_PIN | | the PIN, 4 to 8 bytes | changes nothing about spending |
-| `41` | **SET_PIN** | **a card with no owner**, nothing unspent. No PIN, no proof | the PIN | sets or replaces the PIN and unblocks; `6A91` on a card with an owner (use `42`); `6A8D` if anything is unspent; `6986` locked |
-| `42` | **CHANGE_PIN** | the owner's proof. **No PIN, no session, any PIN state, any funds** | proof length (1), proof (DER), the new PIN | sets the PIN and resets the tries; ends any verified session; `6A90`, `6A91`; `6986` locked |
+| `40` | VERIFY_PIN | | the PIN, 4 to 8 bytes; or, with **P1 = 1**, the PIN sealed (6e) | changes nothing about spending. Sealed: `6985` with no nonce asked for; an envelope that does not open costs a try, as a wrong PIN does. Any other P1 is `6A86` |
+| `41` | **SET_PIN** | **a card with no owner**, nothing unspent. No PIN, no proof | the PIN; or, with **P1 = 1**, the PIN sealed (6e) | sets or replaces the PIN and unblocks; `6A91` on a card with an owner (use `42`); `6A8D` if anything is unspent; `6986` locked. Sealed: `6985` with no nonce, `6A80` for an envelope that does not open |
+| `42` | **CHANGE_PIN** | the owner's proof. **No PIN, no session, any PIN state, any funds** | proof length (1), proof (DER), the new PIN; or, with **P1 = 1**, the same sealed, the PIN as its nine-byte block (6e) | sets the PIN and resets the tries; ends any verified session; `6A90`, `6A91`; `6986` locked. Sealed: the proof is over the PIN itself and the same nonce the seal is under; `6985` with no nonce, `6A80` for an envelope that does not open |
 | `43` | **SET_OWNER** | no owner: nothing unspent. Owner: the owner's proof, nothing unspent | 65 bytes, the owner's public key, uncompressed; with an owner, proof length (1) and the proof first | sets or replaces the owner; `6A8D` if anything is unspent; `6A91` with an owner and no good proof; `6A80` for a key not beginning `04`; `6700` other length; `6986` locked |
-| `44` | GET_NONCE | a card with an owner. No PIN | | 16 bytes, or `6A90` |
+| `44` | GET_NONCE | a card with an owner. No PIN | | 16 bytes, or `6A90`. With **P1 = 1**, on any card: the 16 bytes, the PIN key (33, compressed) and the card key's signature over it (64), for sealing a PIN (6e) |
 | `45` | **ALLOW_LOAD** | the owner's proof, over `FoxyCard/load` and no value | proof length (1), proof | for the rest of this tap: `LOAD_PROOF` and `CLEAR_SPENT` need no verified PIN. `6A90`, `6A91`; `6986` locked |
 | `50` | LOCK_CARD | PIN set and verified; the owner's proof | P2 = `DE`; proof length (1), proof | as the draft |
 
@@ -838,6 +911,7 @@ payment a wait and not a window (6a) the version is 1.5, the format is still
 quicker to hold (6d), and bit 4 says so. 1.7 is the same card with 128 places
 (6d, 8.1), and bit 5 says so. 1.8 burns a payment's pieces outside its
 transaction (6d), so that a payment may be of any number, and bit 6 says so.
+1.9 takes its PIN sealed (6e), and bit 7 says so.
 
 **Every command in every state: the rule of section 3 worked through.** "Open"
 means nothing is needed beyond what the command's own row says; "refused" means

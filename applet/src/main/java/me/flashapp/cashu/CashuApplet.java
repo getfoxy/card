@@ -103,6 +103,8 @@ public class CashuApplet extends Applet {
     // FORMAT is what a reader checks before it reads a slot: 3 for this design
     // (2 was the allowance draft and the first limit).
     static final byte VERSION_MAJOR = (byte) 0x01;
+    // 1.9 takes its PIN sealed: enciphered to a key the card keeps for that and nothing else, under
+    // sixteen bytes of its own that are good once (see `unseal`). Capability bit 7 says so.
     // 1.8 burns a payment's pieces outside the transaction that commits the payment (see `finishBurn`):
     // on the chip a transaction held about a dozen places and no more, and a payment of thirty-two was
     // refused. Now a payment is of as many places as the card has, and capability bit 6 says so.
@@ -116,7 +118,7 @@ public class CashuApplet extends Applet {
     // payment, which asks no clock and is waited for (docs/FOXY-CARD-DAILY-LIMIT.md, section 6a).
     // 1.4 is one signature for a whole payment (NUT-11 SIG_ALL): format 4, in
     // which every piece's secret carries the flag and SPEND_PROOF is gone.
-    static final byte VERSION_MINOR = (byte) 0x08;
+    static final byte VERSION_MINOR = (byte) 0x09;
     static final byte FORMAT        = (byte) 0x04;
 
     // -------------------------------------------------------------------------
@@ -240,6 +242,28 @@ public class CashuApplet extends Applet {
     static final short EC_POINT_LEN        = (short) 65;
 
     static final short AUTH_NONCE_LEN      = (short) 16;
+
+    // -------------------------------------------------------------------------
+    // The PIN, sealed (1.9). See `unseal`.
+    // -------------------------------------------------------------------------
+    /** A sealed command's tag: the first sixteen bytes of block 0. */
+    static final short SEAL_TAG_LEN        = (short) 16;
+    /** A PIN as it is sealed: its length (1), the PIN, zeros to eight. Always nine bytes, so its length says nothing of the PIN's. */
+    static final short PIN_BLOCK_LEN       = (short) 9;
+    /** GET_NONCE with P1 = 1: the nonce (16), the PIN key (33, compressed), the card key's signature over it (64). */
+    static final short PIN_KEY_ANSWER      = (short) 113;
+    private static final byte[] SEAL_LABEL = {
+        'F', 'o', 'x', 'y', 'C', 'a', 'r', 'd', '/', 's', 'e', 'a', 'l'
+    };
+    private static final byte[] PINKEY_LABEL = {
+        'F', 'o', 'x', 'y', 'C', 'a', 'r', 'd', '/', 'p', 'i', 'n', 'k', 'e', 'y'
+    };
+    // `seal` (RAM): the point the two keys share (65), a block of the hash (32), and the two single bytes the hash takes (a counter, the instruction)
+    private static final short S_POINT = (short) 0;
+    private static final short S_HASH  = (short) 65;
+    private static final short S_I     = (short) 97;
+    private static final short S_INS   = (short) 98;
+    private static final short S_LEN   = (short) 99;
 
     // One signature for a payment: no more pieces than this in it, and an
     // output is its amount (4, big-endian) and its blinded message (33).
@@ -695,6 +719,15 @@ public class CashuApplet extends Applet {
     private byte[] burnList;
     /** 1 from the moment a payment is committed until every place in `burnList` has been marked spent. */
     private byte[] burnPending;
+    /** The key a PIN is sealed to: the card's own, made on the card, for that and nothing else. Never the key it signs payments with. */
+    private KeyPair      pinKeyPair;
+    private ECPrivateKey pinPrivKey;
+    private ECPublicKey  pinPubKey;
+    private KeyAgreement pinEcdh;
+    /** The card key's signature over the PIN key: [0] is 1 once it has been made, then its 64 bytes. Made once, at the first asking. */
+    private byte[] pinKeySig;
+    /** Working room for a sealed command (RAM). */
+    private byte[] seal;
     private RandomData rng;
 
     // -------------------------------------------------------------------------
@@ -755,10 +788,13 @@ public class CashuApplet extends Applet {
         lastSig         = new byte[(short) 65];
         burnList        = new byte[(short)(MAX_PROOFS + 1)];
         burnPending     = new byte[1];
+        pinKeySig       = new byte[(short) 65];
+        seal            = JCSystem.makeTransientByteArray(S_LEN, JCSystem.CLEAR_ON_DESELECT);
         rng             = RandomData.getInstance(RandomData.ALG_SECURE_RANDOM);
         sha.reset();
         sha.doFinal(AUTH_TAG, (short) 0, (short) AUTH_TAG.length, authTagHash, (short) 0);
         initCardKeypair();
+        initPinKey();
 
         schnorrHW = new SchnorrHW(SECP256K1_G, SECP256K1_P,
                                   SECP256K1_A, SECP256K1_B, SECP256K1_N);
@@ -784,6 +820,20 @@ public class CashuApplet extends Applet {
         cardPubKey   = (ECPublicKey)  cardKeyPair.getPublic();
         setSecp256k1Params(cardPubKey, cardPrivKey);
         cardKeyPair.genKeyPair();
+    }
+
+    /**
+     * The key a PIN is sealed to: a second secp256k1 pair, made on the card,
+     * and the key agreement that uses it (the same algorithm the signer's
+     * k·G runs on, which is what this chip is known to have).
+     */
+    private void initPinKey() {
+        pinKeyPair = new KeyPair(KeyPair.ALG_EC_FP, KeyBuilder.LENGTH_EC_FP_256);
+        pinPrivKey = (ECPrivateKey) pinKeyPair.getPrivate();
+        pinPubKey  = (ECPublicKey)  pinKeyPair.getPublic();
+        setSecp256k1Params(pinPubKey, pinPrivKey);
+        pinKeyPair.genKeyPair();
+        pinEcdh    = KeyAgreement.getInstance(KeyAgreement.ALG_EC_SVDP_DH_PLAIN_XY, false);
     }
 
     /**
@@ -923,7 +973,8 @@ public class CashuApplet extends Applet {
         // + GET_PIECES names places whole and LOAD_PROOF takes several pieces (bit 4)
         // + more than sixty-four places: seven-bit tags, and the short listing is P2 = 3 (bit 5)
         // + a payment's pieces are burned outside its transaction, so it may be of any number (bit 6)
-        buf[6] = (byte) 0x7F;
+        // + the PIN is taken sealed (bit 7)
+        buf[6] = (byte) 0xFF;
         buf[7] = pinState[0];
         // The fork's: the first eight bytes are upstream's, so a reader that
         // knows only those still reads them right.
@@ -1513,7 +1564,13 @@ public class CashuApplet extends Applet {
             short at = (short)(idx * PROOF_SIZE + PROOF_STATUS_OFFSET);
             if (proofStorage[at] != STATUS_SPENT) proofStorage[at] = STATUS_SPENT;
         }
+        /* The note is taken down in a transaction of its own, one byte: a
+         * commit is the one write a chip must have made lasting before it
+         * goes on, so the status bytes above are in place before the note
+         * that they are owed is gone. */
+        JCSystem.beginTransaction();
         burnPending[0] = (byte) 0;
+        JCSystem.commitTransaction();
     }
 
     /**
@@ -2088,15 +2145,30 @@ public class CashuApplet extends Applet {
     // -------------------------------------------------------------------------
 
     private void processVerifyPin(APDU apdu) {
+        byte[] buf = apdu.getBuffer();
+        boolean sealed = sealedForm(buf);
         if (pinState[0] == (byte) 0) ISOException.throwIt(SW_PIN_NOT_SET);
         if (pin.getTriesRemaining() == 0) ISOException.throwIt(SW_PIN_BLOCKED);
 
         short pinLen = apdu.setIncomingAndReceive();
+        if (sealed) {
+            pinLen = unseal(buf, pinLen, true);
+            if (pinLen < 0) {
+                /* An envelope that does not open is a wrong PIN, and costs a
+                 * try as one does: without that, a terminal could put any
+                 * point it liked to the PIN key as often as it liked. The
+                 * PIN is shown eight random bytes, which it is not. */
+                rng.generateData(seal, S_HASH, (short) 8);
+                pin.check(seal, S_HASH, (byte) 8);
+                failPinCheck();
+            }
+            if (pinLen != PIN_BLOCK_LEN) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            pinLen = unblockPin(buf, pinLen);
+        }
         if (pinLen < PIN_MIN_LEN || pinLen > PIN_MAX_LEN) {
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         }
 
-        byte[] buf = apdu.getBuffer();
         boolean ok = pin.check(buf, ISO7816.OFFSET_CDATA, (byte) pinLen);
         if (!ok) failPinCheck();
         // Nothing about spending is touched here: the PIN can be presented as
@@ -2150,15 +2222,22 @@ public class CashuApplet extends Applet {
      * set a PIN of its own. The owner uses CHANGE_PIN.
      */
     private void processSetPin(APDU apdu) {
+        byte[] buf = apdu.getBuffer();
+        boolean sealed = sealedForm(buf);
         requireNotLocked();
         if (ownerSet[0] == (byte) 1) ISOException.throwIt(SW_OWNER_PROOF);
         requireNothingUnspent();
 
         short pinLen = apdu.setIncomingAndReceive();
+        if (sealed) {
+            pinLen = unseal(buf, pinLen, true);
+            if (pinLen < 0) ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+            if (pinLen != PIN_BLOCK_LEN) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+            pinLen = unblockPin(buf, pinLen);
+        }
         if (pinLen < PIN_MIN_LEN || pinLen > PIN_MAX_LEN) {
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         }
-        byte[] buf = apdu.getBuffer();
         pin.update(buf, ISO7816.OFFSET_CDATA, (byte) pinLen);
         pinState[0] = (byte) 1;
         // a new PIN has not been typed yet: any session that had verified the old one is over
@@ -2178,10 +2257,20 @@ public class CashuApplet extends Applet {
      * proof costs no tries and changes nothing.
      */
     private void processChangePin(APDU apdu) {
+        byte[] buf = apdu.getBuffer();
+        boolean sealed = sealedForm(buf);
         requireNotLocked();
         if (ownerSet[0] != (byte) 1) ISOException.throwIt(SW_NO_OWNER);
         short dataLen = apdu.setIncomingAndReceive();
-        byte[] buf = apdu.getBuffer();
+        if (sealed) {
+            /* Sealed under the same sixteen bytes the proof is over: opening
+             * it leaves them for the proof, which uses them up. What is
+             * inside is the proof and then the PIN block; the proof is over
+             * the PIN itself, as it is in the clear form. */
+            dataLen = unseal(buf, dataLen, false);
+            if (dataLen < 0) ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+            dataLen = unblockPin(buf, dataLen);
+        }
         short at = requireOwnerProof(LABEL_CHANGE_PIN, buf, dataLen);
         short newLen = (short)(ISO7816.OFFSET_CDATA + dataLen - at);
         if (newLen < PIN_MIN_LEN || newLen > PIN_MAX_LEN) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
@@ -2236,12 +2325,170 @@ public class CashuApplet extends Applet {
      * says so.
      */
     private void processGetNonce(APDU apdu) {
-        if (ownerSet[0] != (byte) 1) ISOException.throwIt(SW_NO_OWNER);
         byte[] buf = apdu.getBuffer();
+        if (buf[ISO7816.OFFSET_P1] == (byte) 1) { processGetPinKey(apdu); return; }
+        if (buf[ISO7816.OFFSET_P1] != (byte) 0) ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
+        if (ownerSet[0] != (byte) 1) ISOException.throwIt(SW_NO_OWNER);
         rng.generateData(ownerNonce, (short) 0, OWNER_NONCE_LEN);
         nonceLive[0] = (byte) 1;
         Util.arrayCopyNonAtomic(ownerNonce, (short) 0, buf, (short) 0, OWNER_NONCE_LEN);
         apdu.setOutgoingAndSend((short) 0, OWNER_NONCE_LEN);
+    }
+
+    /**
+     * GET_NONCE with P1 = 1: what a terminal needs to seal a PIN. Sixteen
+     * fresh bytes (as GET_NONCE gives, and the same ones: one asking serves an
+     * owner's proof and the sealing of the command that carries it), the PIN
+     * key (33 bytes, compressed), and the card's own key's signature over
+     * SHA-256("FoxyCard/pinkey" || that key) (64 bytes, BIP-340), by which a
+     * terminal that knows the card's key knows the PIN key is the card's.
+     *
+     * No PIN and no owner: a card with no owner has a PIN to be set. The
+     * signature is made once, at the first asking, and kept.
+     */
+    private void processGetPinKey(APDU apdu) {
+        byte[] buf = apdu.getBuffer();
+        short at = OWNER_NONCE_LEN;
+        // the key, compressed in working room of its own (as GET_PUBKEY does the card's own in the answer), then put after the nonce's place
+        short len = toCompressed(seal, pinPubKey.getW(seal, (short) 0));
+        Util.arrayCopyNonAtomic(seal, (short) 0, buf, at, len);
+        short sigAt = (short)(at + len);
+        if (pinKeySig[0] != (byte) 1) {
+            sha.reset();
+            sha.update(PINKEY_LABEL, (short) 0, (short) PINKEY_LABEL.length);
+            sha.doFinal(buf, at, len, scratch, X_MSG);
+            schnorrHW.sign(cardPrivKey, cardPubKey, scratch, X_MSG, buf, sigAt);
+            JCSystem.beginTransaction();
+            Util.arrayCopy(buf, sigAt, pinKeySig, (short) 1, (short) 64);
+            pinKeySig[0] = (byte) 1;
+            JCSystem.commitTransaction();
+        } else {
+            Util.arrayCopyNonAtomic(pinKeySig, (short) 1, buf, sigAt, (short) 64);
+        }
+        rng.generateData(ownerNonce, (short) 0, OWNER_NONCE_LEN);
+        nonceLive[0] = (byte) 1;
+        Util.arrayCopyNonAtomic(ownerNonce, (short) 0, buf, (short) 0, OWNER_NONCE_LEN);
+        apdu.setOutgoingAndSend((short) 0, (short)(sigAt + 64));
+    }
+
+    /**
+     * Whether a command that carries a PIN is in its sealed form (P1 = 1) or
+     * its clear one (P1 = 0). Anything else is refused.
+     */
+    private static boolean sealedForm(byte[] buf) {
+        byte p1 = buf[ISO7816.OFFSET_P1];
+        if (p1 != (byte) 0 && p1 != (byte) 1) ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
+        return p1 == (byte) 1;
+    }
+
+    /**
+     * A sealed command's data opened, in place.
+     *
+     * A PIN typed at a terminal crossed the air to the card as it was typed,
+     * and whoever was listening had it. A sealed command carries instead
+     *
+     *   the sender's public key for this one message (65, 04 || X || Y, secp256k1)
+     *   the data under a keystream
+     *   a tag (16)
+     *
+     * The secret is the x of the point the sender's key and the card's PIN
+     * key share. A block is SHA-256 of
+     *
+     *   "FoxyCard/seal" || i (1) || the secret (32) || the sender's key (65)
+     *     || the card's sixteen bytes (16) || the instruction (1) [ || more ]
+     *
+     * Block 0, with the sealed bytes as `more`, is the tag (its first
+     * sixteen bytes), and it is checked before anything is opened. Blocks
+     * 1, 2, ... are the keystream, thirty-two bytes each.
+     *
+     * The sixteen bytes are the card's (GET_NONCE), fresh at each asking and
+     * good once: what was heard at one tap opens nothing at another, and
+     * cannot be put to the card again. The instruction is in the sum, so an
+     * envelope made for one command is none for another. `spend`: this
+     * opening uses the sixteen bytes up; an owner's command leaves them for
+     * its proof, which is over the same bytes and uses them up itself. An
+     * envelope that does not open has used them up either way.
+     *
+     * @return the length of the data, now clear and at OFFSET_CDATA; or -1
+     *         where the envelope does not open (the point is no point, or the
+     *         tag is not this sum's)
+     */
+    private short unseal(byte[] buf, short len, boolean spend) {
+        if (len < (short)(EC_POINT_LEN + 1 + SEAL_TAG_LEN)) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        boolean live = nonceLive[0] == (byte) 1;
+        if (spend) nonceLive[0] = (byte) 0;
+        if (!live) ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+        short e = ISO7816.OFFSET_CDATA;
+        short n = (short)(len - EC_POINT_LEN - SEAL_TAG_LEN);
+        short ct = (short)(e + EC_POINT_LEN);
+        short tag = (short)(ct + n);
+        seal[S_INS] = buf[ISO7816.OFFSET_INS];
+        boolean good = false;
+        try {
+            if (buf[e] == (byte) 0x04) {
+                pinEcdh.init(pinPrivKey);
+                short got = pinEcdh.generateSecret(buf, e, EC_POINT_LEN, seal, S_POINT);
+                if (got == EC_POINT_LEN && seal[S_POINT] == (byte) 0x04) {
+                    sealBlock(buf, e, (byte) 0, buf, ct, n);
+                    good = sameBytes(seal, S_HASH, buf, tag, SEAL_TAG_LEN);
+                }
+            }
+        } catch (RuntimeException x) {
+            /* Whatever the key agreement throws for a point that is no point
+             * (a CryptoException on one platform, something else on another),
+             * the envelope does not open: it is not an error of the card's. */
+            good = false;
+        }
+        if (!good) {
+            nonceLive[0] = (byte) 0;
+            return (short) -1;
+        }
+        short i = 1;
+        for (short at = 0; at < n; at += (short) 32) {
+            sealBlock(buf, e, (byte) i, buf, (short) 0, (short) 0);
+            for (short k = 0; k < (short) 32 && (short)(at + k) < n; k++) {
+                buf[(short)(ct + at + k)] ^= seal[(short)(S_HASH + k)];
+            }
+            i++;
+        }
+        moveDown(buf, ct, e, n);
+        return n;
+    }
+
+    /** `len` bytes of `buf` moved from `from` down to `to` (to < from), a byte at a time: the two ranges may overlap, and nothing is asked of how a copy treats that. */
+    private static void moveDown(byte[] buf, short from, short to, short len) {
+        for (short k = 0; k < len; k++) {
+            buf[(short)(to + k)] = buf[(short)(from + k)];
+        }
+    }
+
+    /** One block of a sealed command's sum (see `unseal`), into seal[S_HASH]. The shared point is in seal[S_POINT], the instruction in seal[S_INS]. */
+    private void sealBlock(byte[] buf, short e, byte i, byte[] more, short moreAt, short moreLen) {
+        seal[S_I] = i;
+        sha.reset();
+        sha.update(SEAL_LABEL, (short) 0, (short) SEAL_LABEL.length);
+        sha.update(seal, S_I, (short) 1);
+        sha.update(seal, (short)(S_POINT + 1), (short) 32);
+        sha.update(buf, e, EC_POINT_LEN);
+        sha.update(ownerNonce, (short) 0, OWNER_NONCE_LEN);
+        sha.update(seal, S_INS, (short) 1);
+        sha.doFinal(more, moreAt, moreLen, seal, S_HASH);
+    }
+
+    /**
+     * The PIN block that ends a sealed command's data (its length, the PIN,
+     * zeros to eight: nine bytes) taken out, and the PIN itself put in its
+     * place, so that what follows reads the data as the clear form has it.
+     *
+     * @return the data's new length
+     */
+    private short unblockPin(byte[] buf, short len) {
+        if (len < PIN_BLOCK_LEN) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        short block = (short)(ISO7816.OFFSET_CDATA + len - PIN_BLOCK_LEN);
+        short pinLen = (short)(buf[block] & 0xFF);
+        if (pinLen < PIN_MIN_LEN || pinLen > PIN_MAX_LEN) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        moveDown(buf, (short)(block + 1), block, pinLen);
+        return (short)(len - PIN_BLOCK_LEN + pinLen);
     }
 
     /**

@@ -178,7 +178,7 @@ class SchnorrHWMathTest {
           "SchnorrHW(", "void init()" },
         { "CashuApplet.java",
           "public static void install(", "private CashuApplet()",
-          "private void initCardKeypair()" },
+          "private void initCardKeypair()", "private void initPinKey()" },
     };
 
     /**
@@ -491,6 +491,41 @@ class SchnorrHWMathTest {
             else if (c == '}' && --depth == 0) return new int[] { open, i };
         }
         throw new IllegalStateException("unbalanced braces after: " + declaration);
+    }
+
+    /**
+     * The PIN key (1.9) is made once, at install, and the allow-list waives its body from the no-allocation rule (it builds a KeyPair and
+     * a KeyAgreement). That is sound only while nothing on the APDU path can call it: a second call would put a new key pair in EEPROM
+     * for every asking. The general call-site check above lets any install-time body call any listed method; this one is exact. Each of the
+     * two key makers is called once, from the constructor, and the constructor is made once, by install().
+     */
+    @Test
+    @DisplayName("initPinKey() and initCardKeypair() are each called once, from the constructor and nowhere else, and the constructor only by install()")
+    void keyMakersAreCalledOnlyFromTheConstructor() throws Exception {
+        String src = stripCommentsAndCharLiterals(new String(
+            java.nio.file.Files.readAllBytes(mainSourceDir().resolve("CashuApplet.java")), java.nio.charset.StandardCharsets.UTF_8));
+        int[] constructor = bodyRange(src, "private CashuApplet()");
+        int[] install = bodyRange(src, "public static void install(");
+        for (String maker : new String[] { "initCardKeypair", "initPinKey" }) {
+            int declaration = src.indexOf("private void " + maker + "(");
+            org.junit.jupiter.api.Assertions.assertTrue(declaration > 0, maker + " is declared");
+            java.util.regex.Matcher calls = java.util.regex.Pattern.compile("(?<![.\\w$])" + maker + "\\s*\\(").matcher(src);
+            int made = 0;
+            while (calls.find()) {
+                if (calls.start() == declaration + "private void ".length()) continue;
+                made++;
+                org.junit.jupiter.api.Assertions.assertTrue(calls.start() > constructor[0] && calls.start() < constructor[1],
+                    maker + "() is called from outside the constructor, near: ..." + src.substring(Math.max(0, calls.start() - 80), Math.min(src.length(), calls.start() + 40)).replaceAll("\\s+", " "));
+            }
+            org.junit.jupiter.api.Assertions.assertEquals(1, made, maker + "() is called once");
+        }
+        java.util.regex.Matcher built = java.util.regex.Pattern.compile("\\bnew\\s+CashuApplet\\s*\\(").matcher(src);
+        int constructed = 0;
+        while (built.find()) {
+            constructed++;
+            org.junit.jupiter.api.Assertions.assertTrue(built.start() > install[0] && built.start() < install[1], "the constructor is run only from install()");
+        }
+        org.junit.jupiter.api.Assertions.assertEquals(1, constructed, "and once");
     }
 
     @Test

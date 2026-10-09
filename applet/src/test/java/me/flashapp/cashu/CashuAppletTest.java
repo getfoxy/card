@@ -535,7 +535,7 @@ class CashuAppletTest {
         // what a phone sends: iOS chooses by the name in the app's Info.plist, and Foxy by the same ten bytes
         ResponseAPDU whole = transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_HEX), 256));
         assertEquals(SW_OK, whole.getSW());
-        assertArrayEquals(new byte[] { 0x01, 0x08 }, whole.getData(), "the same answer either way: version 1.8");
+        assertArrayEquals(new byte[] { 0x01, 0x09 }, whole.getData(), "the same answer either way: version 1.9");
         assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)), "and its instructions follow");
     }
 
@@ -544,21 +544,21 @@ class CashuAppletTest {
     void testSelect() {
         ResponseAPDU resp = transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR)));
         assertEquals(SW_OK, resp.getSW());
-        assertArrayEquals(new byte[] { 0x01, 0x08 }, resp.getData(), "version 1.8: a payment's pieces are burned outside the transaction that commits it");
+        assertArrayEquals(new byte[] { 0x01, 0x09 }, resp.getData(), "version 1.9: the PIN is taken sealed");
         assertNotEquals(SW_OK, sw(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(UPSTREAM_AID))),
             "an upstream reader must not find this applet under upstream's AID: the wire is not the same");
     }
 
     @Test
-    @DisplayName("GET_INFO on a new card: 30 bytes: version 1.8, 128 empty slots, no PIN, three tries, format 4, capabilities 7F, no record, no limit, no owner, no time, no change due")
+    @DisplayName("GET_INFO on a new card: 30 bytes: version 1.9, 128 empty slots, no PIN, three tries, format 4, capabilities FF, no record, no limit, no owner, no time, no change due")
     void testInfoFresh() {
         byte[] d = info();
         assertEquals(30, d.length);
-        assertEquals(1, d[0]); assertEquals(8, d[1]);
+        assertEquals(1, d[0]); assertEquals(9, d[1]);
         assertEquals(MAX_PROOFS, d[2] & 0xFF);
         assertEquals(0, d[3]); assertEquals(0, d[4]);
         assertEquals(MAX_PROOFS, d[5] & 0xFF);
-        assertEquals(0x7F, d[6], "secp256k1, Schnorr, PIN, the limit on one payment waited for and not refused, the 1.6 forms (several pieces to a LOAD_PROOF, GET_PIECES by name), more than sixty-four places with the short listing, and a payment's pieces burned outside its transaction so that it may be of any number (it was 3F, 1F, 0F and 07 before)");
+        assertEquals((byte) 0xFF, d[6], "secp256k1, Schnorr, PIN, the limit on one payment waited for and not refused, the 1.6 forms (several pieces to a LOAD_PROOF, GET_PIECES by name), more than sixty-four places with the short listing, a payment's pieces burned outside its transaction so that it may be of any number, and the PIN taken sealed (it was 7F, 3F, 1F, 0F and 07 before)");
         assertEquals(0, d[7], "no PIN");
         assertEquals(4, d[8], "format");
         assertEquals(3, d[9], "tries");
@@ -2255,15 +2255,24 @@ class CashuAppletTest {
         assertTrue(f.contains("if (idx >= MAX_PROOFS) continue;"), "a number that is no place is passed over");
         assertTrue(f.contains("short at = (short)(idx * PROOF_SIZE + PROOF_STATUS_OFFSET);"), "the place's status byte");
         assertTrue(f.contains("if (proofStorage[at] != STATUS_SPENT) proofStorage[at] = STATUS_SPENT;"), "marked spent");
+        int loop = finish.indexOf("for (short i = 0; i < n; i++) {");
         int mark = finish.indexOf("proofStorage[at] = STATUS_SPENT;");
+        int loopEnd = finish.indexOf("}", mark);
+        int clearBegins = finish.indexOf("JCSystem.beginTransaction();");
         int clear = finish.indexOf("burnPending[0] = (byte) 0;");
-        assertTrue(mark > 0 && clear > mark, "the note is cleared after the places are marked");
-        assertEquals("}", finish.substring(clear + "burnPending[0] = (byte) 0;".length()).replaceAll("\\s+", ""), "and clearing it is the last thing finishBurn does");
+        int clearCommits = finish.indexOf("JCSystem.commitTransaction();");
+        assertTrue(loop > 0 && loop < mark && mark < loopEnd && loopEnd < clearBegins && clearBegins < clear && clear < clearCommits,
+            "the places are marked in the loop, and after the loop the note is taken down in a transaction of its own: begun, one byte, committed");
+        assertEquals("JCSystem.beginTransaction();burnPending[0]=(byte)0;JCSystem.commitTransaction();}", finish.substring(clearBegins).replaceAll("\\s+", ""),
+            "and that transaction is the last thing finishBurn does, and holds the one byte and nothing else: the commit is the barrier between the status bytes and the note");
+        assertEquals(1, count(finish, "beginTransaction"), "one transaction");
+        assertEquals(1, count(finish, "commitTransaction"), "committed once");
+        assertEquals(0, count(finish, "abortTransaction"), "and not aborted: there is nothing in it to fail");
         assertEquals(1, count(finish, "burnPending"), "finishBurn names burnPending once, to clear it");
         assertEquals(2, count(finish, "STATUS_SPENT"), "and writes only that one status, in that one place");
-        assertFalse(finish.contains("beginTransaction") || finish.contains("commitTransaction") || finish.contains("burnList[0] =") || finish.contains("cardLog")
-                || finish.contains("lastSig") || finish.contains("changeDue") || finish.contains("cardRecord") || finish.contains("STATUS_EMPTY") || finish.contains("STATUS_UNSPENT"),
-            "it is outside any transaction, writes only statuses to spent and the note to 0, and never the list");
+        assertFalse(finish.contains("burnList[0] =") || finish.contains("cardLog") || finish.contains("lastSig") || finish.contains("changeDue")
+                || finish.contains("cardRecord") || finish.contains("STATUS_EMPTY") || finish.contains("STATUS_UNSPENT"),
+            "it writes only statuses to spent and the note to 0, and never the list");
 
         // ---- process(): a pending burn is finished before anything else
         int gets = process.indexOf("byte[] buf = apdu.getBuffer();");
@@ -2436,7 +2445,7 @@ class CashuAppletTest {
                 // and the answer says what the marked places make it say
                 byte[] d = torn.getData();
                 if (name.equals("SELECT")) {
-                    assertArrayEquals(new byte[] { 0x01, 0x08 }, d, what);
+                    assertArrayEquals(new byte[] { 0x01, 0x09 }, d, what);
                 } else if (name.equals("GET_INFO")) {
                     assertEquals(others, d[3] & 0xFF, what + ": unspent");
                     assertEquals(n + others, d[4] & 0xFF, what + ": spent");
@@ -2726,11 +2735,11 @@ class CashuAppletTest {
     }
 
     @Test
-    @DisplayName("A card taken out of the field the instant after a payment's transaction commits (the note set, the places not marked, nothing answered) has paid: the day, the log, the last signature and the change note are the payment's, the receipt is not written, and the next command, SELECT or any other, marks every place before it looks at one, so that SPEND_ALL_AGAIN gives the signature and the places cannot be paid with again; and a card taken away after the receipt has the places marked and the receipt; for 1, 12, 64 and 128 places")
+    @DisplayName("A card taken out of the field the instant after one of a payment's three commits has paid, and is left as that commit leaves it. After the payment's (the note set, the places not marked): the day, the log, the last signature and the change note are the payment's, the receipt is not written, and the next command, SELECT or any other, marks every place before it looks at one. After the note's clearing (places marked, note cleared): only the receipt is missing. After the receipt's: nothing is missing but the answer. SPEND_ALL_AGAIN gives the signature in all three, and the places cannot be paid with again; for 1, 12, 64 and 128 places")
     void testACardTornAtTheCommitHasPaidAndFinishesAtItsNextCommand() throws Exception {
         for (int n : new int[] { 1, 12, 64, 128 }) {
-            for (int tearAfter = 1; tearAfter <= 2; tearAfter++) {
-                String what = n + " places, taken away after commit " + tearAfter + (tearAfter == 1 ? " (the payment's)" : " (the receipt's)");
+            for (int tearAfter = 1; tearAfter <= 3; tearAfter++) {
+                String what = n + " places, taken away after commit " + tearAfter + (tearAfter == 1 ? " (the payment's)" : tearAfter == 2 ? " (the note's clearing)" : " (the receipt's)");
                 simulator = freshCard();
                 readyWithLimit(100000);
                 byte[][] sent = loadMany(128, i -> buildProof(KEYSET, 1 + i, i + 1));
@@ -2748,11 +2757,11 @@ class CashuAppletTest {
                 // the card as it was left, read where no command is spent
                 assertEquals(tearAfter == 1 ? 1 : 0, field("burnPending")[0], what + ": the note");
                 for (int place = 0; place < 128; place++) {
-                    assertEquals(burned[place] && tearAfter == 2 ? 2 : 1, statusOf(place), what + ": place " + place + " as the tear left it");
+                    assertEquals(burned[place] && tearAfter >= 2 ? 2 : 1, statusOf(place), what + ": place " + place + " as the tear left it");
                 }
                 assertEquals(1, field("changeDue")[0], what + ": the change note is in the payment's transaction");
                 assertEquals(1, field("lastSig")[0], what + ": and so is the signature");
-                assertEquals(tearAfter == 1 ? 0 : 1, readUint32(field("cardReceipts"), 0), what + ": the receipt is the next transaction");
+                assertEquals(tearAfter == 3 ? 1 : 0, readUint32(field("cardReceipts"), 0), what + ": the receipt is the third transaction");
                 // the card goes out of the field and comes back
                 simulator.reset();
                 reselect();
@@ -2767,7 +2776,7 @@ class CashuAppletTest {
                 assertEquals(64, again.getData().length, what);
                 assertTrue(signedForAll(again.getData(), named, outputs, REFUND), what + ": the signature of the payment that was made");
                 assertEquals(SW_OK, allowLoad());
-                assertEquals(tearAfter == 1 ? 0 : 1, heldReceipts().count, what + ": a payment taken away before its receipt has none");
+                assertEquals(tearAfter == 3 ? 1 : 0, heldReceipts().count, what + ": a payment taken away before its receipt has none");
                 // a place paid with cannot be paid with again, and one not paid with can
                 assertEquals(SW_CONDITIONS_NOT_SATIS, sw(beginCommand(places[0])), what);
                 if (n < 128) {
@@ -6020,13 +6029,13 @@ class CashuAppletTest {
     }
 
     @Test
-    @DisplayName("GET_INFO: byte 1 is 8 and byte 6 is 7F, and bytes 34..41 asked for with P1 = 1 are zero, as is the record behind them, however the limit on a payment has been used; nothing ever answers 6A95")
+    @DisplayName("GET_INFO: byte 1 is 9 and byte 6 is FF, and bytes 34..41 asked for with P1 = 1 are zero, as is the record behind them, however the limit on a payment has been used; nothing ever answers 6A95")
     void testTheCardRemembersNothingOfThePaymentLimit() throws Exception {
         readyWithLimit(0);
         byte[] more = infoTap();
         assertEquals(1, more[0]);
-        assertEquals(8, more[1], "version 1.8");
-        assertEquals(0x7F, more[6], "capabilities 7F: the limit on one payment is waited for, not refused, the 1.6 forms are there, so are 128 places with the short listing, and so is a payment burned outside its transaction");
+        assertEquals(9, more[1], "version 1.9");
+        assertEquals((byte) 0xFF, more[6], "capabilities FF: the limit on one payment is waited for, not refused, the 1.6 forms are there, so are 128 places with the short listing, a payment burned outside its transaction, and the PIN taken sealed");
         assertEquals(SW_OK, setLimits(1000, 100));
         assertEquals(100, paymentLimit());
         assertNothingRemembered("a limit set");
@@ -7090,6 +7099,953 @@ class CashuAppletTest {
         java.nio.file.Files.write(target.resolve("target").resolve("owner-vectors.json"), out.toString().getBytes(StandardCharsets.UTF_8));
     }
 
+    // =========================================================================
+    // The PIN, sealed (1.9)
+    // =========================================================================
+    //
+    // The envelope is built here from its description, and not from the applet: the secp256k1 arithmetic is this file's own
+    // (ecMulTest and liftX, BigInteger, at the end of it) and the hash is the JDK's SHA-256. BouncyCastle is not on the test
+    // classpath. A sealed command's data is E (65, 04 || X || Y) || the clear data under a keystream || a tag (16), where
+    //
+    //   shared    = the x of (the sender's scalar) times (the card's PIN key)
+    //   block(i, more) = SHA-256("FoxyCard/seal" || i (1) || shared (32) || E (65) || nonce (16) || INS (1) || more)
+    //   tag       = the first 16 bytes of block(0, ct)
+    //   keystream = block(1) || block(2) || ...      clear = ct XOR keystream
+    //
+    // and the clear data ends in a PIN block: its length (4 to 8), the PIN, zeros to eight.
+
+    /** The scalar these tests give a card's PIN key (ownPinKey), so that it is not the card's signing key as well. */
+    static final java.math.BigInteger PIN_D = new java.math.BigInteger("3141592653589793238462643383279502884197169399375105820974944592", 16);
+    /** The sender's one-message scalars, the private halves of E: an envelope uses one of them. */
+    static final java.math.BigInteger[] EPH = {
+        new java.math.BigInteger("1111111111111111111111111111111111111111111111111111111111111111", 16),
+        new java.math.BigInteger("2222222222222222222222222222222222222222222222222222222222222222", 16),
+        new java.math.BigInteger("3333333333333333333333333333333333333333333333333333333333333333", 16),
+        new java.math.BigInteger("4444444444444444444444444444444444444444444444444444444444444444", 16),
+        new java.math.BigInteger("5555555555555555555555555555555555555555555555555555555555555555", 16),
+        new java.math.BigInteger("6666666666666666666666666666666666666666666666666666666666666666", 16) };
+    static final byte[] PIN5 = { 0x35, 0x36, 0x37, 0x38, 0x39 };
+    static final byte[] PIN8 = { 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38 };
+
+    /** A compressed secp256k1 point, 02/03 || X. */
+    static byte[] compressed(java.math.BigInteger[] w) {
+        byte[] c = new byte[33];
+        c[0] = (byte) (w[1].testBit(0) ? 3 : 2);
+        System.arraycopy(unsigned32(w[0]), 0, c, 1, 32);
+        return c;
+    }
+    /** The point a compressed key stands for; null where its X is on no point. */
+    static java.math.BigInteger[] decompressed(byte[] key33) {
+        java.math.BigInteger[] even = liftX(new java.math.BigInteger(1, Arrays.copyOfRange(key33, 1, 33)));
+        if (even == null) return null;
+        return key33[0] == 3 ? new java.math.BigInteger[] { even[0], SECP_P.subtract(even[1]) } : even;
+    }
+    /** A PIN key that is not the card's, to seal to: seven times the generator. */
+    static byte[] anotherPinKey() {
+        return compressed(ecMulTest(java.math.BigInteger.valueOf(7), SECP_GX, SECP_GY));
+    }
+
+    private static final java.util.Map<String, byte[][]> AGREED = new java.util.HashMap<>();
+    /** { E (65), the shared x (32) } for the sender's scalar and a PIN key (33). Worked out once: the arithmetic is slow. */
+    static byte[][] agreed(java.math.BigInteger e, byte[] pinKey33) {
+        return AGREED.computeIfAbsent(e.toString(16) + "/" + toHex(pinKey33), id -> {
+            java.math.BigInteger[] eg = ecMulTest(e, SECP_GX, SECP_GY);
+            java.math.BigInteger[] p = decompressed(pinKey33);
+            java.math.BigInteger[] s = ecMulTest(e, p[0], p[1]);
+            return new byte[][] { concat(new byte[] { 4 }, unsigned32(eg[0]), unsigned32(eg[1])), unsigned32(s[0]) };
+        });
+    }
+    static byte[] sealBlock(int i, byte[] shared, byte[] e, byte[] nonce, int ins, byte[] more) {
+        try {
+            java.security.MessageDigest d = java.security.MessageDigest.getInstance("SHA-256");
+            d.update("FoxyCard/seal".getBytes(StandardCharsets.US_ASCII));
+            d.update((byte) i);
+            d.update(shared);
+            d.update(e);
+            d.update(nonce);
+            d.update((byte) ins);
+            d.update(more);
+            return d.digest();
+        } catch (java.security.NoSuchAlgorithmException x) {
+            throw new IllegalStateException(x);
+        }
+    }
+    /** The envelope for `clear`, to the PIN key (33), under the nonce, for the instruction, with the sender's scalar. */
+    static byte[] envelope(java.math.BigInteger e, byte[] pinKey33, byte[] nonce, int ins, byte[] clear) {
+        byte[][] ks = agreed(e, pinKey33);
+        byte[] ct = new byte[clear.length];
+        for (int i = 0; i * 32 < clear.length; i++) {
+            byte[] block = sealBlock(i + 1, ks[1], ks[0], nonce, ins, new byte[0]);
+            for (int k = 0; k < 32 && i * 32 + k < clear.length; k++) ct[i * 32 + k] = (byte) (clear[i * 32 + k] ^ block[k]);
+        }
+        byte[] tag = Arrays.copyOf(sealBlock(0, ks[1], ks[0], nonce, ins, ct), 16);
+        return concat(ks[0], ct, tag);
+    }
+    /** An envelope spoiled: "tag" the last byte of the tag, "tagfirst" its first, "body" the first byte of ct, "last" the last byte of ct, "x" a bit of E's X,
+     *  "minusE" E's Y negated (the same shared secret), "02" "03" "00" E's first byte, "point" E replaced by 04 and 64 zeros,
+     *  "y" a bit of E's Y, "big" X and Y both 2^256 - 1 (no field element). */
+    static byte[] spoiled(byte[] env, String how) {
+        byte[] e = env.clone();
+        switch (how) {
+            case "": break;
+            case "tag": e[e.length - 1] ^= 1; break;
+            case "tagfirst": e[e.length - 16] ^= 0x80; break;
+            case "body": e[65] ^= 1; break;
+            case "last": e[e.length - 17] ^= 1; break;
+            case "x": e[1] ^= 1; break;
+            case "minusE": {
+                byte[] y = unsigned32(SECP_P.subtract(new java.math.BigInteger(1, Arrays.copyOfRange(e, 33, 65))));
+                System.arraycopy(y, 0, e, 33, 32);
+                break;
+            }
+            case "02": e[0] = 2; break;
+            case "03": e[0] = 3; break;
+            case "00": e[0] = 0; break;
+            case "point": Arrays.fill(e, 1, 65, (byte) 0); e[0] = 4; break;
+            case "y": e[33] ^= 1; break;
+            case "big": Arrays.fill(e, 1, 65, (byte) 0xFF); break;
+            default: throw new IllegalArgumentException(how);
+        }
+        return e;
+    }
+    /** The nine-byte PIN block: its length, the PIN, zeros to eight. */
+    static byte[] pinBlock(byte[] pin) {
+        byte[] b = new byte[9];
+        b[0] = (byte) pin.length;
+        System.arraycopy(pin, 0, b, 1, pin.length);
+        return b;
+    }
+
+    /** What GET_NONCE with P1 = 1 said. */
+    private static final class PinKey {
+        byte[] nonce, key, sig, all;
+    }
+    private static PinKey splitPinKey(byte[] answer) {
+        PinKey k = new PinKey();
+        k.all = answer;
+        k.nonce = Arrays.copyOfRange(answer, 0, 16);
+        k.key = Arrays.copyOfRange(answer, 16, 49);
+        k.sig = Arrays.copyOfRange(answer, 49, 113);
+        return k;
+    }
+    private PinKey askPinKey() {
+        ResponseAPDU r = transmit(new CommandAPDU(CLA, INS_GET_NONCE, 1, 0, 256));
+        assertEquals(SW_OK, r.getSW());
+        assertEquals(113, r.getData().length);
+        return splitPinKey(r.getData());
+    }
+
+    private Object appletObject(String name) throws Exception {
+        java.lang.reflect.Field f = CashuApplet.class.getDeclaredField(name);
+        f.setAccessible(true);
+        return f.get(runtime.appletAt(AIDUtil.create(AID_HEX)));
+    }
+    /**
+     * Gives the card's PIN key a scalar of this file's choosing (PIN_D), so that it is not the card's signing key. jCardSim seeds its key
+     * generator the same for every key pair, so on an untouched card the PIN key made at install has the card key's value; a chip's does
+     * not. The key objects are the applet's own and the applet reads them where it always does; only their value is set.
+     * Call it before the card is first asked for its PIN key, which is when the card signs it.
+     */
+    private void ownPinKey() throws Exception {
+        javacard.security.ECPrivateKey priv = (javacard.security.ECPrivateKey) appletObject("pinPrivKey");
+        javacard.security.ECPublicKey pub = (javacard.security.ECPublicKey) appletObject("pinPubKey");
+        priv.setS(unsigned32(PIN_D), (short) 0, (short) 32);
+        java.math.BigInteger[] w = ecMulTest(PIN_D, SECP_GX, SECP_GY);
+        byte[] w65 = concat(new byte[] { 4 }, unsigned32(w[0]), unsigned32(w[1]));
+        pub.setW(w65, (short) 0, (short) 65);
+    }
+    /** A card with a PIN key of its own value, an open one (no owner), TEST_PIN set; taken out of the field and put back: not verified, three tries. */
+    private void openPinCard() throws Exception {
+        simulator = freshCard();
+        ownPinKey();
+        assertEquals(SW_OK, setPin(TEST_PIN));
+        simulator.reset();
+        reselect();
+    }
+    /** The same with an owner, a record and the time (ready()), TEST_PIN set; put back: not verified, three tries. */
+    private void ownedPinCard() throws Exception {
+        simulator = freshCard();
+        ownPinKey();
+        ready();
+        simulator.reset();
+        reselect();
+    }
+    private int tries() { return info()[9] & 0xFF; }
+    private boolean verified() throws Exception { return field("pinVerifiedFlag")[0] == 1; }
+    private boolean nonceLive() throws Exception { return field("nonceLive")[0] == 1; }
+    private ResponseAPDU sendSealed(int ins, byte[] envelope) { return transmit(new CommandAPDU(CLA, ins, 1, 0, envelope)); }
+    /** CHANGE_PIN's clear data: the proof's length, the proof (over the label, the nonce and the PIN itself), the PIN block. */
+    private static byte[] changeClear(byte[] nonce, byte[] pin) {
+        byte[] proof = ownerProof(L_PIN, OWNER, nonce, pin);
+        return concat(new byte[] { (byte) proof.length }, proof, pinBlock(pin));
+    }
+    /** The clear data of a sealed command of this kind, for this PIN. */
+    private static byte[] clearFor(int ins, PinKey k, byte[] pin) {
+        return ins == (INS_CHANGE_PIN & 0xFF) ? changeClear(k.nonce, pin) : pinBlock(pin);
+    }
+    private static final int VERIFY_INS = INS_VERIFY_PIN & 0xFF, SET_INS = INS_SET_PIN & 0xFF, CHANGE_INS = INS_CHANGE_PIN & 0xFF;
+
+    @Test
+    @DisplayName("GET_NONCE with P1 = 1 answers 113 bytes: the nonce (16), the PIN key as a compressed secp256k1 point (33) and the card key's BIP-340 signature (64) over SHA-256(\"FoxyCard/pinkey\" || those 33 bytes); the key is a point on the curve, and is not the card's signing key")
+    void testGetNonceWithP1Of1GivesTheNonceThePinKeyAndTheCardsSignature() throws Exception {
+        simulator = freshCard();
+        ownPinKey();
+        ResponseAPDU r = transmit(new CommandAPDU(CLA, INS_GET_NONCE, 1, 0, 256));
+        assertEquals(SW_OK, r.getSW());
+        assertEquals(113, r.getData().length);
+        PinKey k = splitPinKey(r.getData());
+        assertTrue(k.key[0] == 2 || k.key[0] == 3, "a compressed point");
+        assertNotNull(decompressed(k.key), "and on the curve");
+        assertArrayEquals(compressed(ecMulTest(PIN_D, SECP_GX, SECP_GY)), k.key, "it is the key the applet holds");
+        assertFalse(Arrays.equals(k.key, cardKey()), "and not the card's signing key");
+        byte[] digest = sha256(concat("FoxyCard/pinkey".getBytes(StandardCharsets.US_ASCII), k.key));
+        assertTrue(schnorrVerify(extractPubkeyX(cardKey()), digest, k.sig), "the card key's signature over SHA-256(label || key)");
+        assertFalse(schnorrVerify(extractPubkeyX(cardKey()), sha256(concat("FoxyCard/pinkey".getBytes(StandardCharsets.US_ASCII), anotherPinKey())), k.sig), "and over no other key");
+        assertFalse(schnorrVerify(extractPubkeyX(cardKey()), sha256(concat("FoxyCard/seal".getBytes(StandardCharsets.US_ASCII), k.key)), k.sig), "nor under another label");
+        assertFalse(schnorrVerify(extractPubkeyX(k.key), digest, k.sig), "and it is not the PIN key's signature");
+        assertArrayEquals(k.nonce, field("ownerNonce"), "the nonce is the one the owner's proof is over: the same buffer");
+        assertTrue(nonceLive(), "and it is live");
+    }
+
+    @Test
+    @DisplayName("The PIN key is a key pair of the applet's own, not the card's signing key reused: separate KeyPair, private and public key objects; jCardSim seeds its generator the same for every pair, so on an untouched card the two have the same value, which a chip's do not")
+    void testThePinKeyIsAKeyPairOfItsOwn() throws Exception {
+        simulator = freshCard();
+        assertNotSame(appletObject("cardKeyPair"), appletObject("pinKeyPair"));
+        assertNotSame(appletObject("cardPrivKey"), appletObject("pinPrivKey"));
+        assertNotSame(appletObject("cardPubKey"), appletObject("pinPubKey"));
+        assertSame(((javacard.security.KeyPair) appletObject("pinKeyPair")).getPrivate(), appletObject("pinPrivKey"));
+        assertSame(((javacard.security.KeyPair) appletObject("pinKeyPair")).getPublic(), appletObject("pinPubKey"));
+        // setting the PIN key's value moves the PIN key and leaves the card key where it was (which is what tells the two apart in these tests)
+        byte[] cardBefore = cardKey();
+        ownPinKey();
+        assertArrayEquals(cardBefore, cardKey(), "the card key did not move");
+        assertFalse(Arrays.equals(cardBefore, askPinKey().key), "and the PIN key did");
+    }
+
+    @Test
+    @DisplayName("Asked again, GET_NONCE P1 = 1 gives a new nonce every time and the same key and the same signature, which are made once, at the first asking, and kept (pinKeySig)")
+    void testThePinKeyAndItsSignatureAreTheSameEveryTimeAndOnlyTheNonceChanges() throws Exception {
+        simulator = freshCard();
+        ownPinKey();
+        assertEquals(0, field("pinKeySig")[0], "not yet signed");
+        PinKey a = askPinKey();
+        assertEquals(1, field("pinKeySig")[0], "signed at the first asking");
+        assertArrayEquals(a.sig, Arrays.copyOfRange(field("pinKeySig"), 1, 65), "and kept");
+        PinKey b = askPinKey(), c = askPinKey();
+        assertFalse(Arrays.equals(a.nonce, b.nonce) || Arrays.equals(b.nonce, c.nonce) || Arrays.equals(a.nonce, c.nonce), "a new nonce each time");
+        assertArrayEquals(a.key, b.key); assertArrayEquals(b.key, c.key);
+        assertArrayEquals(a.sig, b.sig); assertArrayEquals(b.sig, c.sig);
+        assertArrayEquals(c.nonce, field("ownerNonce"), "and the nonce the card holds is the last one given");
+    }
+
+    @Test
+    @DisplayName("GET_NONCE P1 = 1 needs no PIN and no owner: a card with neither, with a PIN not given, with an owner and a PIN not given, and a locked card all answer it; P1 = 0 still needs an owner")
+    void testThePinKeyNeedsNeitherOwnerNorPin() throws Exception {
+        simulator = freshCard();
+        assertEquals(SW_NO_OWNER, nonce().getSW(), "P1 = 0 on a card with no owner, as before");
+        assertEquals(113, askPinKey().all.length, "P1 = 1 on a card with no owner and no PIN");
+        assertEquals(SW_OK, setPin(TEST_PIN));
+        simulator.reset(); reselect();
+        assertEquals(113, askPinKey().all.length, "with a PIN set and not given");
+        assertEquals(SW_NO_OWNER, nonce().getSW());
+        ownedPinCard();
+        assertEquals(113, askPinKey().all.length, "with an owner and a PIN not given");
+        assertEquals(16, nonceBytes().length, "and P1 = 0 with the owner");
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, lock());
+        simulator.reset(); reselect();
+        assertEquals(113, askPinKey().all.length, "a locked card says its PIN key as well");
+    }
+
+    @Test
+    @DisplayName("One nonce serves the owner's proof and the sealing: a P1 = 1 nonce is the nonce an owner's proof is over (and is used up by it), a P1 = 0 nonce is the nonce a sealed command is sealed under, and each asking replaces the one before, of either kind")
+    void testOneNonceServesAnOwnersProofAndASealedCommand() throws Exception {
+        ownedPinCard();
+        PinKey k = askPinKey();
+        assertEquals(SW_OK, sw(allowLoadCommand(ownerProof(L_LOAD, OWNER, k.nonce, new byte[0]))), "an owner's proof over a P1 = 1 nonce");
+        assertFalse(nonceLive(), "and it is used up by the proof");
+        assertEquals(SW_OWNER_PROOF, sw(allowLoadCommand(ownerProof(L_LOAD, OWNER, k.nonce, new byte[0]))), "once");
+        // a P1 = 0 nonce, sealed under
+        PinKey key = askPinKey();
+        byte[] zero = nonceBytes();
+        assertArrayEquals(zero, field("ownerNonce"), "the P1 = 0 asking replaced the P1 = 1 nonce");
+        assertEquals(SW_OK, sendSealed(VERIFY_INS, envelope(EPH[0], key.key, zero, VERIFY_INS, pinBlock(TEST_PIN))).getSW(), "a command sealed under the P1 = 0 nonce opens");
+        assertTrue(verified());
+        // and the one before was replaced
+        PinKey older = askPinKey();
+        PinKey newer = askPinKey();
+        assertEquals(0x63C2, sendSealed(VERIFY_INS, envelope(EPH[0], older.key, older.nonce, VERIFY_INS, pinBlock(TEST_PIN))).getSW(), "sealed under the nonce before the last: it does not open");
+        assertEquals(SW_OWNER_PROOF, sw(allowLoadCommand(ownerProof(L_LOAD, OWNER, newer.nonce, new byte[0]))), "the nonce the failed envelope used up is gone for the owner's proof too");
+        PinKey last = askPinKey();
+        byte[] after = nonceBytes();
+        assertEquals(SW_OK, sw(allowLoadCommand(ownerProof(L_LOAD, OWNER, after, new byte[0]))), "a P1 = 0 asking after a P1 = 1 one: its nonce is the live one");
+        last = askPinKey();
+        after = nonceBytes();
+        assertEquals(SW_OWNER_PROOF, sw(allowLoadCommand(ownerProof(L_LOAD, OWNER, last.nonce, new byte[0]))), "and the P1 = 1 nonce before it is gone");
+    }
+
+    @Test
+    @DisplayName("Sealed VERIFY_PIN with the right PIN verifies as the clear one does, for PINs of 4, 5 and 8 bytes: 90 bytes on the wire whatever the PIN's length, the tries back to three, the session verified, and a payment can be begun")
+    void testASealedVerifyOfTheRightPinVerifies() throws Exception {
+        for (byte[] pin : new byte[][] { TEST_PIN, PIN5, PIN8 }) {
+            String what = pin.length + "-byte PIN";
+            simulator = freshCard();
+            ownPinKey();
+            ready();
+            assertEquals(SW_OK, load(buildProof(KEYSET, 16, 1)).getSW(), what);
+            assertEquals(SW_OK, changePin(pin), what);
+            simulator.reset(); reselect();
+            assertEquals(0x63C2, verify(WRONG_PIN), what + ": a try gone");
+            assertEquals(2, tries(), what);
+            PinKey k = askPinKey();
+            byte[] env = envelope(EPH[1], k.key, k.nonce, VERIFY_INS, pinBlock(pin));
+            assertEquals(90, env.length, what + ": ninety bytes on the wire, E and the block and the tag");
+            assertFalse(verified(), what);
+            assertEquals(SW_OK, sendSealed(VERIFY_INS, env).getSW(), what);
+            assertTrue(verified(), what + ": verified");
+            assertEquals(3, tries(), what + ": the tries are back");
+            assertEquals(SW_OK, spend(0).getSW(), what + ": and a payment can be begun and signed");
+            assertFalse(nonceLive(), what + ": the nonce is used up");
+        }
+    }
+
+    @Test
+    @DisplayName("Sealed VERIFY_PIN with a wrong PIN costs a try as a clear one does: 63C2, 63C1, then 6983 with the card blocked (pinState 2, no tries); the session is not verified; a blocked card says 6983 before it looks at the envelope, and leaves the nonce as it was")
+    void testASealedWrongPinCostsATryAndBlocksAtTheThird() throws Exception {
+        openPinCard();
+        PinKey k = askPinKey();
+        assertEquals(SW_OK, sendSealed(VERIFY_INS, envelope(EPH[0], k.key, k.nonce, VERIFY_INS, pinBlock(TEST_PIN))).getSW());
+        assertTrue(verified());
+        k = askPinKey();
+        assertEquals(0x63C2, sendSealed(VERIFY_INS, envelope(EPH[0], k.key, k.nonce, VERIFY_INS, pinBlock(WRONG_PIN))).getSW());
+        assertFalse(verified(), "a wrong PIN ends the session, sealed as clear");
+        assertEquals(2, tries());
+        k = askPinKey();
+        assertEquals(0x63C1, sendSealed(VERIFY_INS, envelope(EPH[0], k.key, k.nonce, VERIFY_INS, pinBlock(PIN5))).getSW(), "a wrong PIN of another length");
+        assertEquals(1, tries());
+        k = askPinKey();
+        assertEquals(SW_PIN_BLOCKED, sendSealed(VERIFY_INS, envelope(EPH[0], k.key, k.nonce, VERIFY_INS, pinBlock(WRONG_PIN))).getSW());
+        assertEquals(2, info()[7], "blocked");
+        assertEquals(0, tries());
+        k = askPinKey();
+        assertEquals(SW_PIN_BLOCKED, sendSealed(VERIFY_INS, envelope(EPH[0], k.key, k.nonce, VERIFY_INS, pinBlock(TEST_PIN))).getSW(), "the right PIN no longer opens it");
+        assertTrue(nonceLive(), "and the envelope was not looked at: the nonce is as it was");
+    }
+
+    @Test
+    @DisplayName("An envelope is good once: sent a second time it is 6985 and costs nothing and leaves the session as it was; sent after a fresh GET_NONCE P1 = 1 it does not open and costs a try; sent after the card was taken out of the field and put back (no nonce) it is 6985 and costs nothing; and the same for SET_PIN")
+    void testASealedCommandCannotBeSentTwice() throws Exception {
+        openPinCard();
+        PinKey k = askPinKey();
+        byte[] env = envelope(EPH[0], k.key, k.nonce, VERIFY_INS, pinBlock(TEST_PIN));
+        assertEquals(SW_OK, sendSealed(VERIFY_INS, env).getSW());
+        assertEquals(SW_CONDITIONS_NOT_SATIS, sendSealed(VERIFY_INS, env).getSW(), "the second time");
+        assertEquals(3, tries(), "at no cost");
+        assertTrue(verified(), "and the session that the first verified is as it was");
+        askPinKey();
+        assertEquals(0x63C2, sendSealed(VERIFY_INS, env).getSW(), "after a fresh nonce it does not open");
+        assertEquals(2, tries(), "and it costs a try");
+        assertFalse(verified());
+        simulator.reset(); reselect();
+        assertEquals(SW_CONDITIONS_NOT_SATIS, sendSealed(VERIFY_INS, env).getSW(), "after the card was out of the field there is no nonce");
+        assertEquals(2, tries(), "and that costs nothing");
+        // SET_PIN
+        openPinCard();
+        k = askPinKey();
+        env = envelope(EPH[0], k.key, k.nonce, SET_INS, pinBlock(NEW_PIN));
+        assertEquals(SW_OK, sendSealed(SET_INS, env).getSW());
+        assertEquals(SW_CONDITIONS_NOT_SATIS, sendSealed(SET_INS, env).getSW(), "SET_PIN the second time");
+        assertEquals(SW_OK, verify(NEW_PIN), "the PIN is the one the first set");
+        askPinKey();
+        assertEquals(SW_WRONG_DATA, sendSealed(SET_INS, env).getSW(), "after a fresh nonce it does not open: SET_PIN says 6A80");
+        assertEquals(3, tries(), "and costs no try");
+    }
+
+    @Test
+    @DisplayName("No nonce asked, no sealing: a good envelope, a bad one and a short one for a nonce nobody gave are 6985 (6700 where the length is short: that is looked at first) with the tries and the PIN untouched, for VERIFY_PIN, SET_PIN and CHANGE_PIN")
+    void testNoNonceIsNoSealing() throws Exception {
+        for (int ins : new int[] { VERIFY_INS, SET_INS, CHANGE_INS }) {
+            String what = String.format("%02X", ins);
+            if (ins == CHANGE_INS) ownedPinCard(); else openPinCard();
+            PinKey k = askPinKey();
+            byte[] good = envelope(EPH[0], k.key, k.nonce, ins, clearFor(ins, k, NEW_PIN));
+            simulator.reset(); reselect();
+            assertFalse(nonceLive(), what);
+            assertEquals(SW_CONDITIONS_NOT_SATIS, sendSealed(ins, good).getSW(), what + ": an envelope for a nonce the card no longer holds");
+            assertEquals(SW_CONDITIONS_NOT_SATIS, sendSealed(ins, new byte[90]).getSW(), what + ": nothing of an envelope");
+            assertEquals(SW_CONDITIONS_NOT_SATIS, sendSealed(ins, new byte[82]).getSW(), what + ": the shortest");
+            assertEquals(SW_WRONG_LENGTH, sendSealed(ins, new byte[81]).getSW(), what + ": one byte shorter, which is looked at first");
+            assertEquals(3, tries(), what + ": no try is cost");
+            assertEquals(SW_OK, verify(TEST_PIN), what + ": the PIN is the old one");
+        }
+    }
+
+    /** Whether an envelope's E (04 || X || Y) is a point of secp256k1. */
+    static boolean pointIsOnTheCurve(byte[] env) {
+        java.math.BigInteger x = new java.math.BigInteger(1, Arrays.copyOfRange(env, 1, 33)), y = new java.math.BigInteger(1, Arrays.copyOfRange(env, 33, 65));
+        return x.compareTo(SECP_P) < 0 && y.compareTo(SECP_P) < 0
+            && y.multiply(y).mod(SECP_P).equals(x.pow(3).add(java.math.BigInteger.valueOf(7)).mod(SECP_P));
+    }
+
+    private static final String[] SPOILS = { "tag", "tagfirst", "body", "last", "x", "y", "minusE", "02", "03", "00", "point", "big" };
+
+    /** One tampered envelope for this command, and what the card does with it. */
+    private void tamperedEnvelope(int ins, String how) throws Exception {
+        String what = String.format("%02X sealed, %s", ins, how);
+        if (ins == CHANGE_INS) ownedPinCard(); else openPinCard();
+        PinKey old = askPinKey();
+        PinKey k = how.equals("earlier nonce") ? askPinKey() : old;
+        int sealedFor = how.startsWith("for ") ? Integer.parseInt(how.substring(4), 16) : ins;
+        byte[] pin = ins == VERIFY_INS ? TEST_PIN : NEW_PIN;
+        byte[] clear = ins == CHANGE_INS ? changeClear(old.nonce, pin) : pinBlock(pin);
+        byte[] key = how.equals("another key") ? anotherPinKey() : k.key;
+        byte[] env = envelope(EPH[2], key, old.nonce, sealedFor, clear);
+        for (String s : SPOILS) if (s.equals(how)) env = spoiled(env, how);
+        // the spoils that leave the curve do, and the one that does not, does not: so that what is tried here is what its name says
+        if (how.equals("x") || how.equals("y") || how.equals("point") || how.equals("big")) assertTrue(env[0] == 4 && !pointIsOnTheCurve(env), what + ": E is no point");
+        if (how.equals("minusE") || how.equals("another key") || how.equals("tag") || how.equals("body")) assertTrue(env[0] == 4 && pointIsOnTheCurve(env), what + ": E is a point");
+        java.util.Map<String, byte[]> before = persistent();
+        ResponseAPDU r = sendSealed(ins, env);
+        if (ins == VERIFY_INS) {
+            assertEquals(0x63C2, r.getSW(), what + ": a wrong PIN, as far as the card can tell");
+            assertEquals(2, tries(), what + ": costs a try");
+            assertFalse(verified(), what);
+        } else {
+            assertEquals(SW_WRONG_DATA, r.getSW(), what + ": 6A80");
+            assertEquals(3, tries(), what + ": costs no try");
+            assertPersistent(before, what + ": and changes nothing");
+        }
+        assertEquals(0, r.getData().length, what);
+        assertFalse(nonceLive(), what + ": an envelope that does not open has used the nonce up");
+        // and the good envelope under that nonce is too late
+        byte[] fine = envelope(EPH[2], k.key, k.nonce, ins, ins == CHANGE_INS ? changeClear(k.nonce, pin) : pinBlock(pin));
+        assertEquals(SW_CONDITIONS_NOT_SATIS, sendSealed(ins, fine).getSW(), what + ": the good one is 6985 after it");
+        assertEquals(SW_OK, verify(TEST_PIN), what + ": the PIN is the old one");
+    }
+
+    @Test
+    @DisplayName("A tampered sealed VERIFY_PIN costs a try, as a wrong PIN does, and uses the nonce up: one bit of the tag (its first byte and its last), of the ciphertext (first and last byte), of E's X or Y; E negated (the same shared secret); E starting 02, 03 or 00; E off the curve (04 and zeros, 04 and ones, one bit of X or Y); an envelope sealed to another key, under the nonce before, or for SET_PIN or CHANGE_PIN")
+    void testATamperedSealedVerifyCostsATry() throws Exception {
+        String[] hows = { "tag", "tagfirst", "body", "last", "x", "y", "minusE", "02", "03", "00", "point", "big", "another key", "earlier nonce", "for 41", "for 42" };
+        for (String how : hows) tamperedEnvelope(VERIFY_INS, how);
+    }
+
+    @Test
+    @DisplayName("A tampered sealed SET_PIN is 6A80 and changes nothing and costs no try: every spoil and every wrong key, nonce or instruction a sealed VERIFY_PIN has")
+    void testATamperedSealedSetPinChangesNothing() throws Exception {
+        String[] hows = { "tag", "tagfirst", "body", "last", "x", "y", "minusE", "02", "03", "00", "point", "big", "another key", "earlier nonce", "for 40", "for 42" };
+        for (String how : hows) tamperedEnvelope(SET_INS, how);
+    }
+
+    @Test
+    @DisplayName("A tampered sealed CHANGE_PIN is 6A80 and changes nothing and costs no try, and the nonce is gone with it: every spoil and every wrong key, nonce or instruction a sealed VERIFY_PIN has")
+    void testATamperedSealedChangePinChangesNothing() throws Exception {
+        String[] hows = { "tag", "tagfirst", "body", "last", "x", "y", "minusE", "02", "03", "00", "point", "big", "another key", "earlier nonce", "for 40", "for 41" };
+        for (String how : hows) tamperedEnvelope(CHANGE_INS, how);
+    }
+
+    @Test
+    @DisplayName("Lc below 82 (E, one byte and the tag) is 6700 for all three commands and uses nothing: no try, the nonce is as it was, and the envelope that follows under the same nonce opens; with 82 the envelope opens and a clear length of one is 6700")
+    void testAnEnvelopeShorterThanItsParts() throws Exception {
+        for (int ins : new int[] { VERIFY_INS, SET_INS, CHANGE_INS }) {
+            for (int len : new int[] { 0, 1, 16, 65, 80, 81 }) {
+                String what = String.format("%02X with %d bytes", ins, len);
+                if (ins == CHANGE_INS) ownedPinCard(); else openPinCard();
+                PinKey k = askPinKey();
+                assertEquals(SW_WRONG_LENGTH, sendSealed(ins, new byte[len]).getSW(), what);
+                assertEquals(3, tries(), what);
+                assertTrue(nonceLive(), what + ": the nonce was not used");
+                byte[] pin = ins == VERIFY_INS ? TEST_PIN : NEW_PIN;
+                assertEquals(SW_OK, sendSealed(ins, envelope(EPH[3], k.key, k.nonce, ins, clearFor(ins, k, pin))).getSW(), what + ": the nonce is still good");
+            }
+        }
+        openPinCard();
+        PinKey k = askPinKey();
+        assertEquals(SW_WRONG_LENGTH, sendSealed(VERIFY_INS, envelope(EPH[3], k.key, k.nonce, VERIFY_INS, new byte[] { 4 })).getSW(), "82 bytes open, and one byte of data is no PIN block");
+        assertEquals(3, tries());
+        assertFalse(nonceLive(), "the nonce was used by the opening");
+    }
+
+    @Test
+    @DisplayName("The data that opens from a sealed VERIFY_PIN or SET_PIN is exactly a nine-byte block: 1, 8, 10, 41 and 80 bytes are 6700 even where a good PIN block ends them (the longer ones take a second and a third block of keystream to open) at no cost in tries, with the PIN as it was and the nonce used")
+    void testTheClearDataOfAPinCommandIsNineBytes() throws Exception {
+        for (int ins : new int[] { VERIFY_INS, SET_INS }) {
+            for (int len : new int[] { 1, 8, 10, 41, 80 }) {
+                String what = String.format("%02X with %d bytes of clear data", ins, len);
+                openPinCard();
+                PinKey k = askPinKey();
+                // a good PIN block at the end of it, so that a card that read the last nine bytes and not the whole would take it
+                byte[] pin = ins == VERIFY_INS ? TEST_PIN : NEW_PIN;
+                byte[] clear = new byte[len];
+                Arrays.fill(clear, (byte) 0xEE);
+                System.arraycopy(pinBlock(pin), 0, clear, Math.max(0, len - 9), Math.min(9, len));
+                assertEquals(SW_WRONG_LENGTH, sendSealed(ins, envelope(EPH[4], k.key, k.nonce, ins, clear)).getSW(), what);
+                assertEquals(3, tries(), what + ": no try");
+                assertFalse(nonceLive(), what + ": the nonce is used");
+                assertEquals(SW_OK, verify(TEST_PIN), what + ": the PIN is as it was");
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("A PIN block whose length byte is not 4 to 8 (0, 3, 9, 255) is 6700, for all three commands, with nothing changed and no try cost; for VERIFY_PIN and SET_PIN the nonce is used by the opening, for CHANGE_PIN it is left for the proof")
+    void testAPinBlockOfTheWrongLengthIsRefused() throws Exception {
+        for (int ins : new int[] { VERIFY_INS, SET_INS, CHANGE_INS }) {
+            for (int length : new int[] { 0, 3, 9, 255 }) {
+                String what = String.format("%02X with a block of length %d", ins, length);
+                if (ins == CHANGE_INS) ownedPinCard(); else openPinCard();
+                PinKey k = askPinKey();
+                byte[] block = pinBlock(NEW_PIN);
+                block[0] = (byte) length;
+                byte[] clear;
+                if (ins == CHANGE_INS) {
+                    byte[] proof = ownerProof(L_PIN, OWNER, k.nonce, NEW_PIN);
+                    clear = concat(new byte[] { (byte) proof.length }, proof, block);
+                } else {
+                    clear = block;
+                }
+                java.util.Map<String, byte[]> before = persistent();
+                assertEquals(SW_WRONG_LENGTH, sendSealed(ins, envelope(EPH[4], k.key, k.nonce, ins, clear)).getSW(), what);
+                assertEquals(3, tries(), what + ": no try");
+                assertPersistent(before, what + ": nothing changed");
+                assertEquals(ins == CHANGE_INS, nonceLive(), what + ": the nonce");
+                assertEquals(SW_OK, verify(TEST_PIN), what + ": the PIN is as it was");
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("What follows the PIN in its block is not looked at: a block of 4, the PIN and four bytes that are not zeros verifies")
+    void testThePaddingOfThePinBlockIsNotLookedAt() throws Exception {
+        openPinCard();
+        PinKey k = askPinKey();
+        byte[] block = pinBlock(TEST_PIN);
+        Arrays.fill(block, 5, 9, (byte) 0xAA);
+        assertEquals(SW_OK, sendSealed(VERIFY_INS, envelope(EPH[5], k.key, k.nonce, VERIFY_INS, block)).getSW());
+        assertTrue(verified());
+    }
+
+    @Test
+    @DisplayName("Sealed SET_PIN on an open card sets the PIN (4, 5 and 8 bytes), the clear and the sealed VERIFY_PIN both take it and the old one is a wrong PIN; it ends the session, gives the tries back and unblocks a blocked card")
+    void testASealedSetPinOnAnOpenCardSetsThePin() throws Exception {
+        simulator = freshCard();
+        ownPinKey();
+        for (byte[] pin : new byte[][] { NEW_PIN, PIN5, PIN8, TEST_PIN }) {
+            String what = pin.length + "-byte PIN";
+            PinKey k = askPinKey();
+            assertEquals(SW_OK, sendSealed(SET_INS, envelope(EPH[0], k.key, k.nonce, SET_INS, pinBlock(pin))).getSW(), what);
+            assertEquals(1, info()[7], what + ": set");
+            assertEquals(3, tries(), what);
+            assertFalse(verified(), what + ": no session verified");
+            assertEquals(SW_OK, verify(pin), what + ": the clear VERIFY_PIN takes it");
+            assertTrue(verified());
+            k = askPinKey();
+            assertEquals(SW_OK, sendSealed(SET_INS, envelope(EPH[0], k.key, k.nonce, SET_INS, pinBlock(pin))).getSW(), what + ": again");
+            assertFalse(verified(), what + ": a new PIN has not been typed: the session that verified the old one is over");
+            simulator.reset(); reselect();
+            k = askPinKey();
+            assertEquals(SW_OK, sendSealed(VERIFY_INS, envelope(EPH[1], k.key, k.nonce, VERIFY_INS, pinBlock(pin))).getSW(), what + ": the sealed VERIFY_PIN takes it too");
+            simulator.reset(); reselect();
+            assertEquals(0x63C2, verify(pin[0] == WRONG_PIN[0] ? NEW_PIN : WRONG_PIN), what + ": and another is wrong");
+        }
+        // a blocked card
+        simulator.reset(); reselect();
+        assertEquals(SW_OK, verify(TEST_PIN), "(the tries back)");
+        assertEquals(0x63C2, verify(WRONG_PIN)); assertEquals(0x63C1, verify(WRONG_PIN)); assertEquals(SW_PIN_BLOCKED, verify(WRONG_PIN));
+        assertEquals(2, info()[7]);
+        PinKey k = askPinKey();
+        assertEquals(SW_OK, sendSealed(SET_INS, envelope(EPH[0], k.key, k.nonce, SET_INS, pinBlock(NEW_PIN))).getSW(), "an open card may be given a PIN again, sealed");
+        assertEquals(1, info()[7], "unblocked");
+        assertEquals(3, tries());
+        assertEquals(SW_OK, verify(NEW_PIN));
+    }
+
+    @Test
+    @DisplayName("Sealed SET_PIN is refused in the order locked (6986), owned (6A91), something unspent (6A8D), before the envelope is looked at: with a good envelope, with nothing of one and with no nonce asked at all, the nonce is as it was and the PIN is as it was")
+    void testASealedSetPinIsRefusedAsTheClearOneIsAndBeforeTheEnvelope() throws Exception {
+        // something unspent on an open card (no command can put it there: LOAD_PROOF wants an owner)
+        openPinCard();
+        setStatusOf(0, 1);
+        PinKey k = askPinKey();
+        byte[] good = envelope(EPH[0], k.key, k.nonce, SET_INS, pinBlock(NEW_PIN));
+        assertEquals(SW_CARD_IN_USE, sendSealed(SET_INS, good).getSW(), "unspent");
+        assertEquals(SW_CARD_IN_USE, sendSealed(SET_INS, new byte[90]).getSW(), "unspent, and nothing of an envelope");
+        assertTrue(nonceLive(), "the nonce was not used");
+        assertEquals(SW_OK, verify(TEST_PIN), "the PIN is as it was");
+        // owned, and unspent as well
+        ownedPinCard();
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, load(buildProof(KEYSET, 16, 1)).getSW());
+        reselect();
+        k = askPinKey();
+        good = envelope(EPH[0], k.key, k.nonce, SET_INS, pinBlock(NEW_PIN));
+        assertEquals(SW_OWNER_PROOF, sendSealed(SET_INS, good).getSW(), "owned, though something is unspent as well");
+        assertEquals(SW_OWNER_PROOF, sendSealed(SET_INS, new byte[90]).getSW(), "nothing of an envelope");
+        assertTrue(nonceLive());
+        simulator.reset(); reselect();
+        assertEquals(SW_OWNER_PROOF, sendSealed(SET_INS, good).getSW(), "no nonce at all");
+        // locked, and owned
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, lock());
+        simulator.reset(); reselect();
+        k = askPinKey();
+        good = envelope(EPH[0], k.key, k.nonce, SET_INS, pinBlock(NEW_PIN));
+        assertEquals(SW_NOT_ALLOWED, sendSealed(SET_INS, good).getSW(), "locked, and owned");
+        assertEquals(SW_NOT_ALLOWED, sendSealed(SET_INS, new byte[90]).getSW());
+        assertTrue(nonceLive());
+        assertEquals(SW_OK, verify(TEST_PIN), "the PIN is as it was");
+    }
+
+    @Test
+    @DisplayName("Sealed CHANGE_PIN by the owner: the proof is over the label, the P1 = 1 nonce and the PIN itself, and the data spans three blocks of keystream; it sets the PIN, ends the session, gives the tries back and unblocks a blocked card on which the old PIN is not given, and the old one is a wrong PIN")
+    void testASealedChangePinByTheOwnerSetsThePin() throws Exception {
+        for (byte[] pin : new byte[][] { NEW_PIN, PIN5, PIN8 }) {
+            String what = pin.length + "-byte PIN";
+            ownedPinCard();
+            assertEquals(SW_OK, verify(TEST_PIN), what);
+            assertEquals(SW_OK, load(buildProof(KEYSET, 16, 1)).getSW(), what + ": a funded card");
+            assertTrue(verified());
+            PinKey k = askPinKey();
+            byte[] clear = changeClear(k.nonce, pin);
+            assertTrue(clear.length > 64 && clear.length <= 96, what + ": three blocks of keystream: " + clear.length);
+            assertEquals(SW_OK, sendSealed(CHANGE_INS, envelope(EPH[0], k.key, k.nonce, CHANGE_INS, clear)).getSW(), what);
+            assertEquals(1, info()[7], what);
+            assertEquals(3, tries(), what);
+            assertFalse(verified(), what + ": the session that verified the old PIN is over");
+            assertFalse(nonceLive(), what + ": the proof used the nonce up");
+            assertEquals(SW_SECURITY_NOT_SATIS, spend(0).getSW(), what);
+            simulator.reset(); reselect();
+            assertEquals(0x63C2, verify(TEST_PIN), what + ": the old PIN is wrong");
+            assertEquals(SW_OK, verify(pin), what + ": the new one is right");
+            assertEquals(SW_OK, spend(0).getSW(), what);
+        }
+        // a blocked card
+        ownedPinCard();
+        assertEquals(0x63C2, verify(WRONG_PIN)); assertEquals(0x63C1, verify(WRONG_PIN)); assertEquals(SW_PIN_BLOCKED, verify(WRONG_PIN));
+        assertEquals(2, info()[7]);
+        PinKey k = askPinKey();
+        assertEquals(SW_OK, sendSealed(CHANGE_INS, envelope(EPH[0], k.key, k.nonce, CHANGE_INS, changeClear(k.nonce, NEW_PIN))).getSW());
+        assertEquals(1, info()[7], "unblocked");
+        assertEquals(3, tries());
+        assertEquals(SW_OK, verify(NEW_PIN));
+    }
+
+    @Test
+    @DisplayName("Sealed CHANGE_PIN with a proof over the PIN block instead of the PIN, with a wrong key's proof, or with a proof for another nonce is 6A91 and changes nothing; the nonce is used up whichever it was, a second CHANGE_PIN under it is 6985, and an envelope that does not open is 6A80 with the nonce gone")
+    void testASealedChangePinWithABadProofIsRefused() throws Exception {
+        ownedPinCard();
+        PinKey k = askPinKey();
+        byte[] overBlock = ownerProof(L_PIN, OWNER, k.nonce, pinBlock(NEW_PIN));
+        java.util.Map<String, byte[]> before = persistent();
+        assertEquals(SW_OWNER_PROOF, sendSealed(CHANGE_INS, envelope(EPH[0], k.key, k.nonce, CHANGE_INS,
+            concat(new byte[] { (byte) overBlock.length }, overBlock, pinBlock(NEW_PIN)))).getSW(), "a proof over the block");
+        assertPersistent(before, "and nothing changed");
+        assertFalse(nonceLive(), "the proof was tried and the nonce is used");
+        assertEquals(SW_OK, verify(TEST_PIN), "the PIN is as it was");
+        // another key's proof, and another label's
+        k = askPinKey();
+        byte[] other = OTHER_OWNER.sign(concat(L_PIN.getBytes(StandardCharsets.US_ASCII), k.nonce, NEW_PIN));
+        assertEquals(SW_OWNER_PROOF, sendSealed(CHANGE_INS, envelope(EPH[0], k.key, k.nonce, CHANGE_INS,
+            concat(new byte[] { (byte) other.length }, other, pinBlock(NEW_PIN)))).getSW(), "another phone's proof");
+        k = askPinKey();
+        byte[] label = ownerProof(L_LIMIT, OWNER, k.nonce, NEW_PIN);
+        assertEquals(SW_OWNER_PROOF, sendSealed(CHANGE_INS, envelope(EPH[0], k.key, k.nonce, CHANGE_INS,
+            concat(new byte[] { (byte) label.length }, label, pinBlock(NEW_PIN)))).getSW(), "another command's proof");
+        PinKey old = askPinKey();
+        k = askPinKey();
+        assertEquals(0x63C2, sendSealed(VERIFY_INS, envelope(EPH[0], k.key, k.nonce, VERIFY_INS, pinBlock(WRONG_PIN))).getSW(), "(a try gone, to be given back)");
+        k = askPinKey();
+        byte[] forOld = ownerProof(L_PIN, OWNER, old.nonce, NEW_PIN);
+        assertEquals(SW_OWNER_PROOF, sendSealed(CHANGE_INS, envelope(EPH[0], k.key, k.nonce, CHANGE_INS,
+            concat(new byte[] { (byte) forOld.length }, forOld, pinBlock(NEW_PIN)))).getSW(), "a proof for an earlier nonce");
+        assertEquals(2, tries(), "no try cost by any of them");
+        assertEquals(SW_OK, verify(TEST_PIN));
+        // good once, then 6985
+        k = askPinKey();
+        byte[] env = envelope(EPH[0], k.key, k.nonce, CHANGE_INS, changeClear(k.nonce, NEW_PIN));
+        assertEquals(SW_OK, sendSealed(CHANGE_INS, env).getSW());
+        assertEquals(SW_CONDITIONS_NOT_SATIS, sendSealed(CHANGE_INS, env).getSW(), "a second CHANGE_PIN under the nonce is 6985");
+        assertEquals(SW_OK, verify(NEW_PIN));
+        // an envelope that does not open
+        k = askPinKey();
+        assertEquals(SW_WRONG_DATA, sendSealed(CHANGE_INS, spoiled(envelope(EPH[0], k.key, k.nonce, CHANGE_INS, changeClear(k.nonce, TEST_PIN)), "tag")).getSW());
+        assertFalse(nonceLive(), "and the nonce is gone");
+        assertEquals(SW_OWNER_PROOF, sw(changePinCommand(ownerProof(L_PIN, OWNER, k.nonce, TEST_PIN), TEST_PIN)), "for the clear form's proof as well");
+    }
+
+    @Test
+    @DisplayName("The clear forms of VERIFY_PIN, SET_PIN and CHANGE_PIN with P1 = 0 are untouched by the sealed ones: each is sent after a sealed command on the same card and does what it did, and the clear form of CHANGE_PIN works under a P1 = 1 nonce")
+    void testTheClearFormsStillWork() throws Exception {
+        ownedPinCard();
+        PinKey k = askPinKey();
+        assertEquals(SW_OK, sendSealed(VERIFY_INS, envelope(EPH[0], k.key, k.nonce, VERIFY_INS, pinBlock(TEST_PIN))).getSW());
+        assertEquals(SW_OK, verify(TEST_PIN), "clear VERIFY_PIN");
+        assertEquals(0x63C2, verify(WRONG_PIN), "and clear, wrong");
+        k = askPinKey();
+        assertEquals(SW_OK, sw(changePinCommand(ownerProof(L_PIN, OWNER, k.nonce, NEW_PIN), NEW_PIN)), "clear CHANGE_PIN under a P1 = 1 nonce");
+        assertEquals(SW_OK, verify(NEW_PIN));
+        assertEquals(SW_OWNER_PROOF, setPin(TEST_PIN), "clear SET_PIN on an owned card");
+        openPinCard();
+        assertEquals(SW_OK, setPin(NEW_PIN), "clear SET_PIN on an open card");
+        assertEquals(SW_OK, verify(NEW_PIN));
+    }
+
+    @Test
+    @DisplayName("A P1 other than 0 or 1 (2, 0x80, 0xFF) on VERIFY_PIN, SET_PIN, CHANGE_PIN and GET_NONCE is 6A86, before anything else is looked at: on a card with no PIN, no owner, a locked card, a blocked one; nothing changes, no try is cost and the nonce is as it was")
+    void testAnyOtherP1IsRefusedBeforeAnythingIsLooked() throws Exception {
+        int[] inses = { VERIFY_INS, SET_INS, CHANGE_INS, INS_GET_NONCE & 0xFF };
+        for (int variant = 0; variant < 3; variant++) {
+            String state;
+            if (variant == 0) { simulator = freshCard(); state = "no PIN, no owner"; }
+            else if (variant == 1) { ownedPinCard(); askPinKey(); state = "an owner, a PIN, a nonce live"; }
+            else {
+                ownedPinCard();
+                assertEquals(SW_OK, verify(TEST_PIN));
+                assertEquals(SW_OK, lock());
+                simulator.reset(); reselect();
+                assertEquals(0x63C2, verify(WRONG_PIN)); assertEquals(0x63C1, verify(WRONG_PIN)); assertEquals(SW_PIN_BLOCKED, verify(WRONG_PIN));
+                askPinKey();
+                state = "locked and blocked, a nonce live";
+            }
+            for (int ins : inses) {
+                for (int p1 : new int[] { 2, 0x80, 0xFF }) {
+                    String what = String.format("%s, INS %02X, P1 %02X", state, ins, p1);
+                    java.util.Map<String, byte[]> before = persistent();
+                    byte[] nonceBefore = field("ownerNonce").clone(), liveBefore = field("nonceLive").clone(), verifiedBefore = field("pinVerifiedFlag").clone();
+                    int triesBefore = tries();
+                    ResponseAPDU r = transmit(ins == (INS_GET_NONCE & 0xFF) ? new CommandAPDU(CLA, ins, p1, 0, 256) : new CommandAPDU(CLA, ins, p1, 0, new byte[90]));
+                    assertEquals(SW_INCORRECT_P1P2, r.getSW(), what);
+                    assertEquals(0, r.getData().length, what);
+                    assertPersistent(before, what);
+                    assertArrayEquals(nonceBefore, field("ownerNonce"), what + ": the nonce");
+                    assertArrayEquals(liveBefore, field("nonceLive"), what + ": and whether it is live");
+                    assertArrayEquals(verifiedBefore, field("pinVerifiedFlag"), what + ": and the session");
+                    assertEquals(triesBefore, tries(), what + ": no try");
+                }
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("The PIN key and its signature survive the card leaving the field and are the same after it (the nonce is new); pinKeySig is persistent and the working room of a sealed command is RAM that holds the shared secret until the card is deselected")
+    void testThePinKeyAndItsSignatureSurviveAReset() throws Exception {
+        openPinCard();
+        PinKey a = askPinKey();
+        simulator.reset(); reselect();
+        PinKey b = askPinKey();
+        assertArrayEquals(a.key, b.key);
+        assertArrayEquals(a.sig, b.sig);
+        assertFalse(Arrays.equals(a.nonce, b.nonce));
+        assertEquals(1, field("pinKeySig")[0]);
+        assertEquals(SW_OK, sendSealed(VERIFY_INS, envelope(EPH[0], b.key, b.nonce, VERIFY_INS, pinBlock(TEST_PIN))).getSW());
+        assertFalse(isAllZeros(field("seal")), "after a sealed command the shared secret and the last block are in RAM");
+        reselect();
+        assertTrue(isAllZeros(field("seal")), "and a SELECT clears them");
+        PinKey c = askPinKey();
+        assertArrayEquals(a.sig, c.sig, "and the signature is still the first one");
+        String code = appletCode();
+        String flat = code.replaceAll("\\s+", " ");
+        assertTrue(flat.contains("pinKeySig = new byte[(short) 65];"), "pinKeySig is a persistent array");
+        assertTrue(flat.contains("seal = JCSystem.makeTransientByteArray(S_LEN, JCSystem.CLEAR_ON_DESELECT);"), "and seal is a transient one");
+        assertTrue(flat.contains("pinKeyPair = new KeyPair(KeyPair.ALG_EC_FP, KeyBuilder.LENGTH_EC_FP_256);"), "the PIN key is a KeyPair made of its own");
+    }
+
+    /** The APDU buffer as the applet left it: the command as it came, and what the card did to it. */
+    private byte[] leftInTheBuffer(int length) {
+        return Arrays.copyOf(runtime.getCurrentAPDU().getBuffer(), length);
+    }
+
+    @Test
+    @DisplayName("The clear text of a sealed command arrives at OFFSET_CDATA whole, whatever its length (1, 9, 32, 33, 64, 65 and 81 bytes, either side of the 65 that E takes and of the 32 of a block), and nothing past its end is written: the buffer is the command as it came, with the clear text where the ciphertext was, and that moved down over the start of E, byte for byte")
+    void testTheClearTextArrivesAtTheDataWholeAndNothingIsWrittenPastIt() throws Exception {
+        for (int n : new int[] { 1, 9, 32, 33, 64, 65, 81 }) {
+            String what = n + " bytes of clear text";
+            openPinCard();
+            PinKey k = askPinKey();
+            byte[] clear = new byte[n];
+            for (int i = 0; i < n; i++) clear[i] = (byte) (0x41 + i);
+            if (n == 9) clear[0] = 0;       // a block of length 0, which unblockPin refuses before it moves anything
+            byte[] env = envelope(EPH[1], k.key, k.nonce, VERIFY_INS, clear);
+            assertEquals(SW_WRONG_LENGTH, sendSealed(VERIFY_INS, env).getSW(), what + ": opened, and refused for its length");
+            byte[] want = concat(new byte[] { CLA, (byte) VERIFY_INS, 1, 0, (byte) env.length }, Arrays.copyOfRange(env, 0, 65), clear, Arrays.copyOfRange(env, env.length - 16, env.length));
+            for (int i = 0; i < n; i++) want[5 + i] = want[5 + 65 + i];
+            assertArrayEquals(want, leftInTheBuffer(want.length), what + ": exactly n bytes moved, from the ciphertext's place to the data's, and the rest as it was");
+            assertArrayEquals(clear, Arrays.copyOfRange(leftInTheBuffer(5 + n), 5, 5 + n), what + ": and the clear text is at OFFSET_CDATA");
+        }
+    }
+
+    @Test
+    @DisplayName("unblockPin moves exactly the PIN (4 to 8 bytes) down over its length byte and touches nothing else: after a sealed CHANGE_PIN the buffer is the clear text with the PIN one byte down, byte for byte, and the owner's proof before the block verified")
+    void testUnblockPinLeavesEverythingBeforeTheBlockAlone() throws Exception {
+        byte[][] pins = { TEST_PIN, PIN5, { 0x31, 0x32, 0x33, 0x34, 0x35, 0x36 }, { 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37 }, PIN8 };
+        for (byte[] pin : pins) {
+            String what = pin.length + "-byte PIN";
+            ownedPinCard();
+            PinKey k = askPinKey();
+            byte[] clear = changeClear(k.nonce, pin);
+            byte[] env = envelope(EPH[1], k.key, k.nonce, CHANGE_INS, clear);
+            assertEquals(SW_OK, sendSealed(CHANGE_INS, env).getSW(), what + ": the proof, before the block, is as it was sent");
+            byte[] want = concat(new byte[] { CLA, (byte) CHANGE_INS, 1, 0, (byte) env.length }, Arrays.copyOfRange(env, 0, 65), clear, Arrays.copyOfRange(env, env.length - 16, env.length));
+            for (int i = 0; i < clear.length; i++) want[5 + i] = want[5 + 65 + i];
+            int block = 5 + clear.length - 9;
+            for (int i = 0; i < pin.length; i++) want[block + i] = want[block + 1 + i];
+            assertArrayEquals(want, leftInTheBuffer(want.length), what + ": the PIN moved down one byte, and nothing past it");
+            assertArrayEquals(pin, Arrays.copyOfRange(leftInTheBuffer(block + pin.length), block, block + pin.length), what);
+            assertEquals(SW_OK, verify(pin) , what + ": and it is the PIN");
+        }
+    }
+
+    @Test
+    @DisplayName("GET_NONCE with P1 = 1 compresses the PIN key in the sealing room and copies it from there: the answer is the nonce, then the key at byte 16, then the signature; the room holds the key and nothing an opening trips over (its first byte is 02 or 03, not the 04 an opening looks for), and a command sealed straight after opens, as does one after a failed opening")
+    void testTheKeyAskedForLeavesNothingInTheSealingRoomThatAnOpeningTripsOver() throws Exception {
+        openPinCard();
+        PinKey k = askPinKey();
+        assertArrayEquals(concat(k.nonce, k.key, k.sig), k.all, "nonce || key || signature");
+        assertArrayEquals(Arrays.copyOfRange(k.all, 16, 49), k.key, "the key is at 16");
+        assertArrayEquals(k.key, Arrays.copyOf(field("seal"), 33), "and was compressed in the room");
+        assertTrue(field("seal")[0] == 2 || field("seal")[0] == 3, "which leaves 02 or 03 where the shared point's 04 is looked for");
+        assertEquals(SW_OK, sendSealed(VERIFY_INS, envelope(EPH[0], k.key, k.nonce, VERIFY_INS, pinBlock(TEST_PIN))).getSW(), "a command sealed straight after opens");
+        k = askPinKey();
+        assertEquals(0x63C2, sendSealed(VERIFY_INS, spoiled(envelope(EPH[0], k.key, k.nonce, VERIFY_INS, pinBlock(TEST_PIN)), "point")).getSW(), "a point that is no point, straight after the key was asked, does not open");
+        k = askPinKey();
+        assertEquals(SW_OK, sendSealed(VERIFY_INS, envelope(EPH[0], k.key, k.nonce, VERIFY_INS, pinBlock(TEST_PIN))).getSW(), "and the asking and the sealing after a failed opening are as before");
+        assertEquals(3, tries());
+    }
+
+    @Test
+    @DisplayName("The sealed path in the source: the length, then the nonce (spent where the caller says so, refused where it is not live), then the tag against block 0 before anything is opened, and a failed opening uses the nonce up and returns -1 before the first XOR; the keystream counter begins at 1 and the tag block is 0; the sum has the label, the counter, the shared x, E, the nonce and the instruction; the three callers; GET_NONCE's two forms")
+    void testTheSealedPathIsInTheSourceWhatItsDescriptionSays() throws Exception {
+        String code = appletCode();
+        assertEquals(16, CashuApplet.SEAL_TAG_LEN);
+        assertEquals(9, CashuApplet.PIN_BLOCK_LEN);
+        assertEquals(113, CashuApplet.PIN_KEY_ANSWER);
+        // ---- unseal
+        String u = body(code, "private short unseal(", "private static void moveDown(").replaceAll("\\s+", " ");
+        int[] at = new int[14];
+        String[] steps = {
+            "if (len < (short)(EC_POINT_LEN + 1 + SEAL_TAG_LEN)) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);",
+            "boolean live = nonceLive[0] == (byte) 1;",
+            "if (spend) nonceLive[0] = (byte) 0;",
+            "if (!live) ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);",
+            "seal[S_INS] = buf[ISO7816.OFFSET_INS];",
+            "if (buf[e] == (byte) 0x04) {",
+            "pinEcdh.init(pinPrivKey);",
+            "short got = pinEcdh.generateSecret(buf, e, EC_POINT_LEN, seal, S_POINT);",
+            "sealBlock(buf, e, (byte) 0, buf, ct, n);",
+            "good = sameBytes(seal, S_HASH, buf, tag, SEAL_TAG_LEN);",
+            "if (!good) { nonceLive[0] = (byte) 0; return (short) -1; }",
+            "short i = 1;",
+            "buf[(short)(ct + at + k)] ^= seal[(short)(S_HASH + k)];",
+            "moveDown(buf, ct, e, n);" };
+        int from = 0;
+        for (int s = 0; s < steps.length; s++) {
+            at[s] = u.indexOf(steps[s], from);
+            assertTrue(at[s] >= 0, "unseal has, in this order: " + steps[s]);
+            from = at[s];
+        }
+        assertEquals(1, count(u, "^="), "one XOR in all, after the tag is checked");
+        assertTrue(u.contains("} catch (RuntimeException x) { good = false; } if (!good) {"), "whatever the key agreement throws, the envelope does not open, and the very next thing is the test of whether it did");
+        assertFalse(u.contains("CryptoException"), "the catch is not narrowed to one platform's exception");
+        assertEquals(3, java.util.regex.Pattern.compile("\\bgood\\s*=").matcher(u).results().count(), "good is set three times: false to begin with, false in the catch, and by the tag's comparison");
+        assertFalse(u.contains("good = true"), "and never to true but by the comparison of the tag");
+        assertTrue(u.contains("good = sameBytes(seal, S_HASH, buf, tag, SEAL_TAG_LEN);"), "which is the one place it takes another value");
+        assertEquals(0, count(u, "arrayCopy"), "unseal moves its clear text with moveDown and nothing else");
+        assertTrue(u.contains("if (got == EC_POINT_LEN && seal[S_POINT] == (byte) 0x04) {"), "and so is an answer that is not a point");
+        assertTrue(u.contains("sealBlock(buf, e, (byte) i, buf, (short) 0, (short) 0);"), "the keystream block i, with nothing more");
+        assertTrue(u.contains("for (short at = 0; at < n; at += (short) 32) {") && u.contains("k < (short) 32 && (short)(at + k) < n"), "thirty-two bytes a block, to the end of the data");
+        assertTrue(u.contains("short n = (short)(len - EC_POINT_LEN - SEAL_TAG_LEN);") && u.contains("short ct = (short)(e + EC_POINT_LEN);") && u.contains("short tag = (short)(ct + n);"), "E, the data, the tag");
+        assertEquals(1, count(u, "i++"), "the counter goes up by one a block");
+        // ---- the sum
+        String b = body(code, "private void sealBlock(", "private short unblockPin(").replaceAll("\\s+", " ");
+        String[] sum = { "seal[S_I] = i;", "sha.reset();", "sha.update(SEAL_LABEL, (short) 0, (short) SEAL_LABEL.length);", "sha.update(seal, S_I, (short) 1);",
+            "sha.update(seal, (short)(S_POINT + 1), (short) 32);", "sha.update(buf, e, EC_POINT_LEN);", "sha.update(ownerNonce, (short) 0, OWNER_NONCE_LEN);",
+            "sha.update(seal, S_INS, (short) 1);", "sha.doFinal(more, moreAt, moreLen, seal, S_HASH);" };
+        from = 0;
+        for (String s : sum) {
+            int found = b.indexOf(s, from);
+            assertTrue(found >= 0, "the sum, in this order: " + s);
+            from = found;
+        }
+        assertTrue(code.contains("S_POINT = (short) 0;") && code.contains("S_HASH  = (short) 65;"), "the shared point first, 04 || x || y, and the block after its 65 bytes");
+        // ---- the block
+        String ub = body(code, "private short unblockPin(", "private void processAllowLoad(").replaceAll("\\s+", " ");
+        assertTrue(ub.contains("if (len < PIN_BLOCK_LEN) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);") && ub.contains("short block = (short)(ISO7816.OFFSET_CDATA + len - PIN_BLOCK_LEN);")
+            && ub.contains("short pinLen = (short)(buf[block] & 0xFF);") && ub.contains("if (pinLen < PIN_MIN_LEN || pinLen > PIN_MAX_LEN) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);")
+            && ub.contains("moveDown(buf, (short)(block + 1), block, pinLen);") && ub.contains("return (short)(len - PIN_BLOCK_LEN + pinLen);"),
+            "the block is the last nine bytes, its length is 4 to 8, and the PIN is moved down over it");
+        assertEquals(0, count(ub, "arrayCopy"), "unblockPin moves the PIN with moveDown too");
+        String md = body(code, "private static void moveDown(", "private void sealBlock(").replaceAll("\\s+", " ");
+        assertTrue(md.contains("for (short k = 0; k < len; k++) { buf[(short)(to + k)] = buf[(short)(from + k)]; }"), "moveDown: len bytes, from the front, from + k to to + k");
+        assertEquals(1, count(md, "for ("), "one loop");
+        assertEquals(3, count(code, "moveDown("), "its declaration and its two callers");
+        assertTrue(code.contains("moveDown(buf, ct, e, n);") && code.contains("moveDown(buf, (short)(block + 1), block, pinLen);"), "the clear text down over E, and the PIN down over its length byte");
+        // ---- who calls it
+        assertEquals(4, count(code, "unseal("), "its declaration and three callers");
+        assertEquals(2, count(code, "unseal(buf, pinLen, true)"), "VERIFY_PIN and SET_PIN spend the nonce");
+        assertEquals(1, count(code, "unseal(buf, dataLen, false)"), "CHANGE_PIN leaves it for the proof");
+        assertEquals(2, count(code, "nonceLive[0] = (byte) 1;"), "the nonce is made live by GET_NONCE's two forms and nowhere else");
+        assertEquals(3, count(code, "nonceLive[0] = (byte) 0;"), "and used up by unseal (twice) and by the owner's proof");
+        // ---- VERIFY_PIN, SET_PIN, CHANGE_PIN
+        String v = body(code, "private void processVerifyPin(", "private void failPinCheck(").replaceAll("\\s+", " ");
+        String[] verify = { "boolean sealed = sealedForm(buf);", "if (pinState[0] == (byte) 0) ISOException.throwIt(SW_PIN_NOT_SET);", "if (pin.getTriesRemaining() == 0) ISOException.throwIt(SW_PIN_BLOCKED);",
+            "short pinLen = apdu.setIncomingAndReceive();", "pinLen = unseal(buf, pinLen, true);", "if (pinLen < 0) {", "rng.generateData(seal, S_HASH, (short) 8);",
+            "pin.check(seal, S_HASH, (byte) 8);", "failPinCheck();", "if (pinLen != PIN_BLOCK_LEN) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);", "pinLen = unblockPin(buf, pinLen);",
+            "if (pinLen < PIN_MIN_LEN || pinLen > PIN_MAX_LEN) {", "boolean ok = pin.check(buf, ISO7816.OFFSET_CDATA, (byte) pinLen);", "if (!ok) failPinCheck();", "pinVerifiedFlag[0] = (byte) 1;" };
+        from = 0;
+        for (String s : verify) {
+            int found = v.indexOf(s, from);
+            assertTrue(found >= 0, "VERIFY_PIN, in this order: " + s);
+            from = found;
+        }
+        String sp = body(code, "private void processSetPin(", "private void processChangePin(").replaceAll("\\s+", " ");
+        String[] set = { "boolean sealed = sealedForm(buf);", "requireNotLocked();", "if (ownerSet[0] == (byte) 1) ISOException.throwIt(SW_OWNER_PROOF);", "requireNothingUnspent();",
+            "short pinLen = apdu.setIncomingAndReceive();", "pinLen = unseal(buf, pinLen, true);", "if (pinLen < 0) ISOException.throwIt(ISO7816.SW_WRONG_DATA);",
+            "if (pinLen != PIN_BLOCK_LEN) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);", "pinLen = unblockPin(buf, pinLen);", "pin.update(buf, ISO7816.OFFSET_CDATA, (byte) pinLen);" };
+        from = 0;
+        for (String s : set) {
+            int found = sp.indexOf(s, from);
+            assertTrue(found >= 0, "SET_PIN, in this order: " + s);
+            from = found;
+        }
+        String ch = body(code, "private void processChangePin(", "private void processSetOwner(").replaceAll("\\s+", " ");
+        String[] change = { "boolean sealed = sealedForm(buf);", "requireNotLocked();", "if (ownerSet[0] != (byte) 1) ISOException.throwIt(SW_NO_OWNER);",
+            "short dataLen = apdu.setIncomingAndReceive();", "dataLen = unseal(buf, dataLen, false);", "if (dataLen < 0) ISOException.throwIt(ISO7816.SW_WRONG_DATA);",
+            "dataLen = unblockPin(buf, dataLen);", "short at = requireOwnerProof(LABEL_CHANGE_PIN, buf, dataLen);", "pin.update(buf, at, (byte) newLen);" };
+        from = 0;
+        for (String s : change) {
+            int found = ch.indexOf(s, from);
+            assertTrue(found >= 0, "CHANGE_PIN, in this order: " + s);
+            from = found;
+        }
+        String sf = body(code, "private static boolean sealedForm(", "private short unseal(").replaceAll("\\s+", " ");
+        assertTrue(sf.contains("byte p1 = buf[ISO7816.OFFSET_P1];") && sf.contains("if (p1 != (byte) 0 && p1 != (byte) 1) ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);") && sf.contains("return p1 == (byte) 1;"),
+            "P1 is 0 or 1 and 1 is sealed");
+        // ---- GET_NONCE
+        String n = body(code, "private void processGetNonce(", "private void processGetPinKey(").replaceAll("\\s+", " ");
+        int one = n.indexOf("if (buf[ISO7816.OFFSET_P1] == (byte) 1) { processGetPinKey(apdu); return; }");
+        int other = n.indexOf("if (buf[ISO7816.OFFSET_P1] != (byte) 0) ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);");
+        int owner = n.indexOf("if (ownerSet[0] != (byte) 1) ISOException.throwIt(SW_NO_OWNER);");
+        assertTrue(one >= 0 && one < other && other < owner, "GET_NONCE: P1 = 1 is the PIN key's, any other but 0 is refused, then P1 = 0 wants an owner");
+        String pk = body(code, "private void processGetPinKey(", "private static boolean sealedForm(").replaceAll("\\s+", " ");
+        assertTrue(pk.contains("short len = toCompressed(seal, pinPubKey.getW(seal, (short) 0));") && pk.contains("Util.arrayCopyNonAtomic(seal, (short) 0, buf, at, len);"), "the key is the PIN key's public half, compressed in the sealing room and copied from it into the answer");
+        assertFalse(pk.contains("Util.arrayCopyNonAtomic(buf, (short) 0, buf, at"), "and no copy overlaps itself");
+        assertTrue(pk.contains("schnorrHW.sign(cardPrivKey, cardPubKey, scratch, X_MSG, buf, sigAt)"), "signed by the card key");
+        assertTrue(pk.contains("sha.update(PINKEY_LABEL, (short) 0, (short) PINKEY_LABEL.length); sha.doFinal(buf, at, len, scratch, X_MSG);"), "over the label and the key");
+        assertTrue(pk.indexOf("pinKeySig[0] != (byte) 1") < pk.indexOf("schnorrHW.sign") && pk.indexOf("pinKeySig[0] = (byte) 1;") > pk.indexOf("JCSystem.beginTransaction();")
+            && pk.indexOf("pinKeySig[0] = (byte) 1;") < pk.indexOf("JCSystem.commitTransaction();"), "signed once, and kept in a transaction");
+        assertTrue(pk.indexOf("rng.generateData(ownerNonce, (short) 0, OWNER_NONCE_LEN);") < pk.indexOf("nonceLive[0] = (byte) 1;") && pk.indexOf("nonceLive[0] = (byte) 1;") < pk.indexOf("apdu.setOutgoingAndSend((short) 0, (short)(sigAt + 64));"),
+            "the nonce is made, made live, and then answered");
+        // ---- the PIN key
+        String init = body(code, "private void initPinKey(", "private static ECPublicKey newP256Key(").replaceAll("\\s+", " ");
+        assertTrue(init.contains("pinKeyPair = new KeyPair(KeyPair.ALG_EC_FP, KeyBuilder.LENGTH_EC_FP_256);") && init.contains("pinPrivKey = (ECPrivateKey) pinKeyPair.getPrivate();")
+            && init.contains("pinPubKey = (ECPublicKey) pinKeyPair.getPublic();") && init.contains("setSecp256k1Params(pinPubKey, pinPrivKey);") && init.contains("pinKeyPair.genKeyPair();")
+            && init.contains("pinEcdh = KeyAgreement.getInstance(KeyAgreement.ALG_EC_SVDP_DH_PLAIN_XY, false);"), "a key pair of its own on secp256k1, and a plain key agreement");
+        assertFalse(init.contains("cardKeyPair") || init.contains("cardPrivKey") || init.contains("cardPubKey"), "made of nothing the card key is");
+        assertEquals(1, count(code, "pinEcdh.init("), "the agreement is initialised with the PIN key's private half, in unseal and nowhere else");
+        assertFalse(code.contains("pinEcdh.init(cardPrivKey)"));
+    }
+
     // ---- the transcript ------------------------------------------------------
 
     /** One command, written down with what it answered, and checked against what it was meant to answer. */
@@ -7158,6 +8114,36 @@ class CashuAppletTest {
         return say(out, "GET_NONCE", "nonce", SW_OK, new CommandAPDU(CLA, INS_GET_NONCE, 0, 0, 16)).getData();
     }
 
+    /** GET_NONCE with P1 = 1, written down as `pinkey`: 113 bytes, the nonce, the PIN key and the card key's signature over it. */
+    private PinKey sayPinKey(StringBuilder out, String name) {
+        ResponseAPDU r = say(out, name, "pinkey", SW_OK, new CommandAPDU(CLA, INS_GET_NONCE, 1, 0, 256));
+        assertEquals(113, r.getData().length, name);
+        return splitPinKey(r.getData());
+    }
+
+    /** The envelope of the last sealed command said. */
+    private byte[] lastEnvelope;
+
+    /**
+     * A sealed VERIFY_PIN, SET_PIN or CHANGE_PIN, written down as `sealed`: `apdu` is what the card was sent, and `clear` is the data that
+     * was sealed, which a model seals for itself, under the nonce of the `pinkey` entry before it. `spoil` is what is done to the envelope
+     * once it is sealed ("" nothing, "tag" the last byte of the tag XOR 01, "body" the first byte of the ciphertext XOR 01), and `forIns`
+     * (-1 for none) is the instruction it was sealed for, where that is not its own.
+     */
+    private ResponseAPDU saySealed(StringBuilder out, String name, int ins, int expected, PinKey k, int eph, byte[] clear, String spoil, int forIns) {
+        byte[] env = spoiled(envelope(EPH[eph], k.key, k.nonce, forIns >= 0 ? forIns : ins, clear), spoil);
+        lastEnvelope = env;
+        CommandAPDU cmd = new CommandAPDU(CLA, ins, 1, 0, env);
+        ResponseAPDU r = transmit(cmd);
+        assertEquals(expected, r.getSW(), name);
+        out.append("  {\"name\": ").append(jsonString(name)).append(", \"kind\": \"sealed\", \"apdu\": \"").append(toHex(cmd.getBytes()))
+           .append("\", \"sw\": \"").append(String.format("%04x", r.getSW())).append("\", \"data\": \"").append(toHex(r.getData()))
+           .append("\", \"clear\": \"").append(toHex(clear)).append("\", \"spoil\": \"").append(spoil).append("\"");
+        if (forIns >= 0) out.append(", \"for\": \"").append(String.format("%02x", forIns)).append("\"");
+        out.append("},\n");
+        return r;
+    }
+
     /** A nonce, a proof by `key` over `value` under `label`, and the command built with it. */
     private ResponseAPDU owner(StringBuilder out, String name, int expected, String label, Key key, byte[] value,
                                java.util.function.Function<byte[], CommandAPDU> build) {
@@ -7186,6 +8172,7 @@ class CashuAppletTest {
     @Test
     @DisplayName("A conversation with the card, as a transcript for a model of it to be held to")
     void testWriteTranscript() throws Exception {
+        ownPinKey();    // a chip's PIN key is not its signing key; jCardSim's, left alone, has the same value
         StringBuilder out = new StringBuilder("[\n");
         byte[] badRefund = REFUND.clone(); badRefund[0] = 0x04;
         byte[] compressedKey = SIGNER.pub.clone(); compressedKey[0] = 0x02;
@@ -7212,6 +8199,52 @@ class CashuAppletTest {
         say(out, "a PIN of the wrong length", "exact", SW_WRONG_LENGTH, new CommandAPDU(CLA, INS_SET_PIN, 0, 0, new byte[] { 1, 2, 3 }));
         say(out, "SET_PIN", "exact", SW_OK, new CommandAPDU(CLA, INS_SET_PIN, 0, 0, NEW_PIN));
         say(out, "SET_PIN again: an open card has nobody's PIN to protect", "exact", SW_OK, new CommandAPDU(CLA, INS_SET_PIN, 0, 0, TEST_PIN));
+
+        /* 1.9: the PIN, sealed. The card is open (no owner, nothing on it) and has TEST_PIN. A sealed command's data is E (65) || the data under
+         * a keystream || a tag (16), under the nonce of the last GET_NONCE with P1 = 1, which is good once. */
+        say(out, "GET_NONCE with P1 = 2 is refused", "exact", SW_INCORRECT_P1P2, new CommandAPDU(CLA, INS_GET_NONCE, 2, 0, 256));
+        sayPinKey(out, "GET_NONCE with P1 = 1: a nonce, the PIN key and the card key's signature over it, with no owner and no PIN given");
+        PinKey sk = sayPinKey(out, "asked again: a new nonce, and the same key and signature");
+        saySealed(out, "SET_PIN sealed on an open card: the new PIN as a PIN block, under the second nonce", INS_SET_PIN, SW_OK, sk, 0, pinBlock(NEW_PIN), "", -1);
+        say(out, "the clear VERIFY_PIN takes the new PIN", "exact", SW_OK, new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, NEW_PIN));
+        sk = sayPinKey(out, "a nonce for VERIFY_PIN");
+        saySealed(out, "VERIFY_PIN sealed, the right PIN", INS_VERIFY_PIN, SW_OK, sk, 1, pinBlock(NEW_PIN), "", -1);
+        say(out, "the same envelope again: its nonce is spent", "exact", SW_CONDITIONS_NOT_SATIS, new CommandAPDU(CLA, INS_VERIFY_PIN, 1, 0, lastEnvelope));
+        sk = sayPinKey(out, "a nonce for a wrong PIN");
+        saySealed(out, "VERIFY_PIN sealed, a wrong PIN: a try gone", INS_VERIFY_PIN, 0x63C2, sk, 1, pinBlock(WRONG_PIN), "", -1);
+        sk = sayPinKey(out, "a nonce for an envelope with its tag spoiled");
+        saySealed(out, "VERIFY_PIN sealed, the last byte of the tag changed: a wrong PIN as far as the card can tell", INS_VERIFY_PIN, 0x63C1, sk, 1, pinBlock(NEW_PIN), "tag", -1);
+        sk = sayPinKey(out, "a nonce for the right PIN");
+        saySealed(out, "VERIFY_PIN sealed, the right PIN: the tries are back", INS_VERIFY_PIN, SW_OK, sk, 1, pinBlock(NEW_PIN), "", -1);
+        sk = sayPinKey(out, "a nonce for an envelope with its body spoiled");
+        saySealed(out, "VERIFY_PIN sealed, the first byte of the ciphertext changed", INS_VERIFY_PIN, 0x63C2, sk, 1, pinBlock(NEW_PIN), "body", -1);
+        sk = sayPinKey(out, "a nonce for an envelope sealed for another instruction");
+        saySealed(out, "VERIFY_PIN sent, sealed for SET_PIN", INS_VERIFY_PIN, 0x63C1, sk, 1, pinBlock(NEW_PIN), "", INS_SET_PIN & 0xFF);
+        sk = sayPinKey(out, "a nonce for the right PIN");
+        saySealed(out, "VERIFY_PIN sealed, the right PIN: the tries are back", INS_VERIFY_PIN, SW_OK, sk, 1, pinBlock(NEW_PIN), "", -1);
+        sk = sayPinKey(out, "a nonce for an envelope whose E is no point");
+        saySealed(out, "VERIFY_PIN sealed, E replaced by 04 and zeros: it does not open, and costs a try as a wrong PIN does", INS_VERIFY_PIN, 0x63C2, sk, 1, pinBlock(NEW_PIN), "point", -1);
+        saySealed(out, "and the nonce is gone: a good envelope under it is 6985, and costs nothing", INS_VERIFY_PIN, SW_CONDITIONS_NOT_SATIS, sk, 1, pinBlock(NEW_PIN), "", -1);
+        sk = sayPinKey(out, "a nonce for the right PIN");
+        saySealed(out, "VERIFY_PIN sealed, the right PIN: the tries are back", INS_VERIFY_PIN, SW_OK, sk, 1, pinBlock(NEW_PIN), "", -1);
+        sk = sayPinKey(out, "a nonce for a SET_PIN with its tag spoiled");
+        saySealed(out, "SET_PIN sealed, the last byte of the tag changed: 6A80 and the PIN is as it was", INS_SET_PIN, SW_WRONG_DATA, sk, 0, pinBlock(TEST_PIN), "tag", -1);
+        sk = sayPinKey(out, "a nonce for a SET_PIN with its body spoiled");
+        saySealed(out, "SET_PIN sealed, the first byte of the ciphertext changed", INS_SET_PIN, SW_WRONG_DATA, sk, 0, pinBlock(TEST_PIN), "body", -1);
+        sk = sayPinKey(out, "a nonce for a SET_PIN sealed for VERIFY_PIN");
+        saySealed(out, "SET_PIN sent, sealed for VERIFY_PIN", INS_SET_PIN, SW_WRONG_DATA, sk, 0, pinBlock(TEST_PIN), "", INS_VERIFY_PIN & 0xFF);
+        sk = sayPinKey(out, "a nonce for a SET_PIN whose E is no point");
+        saySealed(out, "SET_PIN sealed, E replaced by 04 and zeros: 6A80 and the PIN is as it was", INS_SET_PIN, SW_WRONG_DATA, sk, 0, pinBlock(TEST_PIN), "point", -1);
+        saySealed(out, "and the nonce is gone: a good envelope under it is 6985", INS_SET_PIN, SW_CONDITIONS_NOT_SATIS, sk, 0, pinBlock(TEST_PIN), "", -1);
+        say(out, "a sealed VERIFY_PIN of 81 bytes is short", "exact", SW_WRONG_LENGTH, new CommandAPDU(CLA, INS_VERIFY_PIN, 1, 0, new byte[81]));
+        say(out, "VERIFY_PIN with P1 = 2", "exact", SW_INCORRECT_P1P2, new CommandAPDU(CLA, INS_VERIFY_PIN, 2, 0, TEST_PIN));
+        say(out, "SET_PIN with P1 = 2", "exact", SW_INCORRECT_P1P2, new CommandAPDU(CLA, INS_SET_PIN, 2, 0, TEST_PIN));
+        say(out, "CHANGE_PIN with P1 = 2", "exact", SW_INCORRECT_P1P2, new CommandAPDU(CLA, INS_CHANGE_PIN, 2, 0, new byte[90]));
+        sk = sayPinKey(out, "a nonce for the PIN that the rest of this conversation uses");
+        saySealed(out, "SET_PIN sealed: back to the PIN the rest uses", INS_SET_PIN, SW_OK, sk, 0, pinBlock(TEST_PIN), "", -1);
+        sayReset(out, "taken away and put back: no nonce is held");
+        say(out, "select", "exact", SW_OK, select);
+        say(out, "a sealed VERIFY_PIN with no nonce asked for in this tap is 6985, whatever the envelope", "exact", SW_CONDITIONS_NOT_SATIS, new CommandAPDU(CLA, INS_VERIFY_PIN, 1, 0, lastEnvelope));
         say(out, "VERIFY_PIN with nothing wrong", "exact", SW_OK, verifyOk);
         say(out, "a wrong PIN", "exact", 0x63C2, new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, WRONG_PIN));
         say(out, "the info after a wrong PIN", "exact", SW_OK, info);
@@ -7333,6 +8366,24 @@ class CashuAppletTest {
         say(out, "has none", "exact", SW_OK, info);
         say(out, "nor loads", "exact", SW_SECURITY_NOT_SATIS, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 2, 14), 1));
         say(out, "the PIN, for the rest", "exact", SW_OK, verifyOk);
+
+        // 1.9: the owner changes the PIN, sealed: the proof over the label, the nonce of GET_NONCE with P1 = 1 and the PIN itself, inside the envelope
+        sk = sayPinKey(out, "a nonce for the owner's sealed CHANGE_PIN");
+        saySealed(out, "CHANGE_PIN sealed: the owner's proof and the PIN block, in one envelope", INS_CHANGE_PIN, SW_OK, sk, 2, changeClear(sk.nonce, NEW_PIN), "", -1);
+        say(out, "the old PIN is wrong now", "exact", 0x63C2, verifyOk);
+        say(out, "and the new one is right", "exact", SW_OK, new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, NEW_PIN));
+        sk = sayPinKey(out, "a nonce for a CHANGE_PIN with its body spoiled");
+        saySealed(out, "CHANGE_PIN sealed, the first byte of the ciphertext changed: 6A80 and nothing changed", INS_CHANGE_PIN, SW_WRONG_DATA, sk, 2, changeClear(sk.nonce, TEST_PIN), "body", -1);
+        sk = sayPinKey(out, "a nonce for a CHANGE_PIN whose E is no point");
+        saySealed(out, "CHANGE_PIN sealed, E replaced by 04 and zeros: 6A80 and nothing changed", INS_CHANGE_PIN, SW_WRONG_DATA, sk, 2, changeClear(sk.nonce, TEST_PIN), "point", -1);
+        saySealed(out, "and the nonce is gone: a good envelope under it is 6985", INS_CHANGE_PIN, SW_CONDITIONS_NOT_SATIS, sk, 2, changeClear(sk.nonce, TEST_PIN), "", -1);
+        sk = sayPinKey(out, "a nonce for a CHANGE_PIN with a proof over the block");
+        byte[] overBlock = ownerProof(L_PIN, OWNER, sk.nonce, pinBlock(TEST_PIN));
+        saySealed(out, "CHANGE_PIN sealed, the owner's proof over the PIN block and not the PIN: 6A91", INS_CHANGE_PIN, SW_OWNER_PROOF, sk, 2,
+            concat(new byte[] { (byte) overBlock.length }, overBlock, pinBlock(TEST_PIN)), "", -1);
+        sk = sayPinKey(out, "a nonce for the PIN that the rest uses");
+        saySealed(out, "CHANGE_PIN sealed: back to the PIN the rest uses", INS_CHANGE_PIN, SW_OK, sk, 2, changeClear(sk.nonce, TEST_PIN), "", -1);
+        say(out, "the PIN again", "exact", SW_OK, verifyOk);
 
         say(out, "SIGN_ARBITRARY is not a command", "exact", SW_INS_NOT_SUPPORTED, new CommandAPDU(CLA, INS_SIGN_ARBITRARY, 0, 0, new byte[32], 64));
         say(out, "AUTH", "auth", SW_OK, new CommandAPDU(CLA, INS_AUTH, 0, 0, hexToBytes("a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"), 80));
