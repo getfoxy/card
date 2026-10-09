@@ -176,11 +176,20 @@ compromised or truncated download.
                 version="0.1"
                 aid="F0:46:4F:58:59:43:41:52:44"
                 output="${cap.file}">
+                <!-- The opener FIRST: the chip takes the card's applet only after a small one has been
+                     instantiated from the package (docs/FOXY-CARD-HARDWARE.md). gp installs one applet
+                     at a time from a file with two: see docs/HARDWARE_DEPLOYMENT.md for the two commands. -->
+                <applet class="me.flashapp.cashu.Opener"
+                        aid="F0:46:4F:58:59:43:41:52:44:4D"/>
                 <applet class="me.flashapp.cashu.CashuApplet"
                         aid="F0:46:4F:58:59:43:41:52:44:01"/>
             </cap>
         </javacard>
-        <echo message="CAP file: ${cap.file}"/>
+        <echo message="CAP file: ${cap.file} (two applets: install the opener first)"/>
+        <exec executable="python3" dir="${basedir}/.." failonerror="true">
+            <arg value="tools/refcheck.py"/>
+            <arg value="applet/${cap.file}"/>
+        </exec>
     </target>
 
     <!-- ── Debug cap (includes line-number table) ─────────────────────── -->
@@ -196,6 +205,8 @@ compromised or truncated download.
                 aid="F0:46:4F:58:59:43:41:52:44"
                 output="${target.dir}/cashu-javacard-0.1.0-debug.cap"
                 debug="true">
+                <applet class="me.flashapp.cashu.Opener"
+                        aid="F0:46:4F:58:59:43:41:52:44:4D"/>
                 <applet class="me.flashapp.cashu.CashuApplet"
                         aid="F0:46:4F:58:59:43:41:52:44:01"/>
             </cap>

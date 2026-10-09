@@ -179,6 +179,9 @@ class SchnorrHWMathTest {
         { "CashuApplet.java",
           "public static void install(", "private CashuApplet()",
           "private void initCardKeypair()", "private void initPinKey()" },
+        // the applet instantiated first, so that the chip takes the card's own (FOXY-CARD-HARDWARE.md): it allocates nothing at all
+        { "Opener.java",
+          "public static void install(", "private Opener()" },
     };
 
     /**

@@ -161,8 +161,12 @@ downloaded for you:
 git clone https://github.com/martinpaljak/oracle_javacard_sdks ~/.javacard/sdks
 
 ant -f applet/build.xml cap
-# → applet/target/cashu-javacard-0.1.0.cap
+# → applet/target/cashu-javacard-0.1.0.cap   (two applets: the opener, then the card's)
 ```
+
+The file holds a second, empty applet that is instantiated before the card's
+own: the chip refuses the card's applet as a package's first
+([`docs/FOXY-CARD-HARDWARE.md`](docs/FOXY-CARD-HARDWARE.md)).
 
 Override the kit with `-Djc.sdk=/path/to/jc305u4_kit`. Installing onto a card:
 [`docs/HARDWARE_DEPLOYMENT.md`](docs/HARDWARE_DEPLOYMENT.md).

@@ -50,9 +50,15 @@ cd cashu-javacard/applet
 ant cap
 ant cap -Djc.sdk=/path/to/jc305u4_kit   # explicit form
 
-# Output: target/cashu-javacard-0.1.0.cap
+# Output: target/cashu-javacard-0.1.0.cap, one file with two applets in it: the opener, and the card's
 ls -lh target/cashu-javacard-0.1.0.cap
 ```
+
+> **Two applets, installed in order.** The chip refuses the card's applet as the
+> first instantiated from its package (no answer, or `6F00`); it takes it once a
+> small applet has been instantiated before it. So the file lists `Opener` first,
+> and the install is two commands (below). Measurements and the rest of what the
+> chip has room for: [FOXY-CARD-HARDWARE.md](FOXY-CARD-HARDWARE.md).
 
 > **3.0.5 is a hard floor.** `SchnorrHW` performs the `k·G` scalar multiply with
 > `KeyAgreement.ALG_EC_SVDP_DH_PLAIN_XY`, which was introduced in JavaCard 3.0.5
@@ -122,8 +128,10 @@ build with the fix, which is why the fix moved the applet version to 0.4.
 Don't install `958a8baa…` or any other 0.3 CAP.
 
 ```bash
-# Install CashuApplet.cap onto the card
-gp --install target/cashu-javacard-0.1.0.cap
+# Load the file and instantiate the opener (gp installs one applet of a file at a time)...
+gp --install target/cashu-javacard-0.1.0.cap --applet F0464F5859434152444D
+# ...then create the card's applet from the loaded package
+gp --create F0464F58594341524401 --package F0464F585943415244 --applet F0464F58594341524401
 
 # Verify installation
 gp --list
@@ -160,12 +168,14 @@ gp --apdu B0100000
 ## Reinstall (delete + install)
 
 ```bash
-# Delete the applet (and its package)
-gp --delete D276000085010201   # applet AID
-gp --delete D276000085010200   # package AID (optional)
+# Delete the card's applet, the opener, then the package (that order)
+gp --delete F0464F58594341524401   # the card's applet
+gp --delete F0464F5859434152444D   # the opener
+gp --delete F0464F585943415244     # the package
 
-# Re-install
-gp --install target/cashu-javacard-0.1.0.cap
+# Re-install: the opener first
+gp --install target/cashu-javacard-0.1.0.cap --applet F0464F5859434152444D
+gp --create F0464F58594341524401 --package F0464F585943415244 --applet F0464F58594341524401
 ```
 
 ---
