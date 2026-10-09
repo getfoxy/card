@@ -26,7 +26,7 @@ import java.util.regex.Pattern;
  *
  * A slot is status[1] ‖ keyset[8] ‖ amount[4] ‖ nonce[32] ‖ C[33] ‖ date[4], and every
  * reader trusts the status byte: GET_BALANCE sums the UNSPENT slots and
- * SPEND_PROOF signs for them. So the status byte is the slot's commit. It is
+ * SPEND_ALL_SIGN signs for them. So the status byte is the slot's commit. It is
  * written as a single byte, which the JCRE makes atomic, and only after every
  * other write to the slot, so a tear leaves a slot in its old state and never
  * in a new state over old bytes. Written first, it once let a tear turn an
@@ -53,7 +53,7 @@ class SlotWriteOrderTest {
         assertTrue(violations.isEmpty(), String.join("\n", violations));
 
         // A scan that matched nothing would prove nothing: LOAD_PROOF,
-        // CLEAR_SPENT and SPEND_PROOF each commit a status byte.
+        // CLEAR_SPENT and SPEND_ALL_SIGN each commit a status byte.
         long commits = slotWrites(src).stream().filter(w -> w.status).count();
         assertTrue(commits >= 3, "expected the three status commits, found " + commits);
     }
@@ -251,8 +251,11 @@ class SlotWriteOrderTest {
         return send(new CommandAPDU(CLA, CashuAppletTest.INS_LOAD_PROOF, 0, 0, proof, 0, proof.length, 1));
     }
 
+    /** A payment of that one piece: named, and signed for. The answer of whichever of the two refused, or the signature. */
     private ResponseAPDU spend(int slot) {
-        return send(new CommandAPDU(CLA, CashuAppletTest.INS_SPEND_PROOF, slot, 0, new byte[32], 64));
+        ResponseAPDU begun = send(new CommandAPDU(CLA, CashuAppletTest.INS_SPEND_ALL_BEGIN, 0, 0, new byte[] { (byte) slot }, 4));
+        if (begun.getSW() != CashuAppletTest.SW_OK) return begun;
+        return send(new CommandAPDU(CLA, CashuAppletTest.INS_SPEND_ALL_SIGN, 0, 0, 64));
     }
 
     private ResponseAPDU clearSpent() {

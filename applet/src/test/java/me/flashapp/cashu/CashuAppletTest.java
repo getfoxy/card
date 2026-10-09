@@ -45,7 +45,11 @@ class CashuAppletTest {
     static final byte INS_AUTH             = (byte) 0x15;
     static final byte INS_GET_CARD         = (byte) 0x16;
     static final byte INS_GET_PIECES       = (byte) 0x17;
-    static final byte INS_SPEND_PROOF      = (byte) 0x20;
+    static final byte INS_SPEND_PROOF      = (byte) 0x20;   // gone in format 4: answers 6D00
+    static final byte INS_SPEND_ALL_BEGIN   = (byte) 0x22;
+    static final byte INS_SPEND_ALL_OUTPUTS = (byte) 0x23;
+    static final byte INS_SPEND_ALL_SIGN    = (byte) 0x24;
+    static final byte INS_SPEND_ALL_AGAIN   = (byte) 0x25;
     static final byte INS_SIGN_ARBITRARY   = (byte) 0x21;   // upstream's; gone
     static final byte INS_LOAD_PROOF       = (byte) 0x30;
     static final byte INS_CLEAR_SPENT      = (byte) 0x31;
@@ -81,6 +85,7 @@ class CashuAppletTest {
     static final int SW_OWNER_PROOF         = 0x6A91;
     static final int SW_NO_TIME             = 0x6A92;
     static final int SW_OVER_TAP_LIMIT      = 0x6A95;
+    static final int SW_TOO_MANY            = 0x6A96;
     // how long a tap is, to the card: the applet's TAP_SECONDS
     static final long TAP = 10L;
     static final int SW_NOT_THE_TIME        = 0x6A93;
@@ -320,7 +325,38 @@ class CashuAppletTest {
     private long spentToday() { return readUint32(info(), 25); }
 
     private ResponseAPDU load(byte[] proof) { return transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, proof, 1)); }
-    private ResponseAPDU spend(int slot) { return transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, slot, 0, 64)); }
+    /** One piece paid with: a payment of that one place and no outputs. The signature, or whatever refused it. */
+    private ResponseAPDU spend(int slot) { return spendAll(new int[] { slot }, new byte[0][]); }
+    private static CommandAPDU beginCommand(int... slots) {
+        byte[] list = new byte[slots.length];
+        for (int i = 0; i < slots.length; i++) list[i] = (byte) slots[i];
+        return new CommandAPDU(CLA, INS_SPEND_ALL_BEGIN, 0, 0, list, 4);
+    }
+    private static final CommandAPDU SIGN_ALL = new CommandAPDU(CLA, INS_SPEND_ALL_SIGN, 0, 0, 64);
+    /** An output as SPEND_ALL_OUTPUTS takes it: the amount (4) and the blinded message (33). */
+    static byte[] output(long amount, byte[] blinded) { return concat(u32(amount), blinded); }
+    /**
+     * A payment with one signature: SPEND_ALL_BEGIN naming the places, the outputs six to a command, SPEND_ALL_SIGN.
+     * Answers the signature, or the answer of whichever step refused.
+     */
+    private ResponseAPDU spendAll(int[] slots, byte[][] outputs) {
+        ResponseAPDU begun = transmit(beginCommand(slots));
+        if (begun.getSW() != SW_OK) return begun;
+        for (int at = 0; at < outputs.length; at += 6) {
+            ResponseAPDU r = transmit(new CommandAPDU(CLA, INS_SPEND_ALL_OUTPUTS, 0, 0, concat(Arrays.copyOfRange(outputs, at, Math.min(outputs.length, at + 6)))));
+            if (r.getSW() != SW_OK) return r;
+        }
+        return transmit(SIGN_ALL);
+    }
+    /** The text a payment's one signature is over: each input's secret and C, then each output's amount and blinded message. */
+    static String allMessage(byte[] cardKey, byte[] refund, byte[][] slotData, byte[][] outputs) {
+        StringBuilder m = new StringBuilder();
+        for (byte[] d : slotData) {
+            m.append(secretText(Arrays.copyOfRange(d, 13, 45), cardKey, readUint32(d, 78), refund)).append(toHex(Arrays.copyOfRange(d, 45, 78)));
+        }
+        for (byte[] o : outputs) m.append(readUint32(o, 0)).append(toHex(Arrays.copyOfRange(o, 4, 37)));
+        return m.toString();
+    }
     private int clearSpent() { return sw(new CommandAPDU(CLA, INS_CLEAR_SPENT, 0, 0, 1)); }
     private byte[] info() { return transmit(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)).getData(); }
     private byte[] cardRecord() { return transmit(new CommandAPDU(CLA, INS_GET_CARD, 0, 0, 256)).getData(); }
@@ -362,10 +398,13 @@ class CashuAppletTest {
         }
     }
 
+    /** Whether `sig` is the card's for a payment of that one piece and no outputs. */
     private boolean signedFor(byte[] sig, byte[] slotData, byte[] refund) throws Exception {
-        byte[] nonce = Arrays.copyOfRange(slotData, 13, 45);
-        long date = readUint32(slotData, 78);
-        byte[] msg = sha256(secretText(nonce, cardKey(), date, refund).getBytes(StandardCharsets.UTF_8));
+        return signedForAll(sig, new byte[][] { slotData }, new byte[0][], refund);
+    }
+    /** Whether `sig` is the card's for a payment of those pieces, in that order, into those outputs. */
+    private boolean signedForAll(byte[] sig, byte[][] slotData, byte[][] outputs, byte[] refund) throws Exception {
+        byte[] msg = sha256(allMessage(cardKey(), refund, slotData, outputs).getBytes(StandardCharsets.UTF_8));
         return schnorrVerify(extractPubkeyX(cardKey()), msg, sig);
     }
 
@@ -389,32 +428,32 @@ class CashuAppletTest {
         // what a phone sends: iOS chooses by the name in the app's Info.plist, and Foxy by the same ten bytes
         ResponseAPDU whole = transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_HEX), 256));
         assertEquals(SW_OK, whole.getSW());
-        assertArrayEquals(new byte[] { 0x01, 0x03 }, whole.getData(), "the same answer either way: version 1.3");
+        assertArrayEquals(new byte[] { 0x01, 0x04 }, whole.getData(), "the same answer either way: version 1.4");
         assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)), "and its instructions follow");
     }
 
     @Test
-    @DisplayName("SELECT answers version 1.2, and not to upstream's AID")
+    @DisplayName("SELECT answers its version, and not to upstream's AID")
     void testSelect() {
         ResponseAPDU resp = transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR)));
         assertEquals(SW_OK, resp.getSW());
-        assertArrayEquals(new byte[] { 0x01, 0x03 }, resp.getData());
+        assertArrayEquals(new byte[] { 0x01, 0x04 }, resp.getData());
         assertNotEquals(SW_OK, sw(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(UPSTREAM_AID))),
             "an upstream reader must not find this applet under upstream's AID: the wire is not the same");
     }
 
     @Test
-    @DisplayName("GET_INFO on a new card: 30 bytes: 64 empty slots, no PIN, three tries, format 3, no record, no limit, no owner, no time, no change due")
+    @DisplayName("GET_INFO on a new card: 30 bytes: 64 empty slots, no PIN, three tries, format 4, no record, no limit, no owner, no time, no change due")
     void testInfoFresh() {
         byte[] d = info();
         assertEquals(30, d.length);
-        assertEquals(1, d[0]); assertEquals(3, d[1]);
+        assertEquals(1, d[0]); assertEquals(4, d[1]);
         assertEquals(MAX_PROOFS, d[2] & 0xFF);
         assertEquals(0, d[3]); assertEquals(0, d[4]);
         assertEquals(MAX_PROOFS, d[5] & 0xFF);
         assertEquals(0x07, d[6]);
         assertEquals(0, d[7], "no PIN");
-        assertEquals(3, d[8], "format");
+        assertEquals(4, d[8], "format");
         assertEquals(3, d[9], "tries");
         assertEquals(0, d[10], "not locked");
         assertEquals(0, d[11], "no card record");
@@ -743,7 +782,7 @@ class CashuAppletTest {
         assertEquals(SW_OK, setLimit(5000));
         byte[] c = cardRecord();
         assertEquals(106 + MINT.length(), c.length);
-        assertEquals(3, c[0]); assertEquals(1, c[1]); assertEquals(0, c[2]);
+        assertEquals(4, c[0]); assertEquals(1, c[1]); assertEquals(0, c[2]);
         assertEquals(5000, readUint32(c, 3));
         assertArrayEquals(REFUND, Arrays.copyOfRange(c, 7, 40));
         assertArrayEquals(SIGNER.pub, Arrays.copyOfRange(c, 40, 105), "the time key, uncompressed");
@@ -812,13 +851,15 @@ class CashuAppletTest {
         assertEquals(SW_OK, r.getSW());
         assertEquals(64, r.getData().length);
         assertTrue(signedFor(r.getData(), before, REFUND), "a BIP-340 signature over SHA-256 of the piece's secret");
-        // spelt out: a piece locked to one key, as cashu-ts writes it
+        // spelt out: a piece locked to one key and flagged SIG_ALL, as cashu-ts writes it, and then its C in hex
         String plain = "[\"P2PK\",{\"nonce\":\"" + toHex(Arrays.copyOfRange(before, 13, 45)) + "\",\"data\":\""
-            + toHex(cardKey()) + "\",\"tags\":[]}]";
-        assertTrue(schnorrVerify(extractPubkeyX(cardKey()), sha256(plain.getBytes(StandardCharsets.UTF_8)), r.getData()));
-        // and not upstream's, which the library does not write
-        String upstream = plain.replace("\"tags\":[]", "\"tags\":[[\"sigflag\",\"SIG_INPUTS\"]]");
-        assertFalse(schnorrVerify(extractPubkeyX(cardKey()), sha256(upstream.getBytes(StandardCharsets.UTF_8)), r.getData()));
+            + toHex(cardKey()) + "\",\"tags\":[[\"sigflag\",\"SIG_ALL\"]]}]";
+        String c = toHex(Arrays.copyOfRange(before, 45, 78));
+        assertTrue(schnorrVerify(extractPubkeyX(cardKey()), sha256((plain + c).getBytes(StandardCharsets.UTF_8)), r.getData()));
+        // not the secret alone (a signature a mint would take for a piece without the flag), and not a piece without the flag
+        assertFalse(schnorrVerify(extractPubkeyX(cardKey()), sha256(plain.getBytes(StandardCharsets.UTF_8)), r.getData()));
+        String unflagged = plain.replace("\"tags\":[[\"sigflag\",\"SIG_ALL\"]]", "\"tags\":[]");
+        assertFalse(schnorrVerify(extractPubkeyX(cardKey()), sha256((unflagged + c).getBytes(StandardCharsets.UTF_8)), r.getData()));
         assertEquals(2, slot(0)[0], "and the slot is spent");
         assertEquals(0, balance());
     }
@@ -846,15 +887,18 @@ class CashuAppletTest {
     }
 
     @Test
-    @DisplayName("Nothing the reader sends is signed: 32 bytes offered to SPEND_PROOF change nothing")
+    @DisplayName("Nothing the reader sends in place of the pieces is signed: 32 bytes offered with SPEND_ALL_SIGN change nothing, and SPEND_PROOF is gone")
     void testSpendTakesNoMessage() throws Exception {
         ready();
         assertEquals(SW_OK, load(buildProof(KEYSET, 16, 1)).getSW());
         assertEquals(SW_OK, load(buildProof(KEYSET, 32, 2)).getSW());
         byte[] a = slot(0), b = slot(1);
+        assertEquals(0x6D00, sw(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, 64)), "one piece, one signature over its secret alone: gone");
+        assertEquals(0x6D00, sw(new CommandAPDU(CLA, 0x21, 0, 0, new byte[32], 64)), "as SIGN_ARBITRARY is");
         // upstream's attack: have slot 0 burned for slot 1's message
-        byte[] bMsg = sha256(secretText(Arrays.copyOfRange(b, 13, 45), cardKey(), 0, REFUND).getBytes(StandardCharsets.UTF_8));
-        ResponseAPDU r = transmit(new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, bMsg, 64));
+        byte[] bMsg = sha256(allMessage(cardKey(), REFUND, new byte[][] { b }, new byte[0][]).getBytes(StandardCharsets.UTF_8));
+        assertEquals(SW_OK, transmit(beginCommand(0)).getSW());
+        ResponseAPDU r = transmit(new CommandAPDU(CLA, INS_SPEND_ALL_SIGN, 0, 0, bMsg, 64));
         assertEquals(SW_OK, r.getSW());
         assertFalse(schnorrVerify(extractPubkeyX(cardKey()), bMsg, r.getData()), "not the message that was offered");
         assertTrue(signedFor(r.getData(), a, REFUND), "the slot's own");
@@ -897,7 +941,7 @@ class CashuAppletTest {
     /** Every command that needs the PIN first, as (name, command): each is refused with 6982 until it has been verified. */
     private Object[][] gated() {
         return new Object[][] {
-            { "SPEND_PROOF", new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, 64) },
+            { "SPEND_ALL_BEGIN", beginCommand(0) },
             { "LOAD_PROOF",  new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 4, 50), 1) },
             { "CLEAR_SPENT", new CommandAPDU(CLA, INS_CLEAR_SPENT, 0, 0, 1) },
             { "SET_LIMIT (PIN form)", setLimitByPinCommand(1) },
@@ -2061,6 +2105,209 @@ class CashuAppletTest {
     }
 
     // =========================================================================
+    // One signature for a payment
+    // =========================================================================
+
+    /** A blinded message as a swap would carry it: 33 bytes, a compressed point's shape. The card does not look inside. */
+    private static byte[] blinded(int seed) {
+        byte[] b = new byte[33];
+        b[0] = (byte)(seed % 2 == 0 ? 0x02 : 0x03);
+        for (int i = 1; i < 33; i++) b[i] = (byte)(seed * 7 + i);
+        return b;
+    }
+
+    @Test
+    @DisplayName("One signature for a payment of many pieces: over each piece's secret and C in the order named, then each output's amount and blinded message; every piece named is burned, and no other")
+    void testOneSignatureForManyPieces() throws Exception {
+        ready();
+        long[] amounts = { 64, 32, 16, 8, 4, 2, 1 };
+        for (int i = 0; i < amounts.length; i++) assertEquals(SW_OK, load(buildProof(KEYSET, amounts[i], i + 1)).getSW());
+        byte[][] before = new byte[amounts.length][];
+        for (int i = 0; i < amounts.length; i++) before[i] = slot(i);
+        byte[][] outputs = { output(64, blinded(1)), output(16, blinded(2)), output(4, blinded(3)), output(1, blinded(4)),
+                             output(1024, blinded(5)), output(2, blinded(6)), output(4294967295L, blinded(7)) };
+        newTap();
+        ResponseAPDU begun = transmit(beginCommand(4, 0, 2, 6));
+        assertEquals(SW_OK, begun.getSW());
+        assertEquals(4 + 64 + 16 + 1, readUint32(begun.getData(), 0), "the beginning answers what the pieces are worth");
+        // seven outputs: six in one command and the seventh in another
+        assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_SPEND_ALL_OUTPUTS, 0, 0, concat(Arrays.copyOfRange(outputs, 0, 6)))));
+        assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_SPEND_ALL_OUTPUTS, 0, 0, outputs[6])));
+        ResponseAPDU r = transmit(SIGN_ALL);
+        assertEquals(SW_OK, r.getSW());
+        assertEquals(64, r.getData().length);
+        byte[][] named = { before[4], before[0], before[2], before[6] };
+        assertTrue(signedForAll(r.getData(), named, outputs, REFUND), "one BIP-340 signature over the whole message");
+        assertFalse(signedForAll(r.getData(), new byte[][] { before[0], before[2], before[4], before[6] }, outputs, REFUND), "the order named, and not another");
+        assertFalse(signedForAll(r.getData(), named, Arrays.copyOfRange(outputs, 0, 6), REFUND), "every output, and not fewer");
+        byte[][] elsewhere = outputs.clone();
+        elsewhere[0] = output(64, blinded(9));
+        assertFalse(signedForAll(r.getData(), named, elsewhere, REFUND), "those outputs, and not others: the signature says where the money goes");
+        assertFalse(signedForAll(r.getData(), new byte[][] { before[4], before[0], before[2], before[6], before[1] }, outputs, REFUND), "and no piece that was not named");
+        for (int i = 0; i < amounts.length; i++) {
+            assertEquals(i == 0 || i == 2 || i == 4 || i == 6 ? 2 : 1, slot(i)[0], "place " + i);
+        }
+        assertEquals(32 + 8 + 2, balance());
+        assertArrayEquals(new long[] { T0, 85, 4, 0, 0 }, logTap(0), "one tap in the log: what was signed for, and four pieces");
+    }
+
+    @Test
+    @DisplayName("The card builds the pieces' half of the message itself: a terminal that names one small piece gets a signature for that piece, whatever it sends beside it")
+    void testThePiecesAreTheCardsOwn() throws Exception {
+        ready();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 1, 1)).getSW());
+        assertEquals(SW_OK, load(buildProof(KEYSET, 100000, 2)).getSW());
+        byte[] small = slot(0), large = slot(1);
+        byte[][] outputs = { output(100000, blinded(1)) };
+        // the terminal burns the 1 and wants a signature good for the 100,000
+        byte[] wanted = sha256(allMessage(cardKey(), REFUND, new byte[][] { large }, outputs).getBytes(StandardCharsets.UTF_8));
+        assertEquals(SW_OK, transmit(beginCommand(0)).getSW());
+        assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_SPEND_ALL_OUTPUTS, 0, 0, outputs[0])));
+        ResponseAPDU r = transmit(new CommandAPDU(CLA, INS_SPEND_ALL_SIGN, 0, 0, wanted, 64));
+        assertEquals(SW_OK, r.getSW());
+        assertTrue(signedForAll(r.getData(), new byte[][] { small }, outputs, REFUND), "it signed for the piece it burned");
+        assertFalse(signedForAll(r.getData(), new byte[][] { large }, outputs, REFUND), "and not for the one it did not");
+        assertFalse(signedForAll(r.getData(), new byte[][] { small, large }, outputs, REFUND));
+        assertEquals(1, slot(1)[0], "which is still on the card");
+        assertEquals(100000, balance());
+        /* An output cannot stand in for a piece: its amount is hashed as decimal digits and its blinded message as hex,
+         * so nothing a terminal sends as outputs can spell a secret. The same bytes sent as the outputs of a payment of
+         * the small piece sign for a message that is not a payment of the large one. */
+        assertEquals(SW_OK, load(buildProof(KEYSET, 1, 3)).getSW());
+        byte[] secretBytes = secretText(Arrays.copyOfRange(large, 13, 45), cardKey(), 0, REFUND).getBytes(StandardCharsets.UTF_8);
+        assertEquals(SW_OK, transmit(beginCommand(2)).getSW());
+        assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_SPEND_ALL_OUTPUTS, 0, 0, Arrays.copyOf(secretBytes, 37))));
+        ResponseAPDU crafted = transmit(SIGN_ALL);
+        assertEquals(SW_OK, crafted.getSW());
+        assertFalse(signedForAll(crafted.getData(), new byte[][] { large }, new byte[0][], REFUND));
+        assertEquals(1, slot(1)[0]);
+    }
+
+    @Test
+    @DisplayName("A payment is one beginning, its outputs and one signature, with nothing between: anything else gives it up, and nothing is burned")
+    void testAPaymentIsOneBeginning() throws Exception {
+        ready();
+        for (int i = 0; i < 4; i++) assertEquals(SW_OK, load(buildProof(KEYSET, 10, i + 1)).getSW());
+        assertEquals(0x6985, sw(SIGN_ALL), "no signature with no payment begun");
+        assertEquals(0x6985, sw(new CommandAPDU(CLA, INS_SPEND_ALL_OUTPUTS, 0, 0, output(1, blinded(1)))), "nor outputs");
+        // another command between the beginning and the signature
+        CommandAPDU[] between = { new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256), new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, TEST_PIN),
+                                  new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4), setTimeCommand(T0 + 1, timeSignature(SIGNER, T0 + 1)) };
+        for (CommandAPDU c : between) {
+            assertEquals(SW_OK, transmit(beginCommand(0, 1)).getSW());
+            assertEquals(SW_OK, sw(c));
+            assertEquals(0x6985, sw(SIGN_ALL), "given up by INS " + Integer.toHexString(c.getINS()));
+            assertEquals(40, balance());
+        }
+        // a new SELECT gives it up too
+        assertEquals(SW_OK, transmit(beginCommand(0, 1)).getSW());
+        reselect();
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(0x6985, sw(SIGN_ALL));
+        // outputs of a length that is not outputs give it up
+        assertEquals(SW_OK, transmit(beginCommand(0, 1)).getSW());
+        assertEquals(0x6700, sw(new CommandAPDU(CLA, INS_SPEND_ALL_OUTPUTS, 0, 0, new byte[36])));
+        assertEquals(0x6985, sw(SIGN_ALL));
+        assertEquals(40, balance(), "and nothing has been burned by any of it");
+        // a second beginning replaces the first
+        byte[] two = slot(2);
+        assertEquals(SW_OK, transmit(beginCommand(0, 1)).getSW());
+        assertEquals(SW_OK, transmit(beginCommand(2)).getSW());
+        ResponseAPDU r = transmit(SIGN_ALL);
+        assertEquals(SW_OK, r.getSW());
+        assertTrue(signedFor(r.getData(), two, REFUND), "the last beginning is the payment");
+        assertEquals(30, balance());
+        // and one signature for one beginning
+        assertEquals(0x6985, sw(SIGN_ALL), "a second signature needs a second beginning");
+        assertEquals(30, balance());
+    }
+
+    @Test
+    @DisplayName("What a payment may name: each place once, holding an unspent piece, all of one date, no more than thirty-two; a refusal burns nothing")
+    void testWhatAPaymentMayName() {
+        ready();
+        for (int i = 0; i < 34; i++) assertEquals(SW_OK, load(buildProof(KEYSET, 1, i + 1, i == 33 ? 1900000000L : 0)).getSW());
+        assertEquals(SW_OK, spend(5).getSW());
+        assertEquals(0x6700, sw(new CommandAPDU(CLA, INS_SPEND_ALL_BEGIN, 0, 0, 4)), "none");
+        assertEquals(0x6A80, sw(beginCommand(0, 1, 0)), "a place named twice");
+        assertEquals(0x6985, sw(beginCommand(0, 5)), "a spent one");
+        assertEquals(SW_SLOT_EMPTY, sw(beginCommand(0, 40)), "an empty one");
+        assertEquals(SW_SLOT_OUT_OF_RANGE, sw(beginCommand(0, 64)), "one that is not a place");
+        assertEquals(0x6A80, sw(beginCommand(0, 33)), "pieces of two dates: their lock conditions differ, and a mint takes no one signature for them");
+        int[] many = new int[33];
+        for (int i = 0; i < 33; i++) many[i] = i < 5 ? i : i + 1;
+        assertEquals(SW_TOO_MANY, sw(beginCommand(many)), "thirty-three");
+        assertEquals(33, balance(), "none of which burned anything");
+        assertEquals(0x6985, sw(SIGN_ALL), "or left a payment begun");
+        // thirty-two is a payment
+        int[] most = Arrays.copyOf(many, 32);
+        ResponseAPDU r = spendAll(most, new byte[0][]);
+        assertEquals(SW_OK, r.getSW());
+        assertEquals(64, r.getData().length);
+        assertEquals(1, balance(), "thirty-two burned at once");
+        assertEquals(32 + 1, logTap(0)[2], "and the log has them, with the one before");
+    }
+
+    @Test
+    @DisplayName("The last signature is kept, for a terminal whose answer was lost on the air: asked for again it is the same 64 bytes, with the PIN, until the next payment; and it is good for nothing but that payment")
+    void testTheLastSignatureAgain() throws Exception {
+        ready();
+        for (int i = 0; i < 3; i++) assertEquals(SW_OK, load(buildProof(KEYSET, 8, i + 1)).getSW());
+        CommandAPDU again = new CommandAPDU(CLA, INS_SPEND_ALL_AGAIN, 0, 0, 64);
+        assertEquals(SW_SLOT_EMPTY, sw(again), "a card that has never signed has none");
+        byte[] a = slot(0), b = slot(1);
+        byte[][] outputs = { output(16, blinded(3)) };
+        ResponseAPDU first = spendAll(new int[] { 0, 1 }, outputs);
+        assertEquals(SW_OK, first.getSW());
+        assertArrayEquals(first.getData(), transmit(again).getData(), "the same signature, asked for again in the same tap");
+        // the card taken away as its answer was on the air: the pieces are burned, and the next tap can still have it
+        simulator.reset();
+        reselect();
+        assertEquals(SW_SECURITY_NOT_SATIS, sw(again), "with the PIN, as a spend");
+        assertEquals(SW_OK, verify(TEST_PIN));
+        ResponseAPDU later = transmit(again);
+        assertEquals(SW_OK, later.getSW());
+        assertArrayEquals(first.getData(), later.getData(), "and in the next");
+        assertTrue(signedForAll(later.getData(), new byte[][] { a, b }, outputs, REFUND), "good for the payment it was made for");
+        assertEquals(8, balance(), "and it burns nothing more");
+        assertEquals(1, logTaps(), "nor is it a tap in the log");
+        // the next payment's replaces it
+        byte[] c = slot(2);
+        ResponseAPDU next = spend(2);
+        assertEquals(SW_OK, next.getSW());
+        assertArrayEquals(next.getData(), transmit(again).getData());
+        assertTrue(signedFor(next.getData(), c, REFUND));
+        assertFalse(Arrays.equals(first.getData(), next.getData()));
+    }
+
+    @Test
+    @DisplayName("The limits are held to what a payment's pieces are worth together, at the beginning: over the day or the tap it is refused whole, written down once, and nothing is burned")
+    void testTheLimitsCountThePayment() {
+        readyWithLimit(0);
+        assertEquals(SW_OK, setLimits(250, 100));
+        for (int i = 0; i < 8; i++) assertEquals(SW_OK, load(buildProof(KEYSET, new long[] { 60, 60, 40, 30, 30, 30, 30, 30 }[i], i + 1)).getSW());
+        newTap();
+        assertEquals(SW_OVER_TAP_LIMIT, sw(beginCommand(0, 1)), "60 and 60 are over a tap of 100, though neither is alone");
+        assertEquals(1, logRefused(), "one refusal for the one payment");
+        assertEquals(0x6985, sw(SIGN_ALL));
+        assertEquals(SW_OK, spendAll(new int[] { 0, 2 }, new byte[0][]).getSW(), "60 and 40 are the limit exactly");
+        assertEquals(100, tapSpent());
+        assertEquals(100, spentToday());
+        assertEquals(SW_OVER_TAP_LIMIT, sw(beginCommand(3)), "and then nothing more in this tap");
+        newTap();
+        assertEquals(SW_OK, setTime(T0 + TAP));
+        assertEquals(SW_OK, spendAll(new int[] { 1, 3 }, new byte[0][]).getSW(), "the next tap: 90");
+        assertEquals(190, spentToday());
+        newTap();
+        assertEquals(SW_OK, setTime(T0 + 2 * TAP));
+        assertEquals(SW_OVER_LIMIT, sw(beginCommand(4, 5, 6)), "90 more would be 280, over a day of 250: refused as over the day");
+        assertEquals(SW_OK, spendAll(new int[] { 4, 5 }, new byte[0][]).getSW(), "60 more is the day's limit exactly");
+        assertEquals(250, spentToday());
+        assertEquals(60, balance());
+        assertEquals(3, logRefused());
+    }
+
+    // =========================================================================
     // The card's own log
     // =========================================================================
 
@@ -2461,9 +2708,13 @@ class CashuAppletTest {
     @DisplayName("The spend marks the slot and counts the day in one transaction, refuses before anything is changed, and signs only after it commits")
     void testSpendIsOneTransaction() throws Exception {
         String code = appletCode();
-        String body = body(code, "private void processSpendProof(", "private void secretHash(");
-        int refuse = body.indexOf("SW_OVER_LIMIT");
-        int refuseTime = body.indexOf("SW_NO_TIME");
+        String body = body(code, "private void processSpendAllSign(", "private void processSpendAllAgain(");
+        // the refusals (over the day, over the tap, no time) are the limits' own, asked for before anything is signed or changed
+        String limits = body(code, "private void requireUnderLimits(", "private void secretInto(");
+        assertTrue(limits.contains("SW_OVER_LIMIT") && limits.contains("SW_OVER_TAP_LIMIT") && limits.contains("SW_NO_TIME")
+            && !limits.contains("beginTransaction") && !limits.contains("STATUS_SPENT"), "the limits refuse, and change nothing themselves");
+        int refuse = body.indexOf("requireUnderLimits(");
+        int refuseTime = refuse;
         int begin = body.indexOf("beginTransaction");
         int window = body.indexOf("CARD_WINDOW_OFFSET");
         int charge = body.indexOf("CARD_SPENT_OFFSET", begin);
@@ -2471,7 +2722,7 @@ class CashuAppletTest {
         int commit = body.indexOf("commitTransaction");
         int sign = body.indexOf("schnorrHW.sign");
         int send = body.indexOf("setOutgoingAndSend", commit);
-        int refuseTap = body.indexOf("SW_OVER_TAP_LIMIT");
+        int refuseTap = refuse;
         int tapWindow = body.indexOf("CARD_TAP_WINDOW_OFFSET", begin);
         int tapCharge = body.indexOf("CARD_TAP_SPENT_OFFSET", begin);
         assertTrue(refuse > 0 && refuse < begin && refuseTime > 0 && refuseTime < begin && refuseTap > 0 && refuseTap < begin, "the refusals come before anything is changed");
@@ -2496,7 +2747,7 @@ class CashuAppletTest {
     void testWhatReadsWhat() throws Exception {
         String code = appletCode();
         // where the grant is read
-        String spend = body(code, "private void processSpendProof(", "private void secretHash(");
+        String spend = body(code, "private void processSpendAllBegin(", "private void secretInto(");
         assertFalse(spend.contains("loadGrant"), "a spend does not look at the grant");
         String verify = body(code, "private void processVerifyPin(", "private void failPinCheck(");
         assertFalse(verify.contains("arrayFill"), "VERIFY_PIN fills nothing");
@@ -2541,8 +2792,11 @@ class CashuAppletTest {
     @DisplayName("The refusals that gate a command come first: the PIN, then the owner, then the shape; a limit is read, not set, by a spend")
     void testGatesComeFirst() throws Exception {
         String code = appletCode();
-        String spend = body(code, "private void processSpendProof(", "private void secretHash(");
-        assertTrue(spend.indexOf("requirePinIfSet()") >= 0 && spend.indexOf("requirePinIfSet()") < spend.indexOf("SLOT_OUT_OF_RANGE"), "the PIN gate is the first statement of a spend");
+        String spend = body(code, "private void processSpendAllBegin(", "private void processSpendAllOutputs(");
+        assertTrue(spend.indexOf("requirePinIfSet()") >= 0 && spend.indexOf("requirePinIfSet()") < spend.indexOf("setIncomingAndReceive")
+            && spend.indexOf("requirePinIfSet()") < spend.indexOf("SLOT_OUT_OF_RANGE"), "the PIN gate is the first statement of a spend");
+        String signing = body(code, "private void processSpendAllSign(", "private void processSpendAllAgain(");
+        assertTrue(signing.indexOf("requirePinIfSet()") >= 0 && signing.indexOf("requirePinIfSet()") < signing.indexOf("schnorrHW.sign"), "and it stands before the signature too");
         String load = body(code, "private void processLoadProof(", "private void processClearSpent(");
         assertTrue(load.indexOf("requireLoadAuthority()") < load.indexOf("SW_NO_OWNER")
             && load.indexOf("SW_NO_OWNER") < load.indexOf("SW_NO_CARD_RECORD")
@@ -2631,7 +2885,8 @@ class CashuAppletTest {
             assertEquals(SW_OK, r.getSW());
             byte[] nonce = Arrays.copyOfRange(before, 13, 45);
             String secret = secretText(nonce, key, dates[i], REFUND);
-            byte[] msg = sha256(secret.getBytes(StandardCharsets.UTF_8));
+            // the message of a payment of this one piece into no outputs: its secret, and its C in hex
+            byte[] msg = sha256((secret + toHex(Arrays.copyOfRange(before, 45, 78))).getBytes(StandardCharsets.UTF_8));
             assertTrue(schnorrVerify(extractPubkeyX(key), msg, r.getData()));
             out.append("  {\"keyset\": \"").append(KEYSET).append("\", \"amount\": ").append(amount)
                .append(", \"nonce\": \"").append(toHex(nonce))
@@ -2716,6 +2971,15 @@ class CashuAppletTest {
     private void sayReset(StringBuilder out, String name) {
         simulator.reset();
         out.append("  {\"name\": ").append(jsonString(name)).append(", \"kind\": \"reset\", \"apdu\": \"\", \"sw\": \"\", \"data\": \"\"},\n");
+    }
+
+    /**
+     * A payment of one piece, written down: SPEND_ALL_BEGIN naming it, which is what refuses where it is refused, and
+     * then SPEND_ALL_SIGN. The signature's kind is `sigall`: a model checks it against the message of the places named.
+     */
+    private void saySpend(StringBuilder out, String name, int expected, int slot) {
+        say(out, expected == SW_OK ? name + ": the place named" : name, "exact", expected, beginCommand(slot));
+        if (expected == SW_OK) say(out, name, "sigall", SW_OK, SIGN_ALL);
     }
 
     private byte[] sayNonce(StringBuilder out) {
@@ -2837,28 +3101,28 @@ class CashuAppletTest {
         say(out, "a slot there is not", "exact", SW_SLOT_OUT_OF_RANGE, new CommandAPDU(CLA, INS_GET_PROOF, 64, 0, 256));
         say(out, "the balance", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4));
         say(out, "how many slots are in use", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PROOF_COUNT, 0, 0, 1));
-        say(out, "2000 is over the limit by itself", "exact", SW_OVER_LIMIT, new CommandAPDU(CLA, INS_SPEND_PROOF, 3, 0, 64));
-        say(out, "spend slot 0", "sig", SW_OK, new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, 64));
+        saySpend(out, "2000 is over the limit by itself", SW_OVER_LIMIT, 3);
+        saySpend(out, "spend slot 0", SW_OK, 0);
         say(out, "the day after it", "exact", SW_OK, info);
-        say(out, "spend slot 1, to the limit exactly", "sig", SW_OK, new CommandAPDU(CLA, INS_SPEND_PROOF, 1, 0, 64));
-        say(out, "one sat more is over it", "exact", SW_OVER_LIMIT, new CommandAPDU(CLA, INS_SPEND_PROOF, 2, 0, 64));
-        say(out, "slot 0 a second time", "exact", SW_CONDITIONS_NOT_SATIS, new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, 64));
+        saySpend(out, "spend slot 1, to the limit exactly", SW_OK, 1);
+        saySpend(out, "one sat more is over it", SW_OVER_LIMIT, 2);
+        saySpend(out, "slot 0 a second time", SW_CONDITIONS_NOT_SATIS, 0);
         say(out, "a spent piece is not written again beside itself", "exact", SW_PIECE_ON_CARD, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 1, 1, 1900000000L), 1));
-        say(out, "an empty slot spent", "exact", SW_SLOT_EMPTY, new CommandAPDU(CLA, INS_SPEND_PROOF, 9, 0, 64));
+        saySpend(out, "an empty slot spent", SW_SLOT_EMPTY, 9);
         say(out, "the PIN again", "exact", SW_OK, verifyOk);
-        say(out, "it gives none of the day back", "exact", SW_OVER_LIMIT, new CommandAPDU(CLA, INS_SPEND_PROOF, 2, 0, 64));
+        saySpend(out, "it gives none of the day back", SW_OVER_LIMIT, 2);
         say(out, "a new tap", "exact", SW_OK, select);
         say(out, "the PIN in it", "exact", SW_OK, verifyOk);
-        say(out, "nor does a new tap", "exact", SW_OVER_LIMIT, new CommandAPDU(CLA, INS_SPEND_PROOF, 2, 0, 64));
+        saySpend(out, "nor does a new tap", SW_OVER_LIMIT, 2);
         time(out, "a time a second short of a day on", SW_OK, SIGNER, T0 + 86_399);
-        say(out, "is the same day", "exact", SW_OVER_LIMIT, new CommandAPDU(CLA, INS_SPEND_PROOF, 2, 0, 64));
+        saySpend(out, "is the same day", SW_OVER_LIMIT, 2);
         say(out, "and the info is as it was", "exact", SW_OK, info);
         time(out, "a day on", SW_OK, SIGNER, T0 + 86_400);
-        say(out, "the next day: slot 2, one sat", "sig", SW_OK, new CommandAPDU(CLA, INS_SPEND_PROOF, 2, 0, 64));
+        saySpend(out, "the next day: slot 2, one sat", SW_OK, 2);
         say(out, "the window began at the clock, with one sat in it", "exact", SW_OK, info);
-        say(out, "2000 is still over the limit by itself", "exact", SW_OVER_LIMIT, new CommandAPDU(CLA, INS_SPEND_PROOF, 3, 0, 64));
+        saySpend(out, "2000 is still over the limit by itself", SW_OVER_LIMIT, 3);
         owner(out, "the owner takes the limit off", SW_OK, L_LIMIT, OWNER, u32(0), p -> setLimitCommand(p, 0));
-        say(out, "and 2000 goes", "sig", SW_OK, new CommandAPDU(CLA, INS_SPEND_PROOF, 3, 0, 64));
+        saySpend(out, "and 2000 goes", SW_OK, 3);
         say(out, "nothing is counted with no limit", "exact", SW_OK, info);
         owner(out, "the owner puts a limit of 50 back", SW_OK, L_LIMIT, OWNER, u32(50), p -> setLimitCommand(p, 50));
         say(out, "its window, begun at the clock", "exact", SW_OK, info);
@@ -2880,13 +3144,13 @@ class CashuAppletTest {
         say(out, "a piece of 4, with no PIN: change", "exact", SW_OK, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 4, 12), 1));
         say(out, "the same tap may still load the rest", "exact", SW_OK, info);
         say(out, "CLEAR_SPENT, with no PIN", "exact", SW_OK, clear);
-        say(out, "but not a spend", "exact", SW_SECURITY_NOT_SATIS, new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, 64));
+        saySpend(out, "but not a spend", SW_SECURITY_NOT_SATIS, 0);
         say(out, "nor a limit by PIN", "exact", SW_SECURITY_NOT_SATIS, setLimitByPinCommand(0));
         say(out, "a new tap: the load closed the window", "exact", SW_OK, select);
         say(out, "which says so", "exact", SW_OK, info);
         say(out, "and loads nothing with no PIN", "exact", SW_SECURITY_NOT_SATIS, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 4, 13), 1));
         say(out, "the PIN", "exact", SW_OK, verifyOk);
-        say(out, "a payment: the piece of 8", "sig", SW_OK, new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, 64));
+        saySpend(out, "a payment: the piece of 8", SW_OK, 0);
         say(out, "the tap it was paid in gets no grant of its own", "exact", SW_OK, info);
         say(out, "a tap after it", "exact", SW_OK, select);
         say(out, "has the grant", "exact", SW_OK, info);
@@ -2911,7 +3175,7 @@ class CashuAppletTest {
         owner(out, "ALLOW_LOAD with the owner's proof", SW_OK, L_LOAD, OWNER, new byte[0], p -> allowLoadCommand(p));
         say(out, "a load, with no PIN", "exact", SW_OK, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 4, 8), 1));
         say(out, "CLEAR_SPENT, with no PIN", "exact", SW_OK, clear);
-        say(out, "but not a spend", "exact", SW_SECURITY_NOT_SATIS, new CommandAPDU(CLA, INS_SPEND_PROOF, 4, 0, 64));
+        saySpend(out, "but not a spend", SW_SECURITY_NOT_SATIS, 4);
         say(out, "nor a limit by PIN", "exact", SW_SECURITY_NOT_SATIS, setLimitByPinCommand(0));
         say(out, "nor the PIN", "exact", SW_OWNER_PROOF, new CommandAPDU(CLA, INS_SET_PIN, 0, 0, NEW_PIN));
         say(out, "a new tap", "exact", SW_OK, select);
@@ -2928,7 +3192,7 @@ class CashuAppletTest {
         byte[] pinProof = ownerProof(L_PIN, OWNER, pinNonce, NEW_PIN);
         say(out, "CHANGE_PIN", "exact", SW_OK, changePinCommand(pinProof, NEW_PIN));
         say(out, "the same proof again", "exact", SW_OWNER_PROOF, changePinCommand(pinProof, TEST_PIN));
-        say(out, "which ended the session", "exact", SW_SECURITY_NOT_SATIS, new CommandAPDU(CLA, INS_SPEND_PROOF, 4, 0, 64));
+        saySpend(out, "which ended the session", SW_SECURITY_NOT_SATIS, 4);
         say(out, "the old PIN", "exact", 0x63C2, verifyOk);
         say(out, "the new PIN", "exact", SW_OK, new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, NEW_PIN));
         say(out, "a new tap", "exact", SW_OK, select);
@@ -2941,7 +3205,7 @@ class CashuAppletTest {
         say(out, "wrong, blocked", "exact", SW_PIN_BLOCKED, new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, WRONG_PIN));
         say(out, "a blocked card says so", "exact", SW_OK, info);
         say(out, "the right PIN opens nothing now", "exact", SW_PIN_BLOCKED, verifyOk);
-        say(out, "a blocked card does not spend", "exact", SW_SECURITY_NOT_SATIS, new CommandAPDU(CLA, INS_SPEND_PROOF, 4, 0, 64));
+        saySpend(out, "a blocked card does not spend", SW_SECURITY_NOT_SATIS, 4);
         say(out, "nor load", "exact", SW_SECURITY_NOT_SATIS, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 16, 8), 1));
         say(out, "nor be given a PIN by whoever is at the reader", "exact", SW_OWNER_PROOF, new CommandAPDU(CLA, INS_SET_PIN, 0, 0, NEW_PIN));
         time(out, "but it takes the time", SW_OK, SIGNER, T0 + 86_400 + 60);
@@ -2954,7 +3218,7 @@ class CashuAppletTest {
         for (int i = 0; i < MAX_PROOFS; i++) {
             byte[] st = slot(i);
             if (st.length == 0 || st[0] != 1) continue;
-            say(out, "spend slot " + i, "sig", SW_OK, new CommandAPDU(CLA, INS_SPEND_PROOF, i, 0, 64));
+            saySpend(out, "spend slot " + i, SW_OK, i);
         }
         say(out, "CLEAR_SPENT: the card is empty", "exact", SW_OK, clear);
         owner(out, "owner's proof, a different time key: the clock goes back to nothing", SW_OK, L_CARD, OWNER, record(MINT, REFUND, OTHER_SIGNER.pub),
@@ -2975,18 +3239,18 @@ class CashuAppletTest {
         for (int i = 0; i < 3; i++) {
             say(out, "load 50, for the tap", "exact", SW_OK, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 50, 21 + i), 1));
         }
-        say(out, "spend 50", "sig", SW_OK, new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, 64));
-        say(out, "and 50 more: the tap's limit exactly", "sig", SW_OK, new CommandAPDU(CLA, INS_SPEND_PROOF, 1, 0, 64));
-        say(out, "a third is over the limit on one tap", "exact", SW_OVER_TAP_LIMIT, new CommandAPDU(CLA, INS_SPEND_PROOF, 2, 0, 64));
+        saySpend(out, "spend 50", SW_OK, 0);
+        saySpend(out, "and 50 more: the tap's limit exactly", SW_OK, 1);
+        saySpend(out, "a third is over the limit on one tap", SW_OVER_TAP_LIMIT, 2);
         say(out, "the PIN again begins no new tap", "exact", SW_OK, verifyOk);
-        say(out, "still over", "exact", SW_OVER_TAP_LIMIT, new CommandAPDU(CLA, INS_SPEND_PROOF, 2, 0, 64));
+        saySpend(out, "still over", SW_OVER_TAP_LIMIT, 2);
         say(out, "nor does a new SELECT", "exact", SW_OK, select);
         say(out, "the PIN", "exact", SW_OK, verifyOk);
-        say(out, "still over, after it", "exact", SW_OVER_TAP_LIMIT, new CommandAPDU(CLA, INS_SPEND_PROOF, 2, 0, 64));
+        saySpend(out, "still over, after it", SW_OVER_TAP_LIMIT, 2);
         time(out, "nine seconds on", SW_OK, OTHER_SIGNER, T0 + 109);
-        say(out, "is the same tap", "exact", SW_OVER_TAP_LIMIT, new CommandAPDU(CLA, INS_SPEND_PROOF, 2, 0, 64));
+        saySpend(out, "is the same tap", SW_OVER_TAP_LIMIT, 2);
         time(out, "ten seconds on", SW_OK, OTHER_SIGNER, T0 + 110);
-        say(out, "is the next: the third is signed", "sig", SW_OK, new CommandAPDU(CLA, INS_SPEND_PROOF, 2, 0, 64));
+        saySpend(out, "is the next: the third is signed", SW_OK, 2);
         say(out, "the info: the tap begun again at the clock, and 50 signed for in it", "exact", SW_OK, infoTap);
         owner(out, "the tap's limit changed, the day's the same", SW_OK, L_LIMIT, OWNER, concat(u32(0), u32(70)), p -> setLimitsCommand(p, 0, 70));
         say(out, "the info: 70 on a tap, and a window with nothing in it", "exact", SW_OK, infoTap);
@@ -3009,22 +3273,43 @@ class CashuAppletTest {
             say(out, "load 100, for the log", "exact", SW_OK, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 100, 31 + i), 1));
         }
         say(out, "the PIN", "exact", SW_OK, verifyOk);
-        say(out, "spend 100: the tap's limit", "sig", SW_OK, new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, 64));
-        say(out, "a second is refused, and written down", "exact", SW_OVER_TAP_LIMIT, new CommandAPDU(CLA, INS_SPEND_PROOF, 1, 0, 64));
-        say(out, "and again", "exact", SW_OVER_TAP_LIMIT, new CommandAPDU(CLA, INS_SPEND_PROOF, 1, 0, 64));
+        saySpend(out, "spend 100: the tap's limit", SW_OK, 0);
+        saySpend(out, "a second is refused, and written down", SW_OVER_TAP_LIMIT, 1);
+        saySpend(out, "and again", SW_OVER_TAP_LIMIT, 1);
         say(out, "the log: a new tap, one spend and two refusals in it, and no mark", "exact", SW_OK, getLog);
-        say(out, "a third refusal inside ten seconds of the clock", "exact", SW_OVER_TAP_LIMIT, new CommandAPDU(CLA, INS_SPEND_PROOF, 1, 0, 64));
+        saySpend(out, "a third refusal inside ten seconds of the clock", SW_OVER_TAP_LIMIT, 1);
         say(out, "the log: the tap is marked, and the run counted", "exact", SW_OK, getLog);
         sayReset(out, "taken away and put back again");
         say(out, "select", "exact", SW_OK, select);
         say(out, "the PIN", "exact", SW_OK, verifyOk);
         time(out, "eleven seconds on", SW_OK, OTHER_SIGNER, T0 + 121);
-        say(out, "the next tap: a spend within the limit", "sig", SW_OK, new CommandAPDU(CLA, INS_SPEND_PROOF, 1, 0, 64));
+        saySpend(out, "the next tap: a spend within the limit", SW_OK, 1);
         say(out, "the log: a third tap, newest first, with nothing refused in it", "exact", SW_OK, getLog);
         owner(out, "the limit taken off again", SW_OK, L_LIMIT, OWNER, concat(u32(0), u32(0)), p -> setLimitsCommand(p, 0, 0));
-        say(out, "spend the last", "sig", SW_OK, new CommandAPDU(CLA, INS_SPEND_PROOF, 2, 0, 64));
+        saySpend(out, "spend the last", SW_OK, 2);
         say(out, "CLEAR_SPENT", "exact", SW_OK, clear);
         say(out, "leaves the log as it is", "exact", SW_OK, getLog);
+
+        // one signature for a payment of three pieces into two outputs; the signature again; and a payment given up
+        for (int i = 0; i < 4; i++) {
+            say(out, "load, for one signature", "exact", SW_OK, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 8L << i, 41 + i), 1));
+        }
+        say(out, "the last signature this card gave, asked for again", "again", SW_OK, new CommandAPDU(CLA, INS_SPEND_ALL_AGAIN, 0, 0, 64));
+        say(out, "a payment begun: three places, in the order the swap will name them", "exact", SW_OK, beginCommand(2, 0, 1));
+        say(out, "its outputs, the amount and the blinded message of each", "exact", SW_OK,
+            new CommandAPDU(CLA, INS_SPEND_ALL_OUTPUTS, 0, 0, concat(output(32, blinded(1)), output(24, blinded(2)))));
+        say(out, "one signature, and the three are burned", "sigall", SW_OK, SIGN_ALL);
+        say(out, "the same signature, asked for again", "again", SW_OK, new CommandAPDU(CLA, INS_SPEND_ALL_AGAIN, 0, 0, 64));
+        say(out, "a second signature needs a second beginning", "exact", 0x6985, SIGN_ALL);
+        say(out, "a payment begun", "exact", SW_OK, beginCommand(3));
+        say(out, "and a command that is not its next step", "exact", SW_OK, info);
+        say(out, "gives it up: no signature", "exact", 0x6985, SIGN_ALL);
+        say(out, "outputs with no payment begun", "exact", 0x6985, new CommandAPDU(CLA, INS_SPEND_ALL_OUTPUTS, 0, 0, output(1, blinded(3))));
+        say(out, "a place named twice", "exact", 0x6A80, beginCommand(3, 3));
+        say(out, "SPEND_PROOF is gone", "exact", 0x6D00, new CommandAPDU(CLA, INS_SPEND_PROOF, 3, 0, 64));
+        say(out, "the log: the payment is one tap's, with its three pieces", "exact", SW_OK, getLog);
+        saySpend(out, "spend the fourth", SW_OK, 3);
+        say(out, "CLEAR_SPENT", "exact", SW_OK, clear);
 
         // the owner replaces itself, and locks
         say(out, "SET_OWNER with no proof", "exact", SW_OWNER_PROOF, setOwnerOpenCommand(OTHER_OWNER));
@@ -3225,8 +3510,9 @@ class CashuAppletTest {
     static String secretText(byte[] nonce, byte[] cardKey, long date, byte[] refundKey) {
         String s = "[\"P2PK\",{\"nonce\":\"" + toHex(nonce) + "\",\"data\":\"" + toHex(cardKey)
                  + "\",\"tags\":[";
-        if (date != 0) s += "[\"locktime\",\"" + date + "\"],[\"refund\",\"" + toHex(refundKey) + "\"]";
-        return s + "]}]";
+        // the flag is every piece's last tag, as the wallet's library writes it: after the refund key, or alone
+        if (date != 0) s += "[\"locktime\",\"" + date + "\"],[\"refund\",\"" + toHex(refundKey) + "\"],";
+        return s + "[\"sigflag\",\"SIG_ALL\"]]}]";
     }
 
     static byte[] hexToBytes(String hex) {

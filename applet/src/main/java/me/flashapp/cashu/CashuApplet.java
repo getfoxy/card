@@ -29,7 +29,10 @@ import javacardx.crypto.*;
  *   0x16  GET_CARD         — the card record: mint, unit, refund key, limit, time key
  *   0x17  GET_PIECES       — every slot's state and every unspent piece, a page at a time (P1 = the first slot)
  *   0x18  GET_LOG          — the card's own account of its taps: what it signed for, what it refused
- *   0x20  SPEND_PROOF      — mark spent + sign that slot's own secret (no message is taken)
+ *   0x22  SPEND_ALL_BEGIN  — the places a payment is made of, in order (one signature for all: NUT-11 SIG_ALL)
+ *   0x23  SPEND_ALL_OUTPUTS — the swap's outputs, 37 bytes each, hashed into the message as they come
+ *   0x24  SPEND_ALL_SIGN   — the one signature; every piece named is burned as it is given
+ *   0x25  SPEND_ALL_AGAIN  — the last signature given, again, for an answer lost on the air
  *   0x30  LOAD_PROOF       — store new proof (an owner, a time, and a PIN or the owner's grant)
  *   0x31  CLEAR_SPENT      — free spent slots (PIN, or the owner's grant)
  *   0x32  SET_CARD         — write the card record (open card: PIN; owned card: the owner's proof; only with nothing unspent)
@@ -101,8 +104,10 @@ public class CashuApplet extends Applet {
     // (2 was the allowance draft and the first limit).
     static final byte VERSION_MAJOR = (byte) 0x01;
     // 1.3 is the limit on one tap (docs/FOXY-CARD-DAILY-LIMIT.md, section 6a).
-    static final byte VERSION_MINOR = (byte) 0x03;
-    static final byte FORMAT        = (byte) 0x03;
+    // 1.4 is one signature for a whole payment (NUT-11 SIG_ALL): format 4, in
+    // which every piece's secret carries the flag and SPEND_PROOF is gone.
+    static final byte VERSION_MINOR = (byte) 0x04;
+    static final byte FORMAT        = (byte) 0x04;
 
     // -------------------------------------------------------------------------
     // APDU instruction bytes
@@ -117,7 +122,13 @@ public class CashuApplet extends Applet {
     static final byte INS_GET_CARD         = (byte) 0x16;
     static final byte INS_GET_PIECES       = (byte) 0x17;
     static final byte INS_GET_LOG          = (byte) 0x18;
-    static final byte INS_SPEND_PROOF      = (byte) 0x20;
+    // 0x20 was SPEND_PROOF: one piece, one signature over its secret alone. A
+    // piece of format 4 says SIG_ALL in its secret, and a mint takes no such
+    // signature for it. It answers 6D00 and stays unassigned.
+    static final byte INS_SPEND_ALL_BEGIN   = (byte) 0x22;
+    static final byte INS_SPEND_ALL_OUTPUTS = (byte) 0x23;
+    static final byte INS_SPEND_ALL_SIGN    = (byte) 0x24;
+    static final byte INS_SPEND_ALL_AGAIN   = (byte) 0x25;
     // 0x21 was SIGN_ARBITRARY. It answers 6D00 and must stay unassigned.
     static final byte INS_LOAD_PROOF       = (byte) 0x30;
     static final byte INS_CLEAR_SPENT      = (byte) 0x31;
@@ -207,6 +218,11 @@ public class CashuApplet extends Applet {
 
     static final short AUTH_NONCE_LEN      = (short) 16;
 
+    // One signature for a payment: no more pieces than this in it, and an
+    // output is its amount (4, big-endian) and its blinded message (33).
+    static final short ALL_MOST            = (short) 32;
+    static final short ALL_OUTPUT_LEN      = (short) 37;
+
     // -------------------------------------------------------------------------
     // The log (persistent): the card's own account of what it has signed for
     // and what it has refused. A spend writes it, in the transaction that
@@ -274,6 +290,7 @@ public class CashuApplet extends Applet {
     static final short SW_NOT_THE_TIME          = (short) 0x6A93; // SET_TIME whose signature is not the time key's
     static final short SW_PIECE_ON_CARD         = (short) 0x6A94; // LOAD_PROOF of a piece whose nonce is already in a slot, spent or not
     static final short SW_OVER_TAP_LIMIT        = (short) 0x6A95; // the piece would take this tap past the limit on one tap
+    static final short SW_TOO_MANY              = (short) 0x6A96; // more pieces than one signature can burn at once
 
     // LOCK_CARD confirmation byte
     static final byte LOCK_CONFIRM_BYTE = (byte) 0xDE;
@@ -406,8 +423,12 @@ public class CashuApplet extends Applet {
         '[','"','l','o','c','k','t','i','m','e','"',',','"' };
     private static final byte[] SECRET_REFUND = { // "],["refund","
         '"',']',',','[','"','r','e','f','u','n','d','"',',','"' };
-    private static final byte[] SECRET_END_DATED = { '"',']',']','}',']' };   // "]]}]
-    private static final byte[] SECRET_END = { ']','}',']' };                  // ]}]
+    // Every piece's last tag: ["sigflag","SIG_ALL"]. After the refund key where
+    // the piece has a date, and alone where it has none.
+    private static final byte[] SECRET_END_DATED = {   // "],["sigflag","SIG_ALL"]]}]
+        '"',']',',','[','"','s','i','g','f','l','a','g','"',',','"','S','I','G','_','A','L','L','"',']',']','}',']' };
+    private static final byte[] SECRET_END = {         // ["sigflag","SIG_ALL"]]}]
+        '[','"','s','i','g','f','l','a','g','"',',','"','S','I','G','_','A','L','L','"',']',']','}',']' };
     private static final byte[] HEX = {
         '0','1','2','3','4','5','6','7','8','9','a','b','c','d','e','f' };
     /** AUTH's tag: the message signed is SHA-256(SHA-256(tag) || SHA-256(tag) || ...). */
@@ -572,6 +593,21 @@ public class CashuApplet extends Applet {
     /** Whether this time in the field has an entry in the log yet. Gone with the power, not with a SELECT. */
     private byte[] tapOpen;
     private MessageDigest sha;
+    /** The hash of the message a payment's one signature is over, kept from SPEND_ALL_BEGIN to SPEND_ALL_SIGN. */
+    private MessageDigest shaAll;
+    /** The places being paid with, in the order they were named. Gone with a SELECT. */
+    private byte[] allSlots;
+    /** [0] whether a payment is begun and not yet signed for; [1] how many places it names. Gone with a SELECT. */
+    private byte[] allState;
+    /** What those pieces are worth together. Gone with a SELECT. */
+    private byte[] allSum;
+    /**
+     * The last signature given (64), and whether there has been one (1).
+     * Permanent, and written in the transaction that burns the pieces it is
+     * for: a card taken away as its answer was on the air has burned them, and
+     * the terminal that asked has nothing. It asks again (SPEND_ALL_AGAIN).
+     */
+    private byte[] lastSig;
     private RandomData rng;
 
     // -------------------------------------------------------------------------
@@ -619,6 +655,11 @@ public class CashuApplet extends Applet {
         cardLog         = new byte[LOG_LEN];
         tapOpen         = JCSystem.makeTransientByteArray((short) 1, JCSystem.CLEAR_ON_RESET);
         sha             = MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
+        shaAll          = MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
+        allSlots        = JCSystem.makeTransientByteArray(ALL_MOST, JCSystem.CLEAR_ON_DESELECT);
+        allState        = JCSystem.makeTransientByteArray((short) 2, JCSystem.CLEAR_ON_DESELECT);
+        allSum          = JCSystem.makeTransientByteArray((short) 4, JCSystem.CLEAR_ON_DESELECT);
+        lastSig         = new byte[(short) 65];
         rng             = RandomData.getInstance(RandomData.ALG_SECURE_RANDOM);
         sha.reset();
         sha.doFinal(AUTH_TAG, (short) 0, (short) AUTH_TAG.length, authTagHash, (short) 0);
@@ -713,6 +754,13 @@ public class CashuApplet extends Applet {
             ISOException.throwIt(ISO7816.SW_CLA_NOT_SUPPORTED);
         }
 
+        /* A payment begun (SPEND_ALL_BEGIN) is given up by anything that is not
+         * its next step: nothing may come between the pieces being named and
+         * their being burned and signed for, that could change either. */
+        if (buf[ISO7816.OFFSET_INS] != INS_SPEND_ALL_OUTPUTS && buf[ISO7816.OFFSET_INS] != INS_SPEND_ALL_SIGN) {
+            allState[0] = (byte) 0;
+        }
+
         switch (buf[ISO7816.OFFSET_INS]) {
             case INS_GET_INFO:         processGetInfo(apdu);        break;
             case INS_GET_PUBKEY:       processGetPubkey(apdu);      break;
@@ -724,7 +772,10 @@ public class CashuApplet extends Applet {
             case INS_GET_CARD:         processGetCard(apdu);        break;
             case INS_GET_PIECES:       processGetPieces(apdu);      break;
             case INS_GET_LOG:          processGetLog(apdu);         break;
-            case INS_SPEND_PROOF:      processSpendProof(apdu);     break;
+            case INS_SPEND_ALL_BEGIN:   processSpendAllBegin(apdu);   break;
+            case INS_SPEND_ALL_OUTPUTS: processSpendAllOutputs(apdu); break;
+            case INS_SPEND_ALL_SIGN:    processSpendAllSign(apdu);    break;
+            case INS_SPEND_ALL_AGAIN:   processSpendAllAgain(apdu);   break;
             case INS_LOAD_PROOF:       processLoadProof(apdu);      break;
             case INS_CLEAR_SPENT:      processClearSpent(apdu);     break;
             case INS_SET_CARD:         processSetCard(apdu);        break;
@@ -938,153 +989,269 @@ public class CashuApplet extends Applet {
     // Category 0x2x — Spend commands (PIN-gated when a PIN is set or blocked, D13)
     // -------------------------------------------------------------------------
 
-    private void processSpendProof(APDU apdu) {
-        // D13: gate FIRST — a wrong or missing PIN throws before the slot
-        // burn, so no proof is consumed by an unauthorised request. A LOCKED
-        // card still spends (lock disables writes, not the bearer's ability
-        // to pay — see the locked-card test).
+    /*
+     * A payment is one signature, however many pieces it is made of (NUT-11
+     * SIG_ALL). The message the mint checks it against is every input's secret
+     * and its C, in order, and then every output's amount and blinded message:
+     *
+     *   secret_0 || C_0 || ... || secret_n || C_n || amount_0 || B_0 || ... || amount_m || B_m
+     *
+     * as text (C and B_ in hex, an amount in decimal), hashed with SHA-256.
+     *
+     * The card builds the first half itself, from the places it is told to pay
+     * with, and burns exactly those: a terminal that could hand it a hash to
+     * sign would name one small piece to burn and get a signature good for
+     * every piece on the card. The second half is the terminal's, and the card
+     * cannot check it: it is where the terminal wants the money to go. It is
+     * hashed as it comes, so the signature is good for those outputs and no
+     * others.
+     *
+     * Three commands, in one tap and with nothing between them:
+     *
+     *   SPEND_ALL_BEGIN    the places, in the order the swap will name them
+     *   SPEND_ALL_OUTPUTS  the outputs, thirty-seven bytes each; as many
+     *                      commands as they need, or none
+     *   SPEND_ALL_SIGN     the signature; the pieces are burned as it is given
+     */
+
+    /**
+     * SPEND_ALL_BEGIN: one byte for each place to pay with, in order.
+     *
+     * The PIN, as any spend. Every place named once, holding an unspent piece,
+     * and all of one date (pieces with different dates have different lock
+     * conditions, and a mint takes no one signature for those: `6A80`). The
+     * limits are held to what the pieces are worth together, before anything
+     * is hashed: over the day, `6A8F`; over the tap, `6A95`; each written down
+     * in the log before it is refused, as a spend over a limit always is.
+     * Answers what the pieces are worth (4, big-endian).
+     */
+    private void processSpendAllBegin(APDU apdu) {
+        // D13: gate FIRST — a wrong or missing PIN throws before anything is looked at.
+        // A LOCKED card still spends (lock disables writes, not the bearer's ability to pay).
         requirePinIfSet();
-
+        short n = apdu.setIncomingAndReceive();
         byte[] buf = apdu.getBuffer();
-        short idx = (short)(buf[ISO7816.OFFSET_P1] & 0xFF);
-        if (idx >= MAX_PROOFS) ISOException.throwIt(SW_SLOT_OUT_OF_RANGE);
+        if (n < (short) 1) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        if (n > ALL_MOST) ISOException.throwIt(SW_TOO_MANY);
+        // kept apart from the APDU buffer, which the hashing below writes over
+        Util.arrayCopyNonAtomic(buf, ISO7816.OFFSET_CDATA, allSlots, (short) 0, n);
+        Util.arrayFillNonAtomic(allSum, (short) 0, (short) 4, (byte) 0);
+        short first = (short)((short)(allSlots[0] & 0xFF) * PROOF_SIZE);
+        short carry = 0;
+        for (short i = 0; i < n; i++) {
+            short idx = (short)(allSlots[i] & 0xFF);
+            if (idx >= MAX_PROOFS) ISOException.throwIt(SW_SLOT_OUT_OF_RANGE);
+            short base = (short)(idx * PROOF_SIZE);
+            byte status = proofStorage[(short)(base + PROOF_STATUS_OFFSET)];
+            if (status == STATUS_EMPTY)  ISOException.throwIt(SW_SLOT_EMPTY);
+            if (status == STATUS_SPENT)  ISOException.throwIt(SW_ALREADY_SPENT);
+            for (short j = 0; j < i; j++) {
+                if (allSlots[j] == allSlots[i]) ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+            }
+            if (!sameBytes(proofStorage, (short)(base + PROOF_DATE_OFFSET), proofStorage, (short)(first + PROOF_DATE_OFFSET), (short) 4)) {
+                ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+            }
+            if (addUint32Carry(allSum, (short) 0, proofStorage, (short)(base + PROOF_AMOUNT_OFFSET)) != 0) carry = 1;
+        }
+        // a sum that wraps is past any limit, and past what four bytes can say: not a payment
+        if (carry != 0) Util.arrayFillNonAtomic(allSum, (short) 0, (short) 4, (byte) 0xFF);
+        requireUnderLimits(carry);
 
-        short base = (short)(idx * PROOF_SIZE);
-        byte status = proofStorage[(short)(base + PROOF_STATUS_OFFSET)];
+        shaAll.reset();
+        for (short i = 0; i < n; i++) {
+            short base = (short)((short)(allSlots[i] & 0xFF) * PROOF_SIZE);
+            secretInto(shaAll, base, buf);
+            toHex(proofStorage, (short)(base + PROOF_C_OFFSET), (short) 33);
+            shaAll.update(scratch, X_HEX, (short) 66);
+        }
+        allState[1] = (byte) n;
+        allState[0] = (byte) 1;
+        Util.arrayCopyNonAtomic(allSum, (short) 0, buf, (short) 0, (short) 4);
+        apdu.setOutgoingAndSend((short) 0, (short) 4);
+    }
 
-        if (status == STATUS_EMPTY)  ISOException.throwIt(SW_SLOT_EMPTY);
-        if (status == STATUS_SPENT)  ISOException.throwIt(SW_ALREADY_SPENT);
+    /**
+     * SPEND_ALL_OUTPUTS: the swap's outputs, in order, thirty-seven bytes
+     * each: the amount (4, big-endian) and the blinded message (33). Hashed as
+     * the mint will read them, the amount in decimal and the point in hex. As
+     * many of these commands as the outputs need. `6985` with no payment begun.
+     */
+    private void processSpendAllOutputs(APDU apdu) {
+        if (allState[0] != (byte) 1) ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+        short len = apdu.setIncomingAndReceive();
+        if (len < ALL_OUTPUT_LEN || (short)(len % ALL_OUTPUT_LEN) != (short) 0) {
+            allState[0] = (byte) 0;
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+        byte[] buf = apdu.getBuffer();
+        short end = (short)(ISO7816.OFFSET_CDATA + len);
+        for (short at = ISO7816.OFFSET_CDATA; at < end; at += ALL_OUTPUT_LEN) {
+            short digits = toDecimal(buf, at);
+            shaAll.update(scratch, (short)(X_DEC + 10 - digits), digits);
+            toHex(buf, (short)(at + 4), (short) 33);
+            shaAll.update(scratch, X_HEX, (short) 66);
+        }
+    }
 
-        /* The day's limit, before anything is signed or burned. A terminal that
-         * has the PIN picks the slots, and nothing on the card can tell its
-         * request from the holder's, so what bounds it is a number in
-         * permanent memory, counted against a day that only time can end. The
-         * piece is charged at its whole worth, not at the price of the payment
-         * it is for: change that a terminal writes back is not something the
-         * card can check, so loading never gives the day anything back. A
-         * limit of 0 is no limit: nothing is checked, and nothing counted. */
+    /**
+     * SPEND_ALL_SIGN: the one signature, 64 bytes, and every piece named at
+     * SPEND_ALL_BEGIN burned as it is given.
+     *
+     * Signed first, into the APDU buffer, which is RAM and leaves the card only
+     * with the answer; then burned; then answered. A card taken away while it
+     * signs (most of a second) has burned nothing and sent nothing, and no
+     * signature leaves the card for pieces that are not burned, because the
+     * answer is sent only after the commit. (Burned first, a card pulled away
+     * while signing had spent the pieces and given nothing for them.)
+     *
+     * One transaction for all of it: every piece's place, what the day and the
+     * tap have signed for, and the card's own log. A card pulled away in it has
+     * done all of it or none. A set too large for one transaction on this card
+     * burns nothing and is `6A96`: the terminal names fewer.
+     */
+    private void processSpendAllSign(APDU apdu) {
+        if (allState[0] != (byte) 1) ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+        requirePinIfSet();
+        // one signature for one beginning
+        allState[0] = (byte) 0;
+        short n = (short)(allState[1] & 0xFF);
+        byte[] buf = apdu.getBuffer();
+
+        /* The limits again, as they stand now: what the day and the tap would
+         * have signed for is left in scratch (X_SUM, X_TAP) for the commit. */
+        requireUnderLimits((short) 0);
         boolean limited = !isZero(cardRecord, CARD_LIMIT_OFFSET, (short) 4);
-        boolean newDay = false;
-        if (limited) {
-            // never been told the time: a card that cannot know the day does not spend under a limit
-            if (isZero(cardRecord, CARD_NOW_OFFSET, (short) 4)) ISOException.throwIt(SW_NO_TIME);
-            newDay = dayIsOver();
-            // what the day would have signed for with this piece: nothing yet in a new one, plus the piece
-            if (newDay) {
-                Util.arrayFillNonAtomic(scratch, X_SUM, (short) 4, (byte) 0);
-            } else {
-                Util.arrayCopyNonAtomic(cardRecord, CARD_SPENT_OFFSET, scratch, X_SUM, (short) 4);
-            }
-            short carry = addUint32Carry(scratch, X_SUM, proofStorage, (short)(base + PROOF_AMOUNT_OFFSET));
-            // a sum that wraps is over any limit
-            if (carry != 0 || cmpUint32(scratch, X_SUM, cardRecord, CARD_LIMIT_OFFSET) > 0) {
-                refuseOverLimit(SW_OVER_LIMIT);
-            }
-        }
-
-        /* And the limit on one tap, the same way: a number in permanent
-         * memory, counted against a window that only the card's clock can
-         * end. A tap is TAP_SECONDS of that clock. It is not a PIN entry, a
-         * SELECT or a time in the field: a limit that any of those began
-         * again was tried first, and a terminal holding the PIN began it
-         * again between every two pieces. What bounds a terminal here is
-         * what bounds it by the day: it cannot make time pass (and with a
-         * time signer that every copy of the app holds, it can; see the
-         * spec's 5.7 for both limits). */
         boolean tapLimited = !isZero(cardRecord, CARD_TAP_LIMIT_OFFSET, (short) 4);
-        boolean newTap = false;
-        if (tapLimited) {
-            if (isZero(cardRecord, CARD_NOW_OFFSET, (short) 4)) ISOException.throwIt(SW_NO_TIME);
-            newTap = windowIsOver(cardRecord, CARD_TAP_WINDOW_OFFSET, TAP_SECONDS);
-            if (newTap) {
-                Util.arrayFillNonAtomic(scratch, X_TAP, (short) 4, (byte) 0);
-            } else {
-                Util.arrayCopyNonAtomic(cardRecord, CARD_TAP_SPENT_OFFSET, scratch, X_TAP, (short) 4);
-            }
-            short over = addUint32Carry(scratch, X_TAP, proofStorage, (short)(base + PROOF_AMOUNT_OFFSET));
-            if (over != 0 || cmpUint32(scratch, X_TAP, cardRecord, CARD_TAP_LIMIT_OFFSET) > 0) {
-                refuseOverLimit(SW_OVER_TAP_LIMIT);
-            }
-        }
+        boolean newDay = limited && dayIsOver();
+        boolean newTap = tapLimited && windowIsOver(cardRecord, CARD_TAP_WINDOW_OFFSET, TAP_SECONDS);
 
-        /* The message is the card's to work out. Upstream took 32 bytes from
-         * the reader here, and signed them: slot A could be burned for slot
-         * B's signature, or for anything at all, so SPENT bound nothing.
-         * Nothing the reader sends reaches the signer now. Built before the
-         * burn: it changes no state, and a fault in it must not cost a piece. */
-        secretHash(base, buf);
-
-        /* Signed first, into the APDU buffer, which is RAM and leaves the card
-         * only with the answer below; then burned; then answered.
-         *
-         * It was burned first and signed after, so the piece was spent for the
-         * whole of the signing, most of a second, with its signature not yet
-         * made. A card taken away in that time had spent the piece and given
-         * nothing for it: the piece was lost, and a person who pulls a card
-         * away mid-tap does it in that window more often than not (a
-         * payment cut short twice lost 1,024 and then 512).
-         *
-         * The guard is unchanged: no signature leaves the card for a piece that
-         * is not burned, because the answer is sent only after the commit. A
-         * card pulled away before the commit has burned nothing and sent
-         * nothing (the signature dies with the RAM); one pulled away after it
-         * has lost only the few milliseconds of the answer on the air. And no
-         * abort can reset the flag: there is nothing to abort once it is set.
-         *
-         * What the day has signed for goes up in the same transaction as the
-         * burn (and the window begins, if this piece begins a new day): a card
-         * pulled away here has either done all of it or none, so it never
-         * counts a piece it did not burn, and never burns one it did not count. */
+        shaAll.doFinal(buf, (short) 0, (short) 0, scratch, X_MSG);
         short sigLen = schnorrHW.sign(cardPrivKey, cardPubKey, scratch, X_MSG, buf, (short) 0);
 
-        JCSystem.beginTransaction();
-        if (limited) {
-            if (newDay) Util.arrayCopy(cardRecord, CARD_NOW_OFFSET, cardRecord, CARD_WINDOW_OFFSET, (short) 4);
-            Util.arrayCopy(scratch, X_SUM, cardRecord, CARD_SPENT_OFFSET, (short) 4);
+        try {
+            JCSystem.beginTransaction();
+            if (limited) {
+                if (newDay) Util.arrayCopy(cardRecord, CARD_NOW_OFFSET, cardRecord, CARD_WINDOW_OFFSET, (short) 4);
+                Util.arrayCopy(scratch, X_SUM, cardRecord, CARD_SPENT_OFFSET, (short) 4);
+            }
+            if (tapLimited) {
+                if (newTap) Util.arrayCopy(cardRecord, CARD_NOW_OFFSET, cardRecord, CARD_TAP_WINDOW_OFFSET, (short) 4);
+                Util.arrayCopy(scratch, X_TAP, cardRecord, CARD_TAP_SPENT_OFFSET, (short) 4);
+            }
+            for (short i = 0; i < n; i++) {
+                short base = (short)((short)(allSlots[i] & 0xFF) * PROOF_SIZE);
+                proofStorage[(short)(base + PROOF_STATUS_OFFSET)] = STATUS_SPENT;
+            }
+            // and the next tap may put the change on with no PIN (see select)
+            changeDue[0] = (byte) 1;
+            // and the card's own account of it, with the burn: no piece is burned that the log does not have
+            short entry = logEntry();
+            addUint32Stop(cardLog, (short)(entry + LOG_E_SATS), allSum, (short) 0);
+            short pieces = (short)((short)(cardLog[(short)(entry + LOG_E_PIECES)] & 0xFF) + n);
+            cardLog[(short)(entry + LOG_E_PIECES)] = (byte)(pieces > (short) 255 ? (short) 255 : pieces);
+            addUint32Stop(cardLog, LOG_SATS_OFFSET, allSum, (short) 0);
+            // and the signature itself, for the terminal whose answer is lost on the air (SPEND_ALL_AGAIN)
+            Util.arrayCopy(buf, (short) 0, lastSig, (short) 1, (short) 64);
+            lastSig[0] = (byte) 1;
+            JCSystem.commitTransaction();
+        } catch (TransactionException e) {
+            if (JCSystem.getTransactionDepth() != (byte) 0) JCSystem.abortTransaction();
+            ISOException.throwIt(SW_TOO_MANY);
         }
-        if (tapLimited) {
-            if (newTap) Util.arrayCopy(cardRecord, CARD_NOW_OFFSET, cardRecord, CARD_TAP_WINDOW_OFFSET, (short) 4);
-            Util.arrayCopy(scratch, X_TAP, cardRecord, CARD_TAP_SPENT_OFFSET, (short) 4);
-        }
-        proofStorage[(short)(base + PROOF_STATUS_OFFSET)] = STATUS_SPENT;
-        // and the next tap may put the change on with no PIN (see select)
-        changeDue[0] = (byte) 1;
-        // and the card's own account of it, with the burn: no piece is burned that the log does not have
-        short entry = logEntry();
-        addUint32Stop(cardLog, (short)(entry + LOG_E_SATS), proofStorage, (short)(base + PROOF_AMOUNT_OFFSET));
-        if (cardLog[(short)(entry + LOG_E_PIECES)] != (byte) 0xFF) cardLog[(short)(entry + LOG_E_PIECES)]++;
-        addUint32Stop(cardLog, LOG_SATS_OFFSET, proofStorage, (short)(base + PROOF_AMOUNT_OFFSET));
-        JCSystem.commitTransaction();
         tapOpen[0] = (byte) 1;
 
         apdu.setOutgoingAndSend((short) 0, sigLen);
     }
 
     /**
-     * SHA-256 of the NUT-10 secret of the piece at `base`, into scratch[X_MSG].
-     * `buf` is the APDU buffer, used for the card's public key.
+     * SPEND_ALL_AGAIN: the last signature this card gave, 64 bytes, again.
+     *
+     * The pieces are burned as the signature is given, and the answer is the
+     * one thing that can still be lost: a card taken away in those few
+     * milliseconds has spent the payment's pieces, all of them, and the
+     * terminal has no signature to spend them with. This is the way back. It
+     * gives nothing away: the signature is good only for the pieces it burned
+     * and the outputs it was made for, which are the asking terminal's own,
+     * and a terminal that did not make that payment can do nothing with it.
+     * The PIN, as a spend. `6A88` on a card that has never signed.
      */
-    private void secretHash(short base, byte[] buf) {
-        sha.reset();
-        sha.update(SECRET_1, (short) 0, (short) SECRET_1.length);
+    private void processSpendAllAgain(APDU apdu) {
+        requirePinIfSet();
+        if (lastSig[0] != (byte) 1) ISOException.throwIt(SW_SLOT_EMPTY);
+        byte[] buf = apdu.getBuffer();
+        Util.arrayCopyNonAtomic(lastSig, (short) 1, buf, (short) 0, (short) 64);
+        apdu.setOutgoingAndSend((short) 0, (short) 64);
+    }
+
+    /**
+     * The limits, held to what the pieces named at SPEND_ALL_BEGIN are worth
+     * together (`allSum`; `carry` where that sum wrapped). Leaves in scratch
+     * what the day (X_SUM) and the tap (X_TAP) would have signed for with them.
+     *
+     * A terminal that has the PIN picks the places, and nothing on the card
+     * can tell its request from the holder's, so what bounds it is a number in
+     * permanent memory, counted against a window that only time can end: the
+     * day, and the tap (ten seconds of the card's clock; not a PIN entry, a
+     * SELECT or a time in the field, which a terminal begins again as it
+     * likes). The pieces are charged at their whole worth, not at the price of
+     * the payment: change that a terminal writes back is not something the
+     * card can check. A limit of 0 is no limit: nothing is checked, and
+     * nothing counted. Over either, the spend is written down and refused.
+     */
+    private void requireUnderLimits(short carry) {
+        boolean limited = !isZero(cardRecord, CARD_LIMIT_OFFSET, (short) 4);
+        boolean tapLimited = !isZero(cardRecord, CARD_TAP_LIMIT_OFFSET, (short) 4);
+        // never been told the time: a card that cannot know the day does not spend under a limit
+        if ((limited || tapLimited) && isZero(cardRecord, CARD_NOW_OFFSET, (short) 4)) ISOException.throwIt(SW_NO_TIME);
+        if (limited) {
+            if (dayIsOver()) {
+                Util.arrayFillNonAtomic(scratch, X_SUM, (short) 4, (byte) 0);
+            } else {
+                Util.arrayCopyNonAtomic(cardRecord, CARD_SPENT_OFFSET, scratch, X_SUM, (short) 4);
+            }
+            short over = addUint32Carry(scratch, X_SUM, allSum, (short) 0);
+            if (carry != 0 || over != 0 || cmpUint32(scratch, X_SUM, cardRecord, CARD_LIMIT_OFFSET) > 0) {
+                refuseOverLimit(SW_OVER_LIMIT);
+            }
+        }
+        if (tapLimited) {
+            if (windowIsOver(cardRecord, CARD_TAP_WINDOW_OFFSET, TAP_SECONDS)) {
+                Util.arrayFillNonAtomic(scratch, X_TAP, (short) 4, (byte) 0);
+            } else {
+                Util.arrayCopyNonAtomic(cardRecord, CARD_TAP_SPENT_OFFSET, scratch, X_TAP, (short) 4);
+            }
+            short over = addUint32Carry(scratch, X_TAP, allSum, (short) 0);
+            if (carry != 0 || over != 0 || cmpUint32(scratch, X_TAP, cardRecord, CARD_TAP_LIMIT_OFFSET) > 0) {
+                refuseOverLimit(SW_OVER_TAP_LIMIT);
+            }
+        }
+    }
+
+    /**
+     * The NUT-10 secret of the piece at `base`, as text, into `md`: not
+     * finished, so that more can follow it. `buf` is the APDU buffer, used for
+     * the card's public key.
+     */
+    private void secretInto(MessageDigest md, short base, byte[] buf) {
+        md.update(SECRET_1, (short) 0, (short) SECRET_1.length);
         toHex(proofStorage, (short)(base + PROOF_NONCE_OFFSET), (short) 32);
-        sha.update(scratch, X_HEX, (short) 64);
-        sha.update(SECRET_2, (short) 0, (short) SECRET_2.length);
+        md.update(scratch, X_HEX, (short) 64);
+        md.update(SECRET_2, (short) 0, (short) SECRET_2.length);
         short len = toCompressed(buf, cardPubKey.getW(buf, (short) 0));
         toHex(buf, (short) 0, len);
-        sha.update(scratch, X_HEX, (short) 66);
-        sha.update(SECRET_3, (short) 0, (short) SECRET_3.length);
+        md.update(scratch, X_HEX, (short) 66);
+        md.update(SECRET_3, (short) 0, (short) SECRET_3.length);
         if (isZero(proofStorage, (short)(base + PROOF_DATE_OFFSET), (short) 4)) {
-            sha.doFinal(SECRET_END, (short) 0, (short) SECRET_END.length, scratch, X_MSG);
+            md.update(SECRET_END, (short) 0, (short) SECRET_END.length);
             return;
         }
-        sha.update(SECRET_DATE, (short) 0, (short) SECRET_DATE.length);
+        md.update(SECRET_DATE, (short) 0, (short) SECRET_DATE.length);
         short digits = toDecimal(proofStorage, (short)(base + PROOF_DATE_OFFSET));
-        sha.update(scratch, (short)(X_DEC + 10 - digits), digits);
-        sha.update(SECRET_REFUND, (short) 0, (short) SECRET_REFUND.length);
+        md.update(scratch, (short)(X_DEC + 10 - digits), digits);
+        md.update(SECRET_REFUND, (short) 0, (short) SECRET_REFUND.length);
         toHex(cardRecord, CARD_REFUND_OFFSET, (short) 33);
-        sha.update(scratch, X_HEX, (short) 66);
-        sha.doFinal(SECRET_END_DATED, (short) 0, (short) SECRET_END_DATED.length, scratch, X_MSG);
+        md.update(scratch, X_HEX, (short) 66);
+        md.update(SECRET_END_DATED, (short) 0, (short) SECRET_END_DATED.length);
     }
 
     /**
