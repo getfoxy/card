@@ -50,6 +50,7 @@ class CashuAppletTest {
     static final byte INS_LOAD_PROOF       = (byte) 0x30;
     static final byte INS_CLEAR_SPENT      = (byte) 0x31;
     static final byte INS_SET_CARD         = (byte) 0x32;
+    static final byte INS_GET_LOG          = (byte) 0x18;
     static final byte INS_SET_LIMIT        = (byte) 0x33;   // by PIN: an open card only
     static final byte INS_SET_LIMIT_OWNER  = (byte) 0x34;
     static final byte INS_SET_TIME         = (byte) 0x35;
@@ -278,6 +279,26 @@ class CashuAppletTest {
     /** The owner's phone setting both limits: a nonce, a proof over the eight bytes, the command. */
     private int setLimits(long day, long tap) {
         return sw(setLimitsCommand(ownerProof(L_LIMIT, OWNER, nonceBytes(), concat(u32(day), u32(tap))), day, tap));
+    }
+    /** GET_LOG: the four counts, then the last taps, newest first, twelve bytes each. */
+    private ResponseAPDU logAnswer() { return transmit(new CommandAPDU(CLA, INS_GET_LOG, 0, 0, 256)); }
+    private byte[] log() { ResponseAPDU r = logAnswer(); assertEquals(SW_OK, r.getSW()); return r.getData(); }
+    private long logTaps() { return readUint32(log(), 0); }
+    private long logSats() { return readUint32(log(), 4); }
+    private long logRefused() { return readUint32(log(), 8); }
+    private long logTampers() { return readUint32(log(), 12); }
+    private int logHeld() { return (log().length - 16) / 12; }
+    /** The tap `k` back from the newest: { the clock when it began, sats signed for, pieces, refused, flags }. */
+    private long[] logTap(int k) {
+        byte[] d = log();
+        int at = 16 + 12 * k;
+        return new long[] { readUint32(d, at), readUint32(d, at + 4), d[at + 8] & 0xFF, d[at + 9] & 0xFF, d[at + 10] & 0xFF };
+    }
+    /** The card taken out of the field and put back: a new tap, selected, with the PIN. */
+    private void newTap() {
+        simulator.reset();
+        reselect();
+        assertEquals(SW_OK, verify(TEST_PIN));
     }
     /** GET_INFO asked for the tap as well (P1 = 1): forty-two bytes. */
     private byte[] infoTap() { return transmit(new CommandAPDU(CLA, INS_GET_INFO, 1, 0, 256)).getData(); }
@@ -2040,6 +2061,142 @@ class CashuAppletTest {
     }
 
     // =========================================================================
+    // The card's own log
+    // =========================================================================
+
+    @Test
+    @DisplayName("The log: a new card's is empty; a tap is one time in the field, however often the applet is selected in it; each has when, how much and how many pieces; the counts add up")
+    void testTheLogIsTheCardsOwn() {
+        assertArrayEquals(new byte[16], log(), "a new card: four counts of nothing, and no taps");
+        ready();
+        for (int i = 0; i < 4; i++) assertEquals(SW_OK, load(buildProof(KEYSET, new long[] { 100, 50, 25, 7 }[i], i + 1)).getSW());
+        assertEquals(0, logTaps(), "loading is not written down: the log is of what leaves");
+        newTap();
+        assertEquals(SW_OK, setTime(T0 + 5));
+        assertEquals(SW_OK, spend(0).getSW());
+        assertEquals(SW_OK, spend(1).getSW());
+        assertEquals(1, logTaps());
+        assertEquals(150, logSats());
+        assertArrayEquals(new long[] { T0 + 5, 150, 2, 0, 0 }, logTap(0), "one tap: the clock, 150 sats, two pieces, nothing refused, no mark");
+        // the applet selected again and the PIN again, in the same time in the field: the same tap
+        reselect();
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, spend(2).getSW());
+        assertEquals(1, logTaps(), "a new SELECT is not a new tap");
+        assertArrayEquals(new long[] { T0 + 5, 175, 3, 0, 0 }, logTap(0));
+        // taken away and brought back: the next tap
+        newTap();
+        assertEquals(SW_OK, setTime(T0 + 60));
+        assertEquals(1, logTaps(), "a tap in which nothing is signed for or refused is not written down");
+        assertEquals(SW_OK, spend(3).getSW());
+        assertEquals(2, logTaps());
+        assertEquals(182, logSats());
+        assertEquals(2, logHeld());
+        assertArrayEquals(new long[] { T0 + 60, 7, 1, 0, 0 }, logTap(0), "newest first");
+        assertArrayEquals(new long[] { T0 + 5, 175, 3, 0, 0 }, logTap(1));
+        assertEquals(0, logRefused());
+        assertEquals(0, logTampers());
+    }
+
+    @Test
+    @DisplayName("The log is for whoever the card is open to: the PIN verified in this tap, or the owner's grant; and nothing a terminal or the owner can send clears it")
+    void testTheLogIsKept() {
+        ready();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 64, 1)).getSW());
+        assertEquals(SW_OK, spend(0).getSW());
+        byte[] before = log();
+        simulator.reset();
+        reselect();
+        assertEquals(SW_SECURITY_NOT_SATIS, logAnswer().getSW(), "not to a reader with no PIN");
+        assertEquals(SW_OK, allowLoad());
+        assertArrayEquals(before, log(), "to the owner's phone, with its proof and no PIN");
+        reselect();
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertArrayEquals(before, log(), "and to the PIN");
+        // everything that can be sent: none of it is the log's to obey
+        assertEquals(SW_OK, clearSpent());
+        assertEquals(SW_OK, setLimits(0, 0));
+        assertEquals(SW_OK, setLimits(500, 100));
+        assertEquals(SW_OK, changePin(NEW_PIN));
+        assertEquals(SW_OK, verify(NEW_PIN));
+        assertEquals(SW_OK, ownerSetCard(MINT, REFUND, OTHER_SIGNER));
+        assertEquals(0x6D00, sw(new CommandAPDU(CLA, 0x19, 0, 0, 256)), "there is no command beside it to write one with");
+        transmit(new CommandAPDU(CLA, INS_GET_LOG, 1, 1, new byte[117], 256));
+        assertArrayEquals(before, log(), "cleared slots, new limits, a new PIN, a new record, bytes sent with the command: the log is as it was");
+    }
+
+    @Test
+    @DisplayName("A spend over a limit is written down before it is refused; the third inside ten seconds of the clock marks the tap and counts once; three visits, one refusal each, mark nothing")
+    void testRefusalsAreWrittenDown() {
+        readyWithLimit(0);
+        assertEquals(SW_OK, setLimits(1000, 100));
+        for (int i = 0; i < 8; i++) assertEquals(SW_OK, load(buildProof(KEYSET, 100, i + 1)).getSW());
+        newTap();
+        assertEquals(SW_OK, spend(0).getSW(), "the tap's limit exactly");
+        assertEquals(SW_OVER_TAP_LIMIT, spend(1).getSW());
+        assertEquals(1, logRefused());
+        assertArrayEquals(new long[] { T0, 100, 1, 1, 0 }, logTap(0), "one refusal: written down, not marked");
+        assertEquals(SW_OVER_TAP_LIMIT, spend(1).getSW());
+        assertEquals(0, logTampers(), "nor two");
+        assertEquals(SW_OVER_TAP_LIMIT, spend(1).getSW());
+        assertEquals(1, logTampers(), "the third inside the tap's ten seconds: a terminal trying the limit");
+        assertArrayEquals(new long[] { T0, 100, 1, 3, 1 }, logTap(0), "and the tap is marked");
+        assertEquals(SW_OVER_TAP_LIMIT, spend(2).getSW());
+        assertEquals(1, logTampers(), "a fourth and a fifth are the same run, counted once");
+        assertEquals(4, logRefused());
+        assertEquals(700, balance(), "and nothing was burned by any of them");
+        // the card cut out of the field and put back, inside the same ten seconds: the run goes on, in a tap of its own
+        newTap();
+        assertEquals(SW_OK, setTime(T0 + 9));
+        assertEquals(SW_OVER_TAP_LIMIT, spend(1).getSW());
+        assertEquals(2, logTaps());
+        assertArrayEquals(new long[] { T0 + 9, 0, 0, 1, 1 }, logTap(0), "a tap of refusals alone is written down too, and marked: the run reached three before it");
+        assertEquals(1, logTampers());
+        // ten seconds on from the run's first refusal: a refusal begins a new run, and a spend within the limit is a spend
+        newTap();
+        assertEquals(SW_OK, setTime(T0 + 20));
+        assertEquals(SW_OK, spend(1).getSW());
+        assertEquals(SW_OVER_TAP_LIMIT, spend(2).getSW());
+        assertArrayEquals(new long[] { T0 + 20, 100, 1, 1, 0 }, logTap(0), "one refusal in a later tap is one, and is not marked");
+        // a terminal that does not know of the limit, refused once at each of three visits a minute apart: no run
+        for (int visit = 1; visit <= 3; visit++) {
+            newTap();
+            assertEquals(SW_OK, setTime(T0 + 20 + 60 * visit));
+            assertEquals(SW_OK, spend(1 + visit).getSW());
+            assertEquals(SW_OVER_TAP_LIMIT, spend(7).getSW());
+        }
+        assertEquals(1, logTampers(), "three refusals a minute apart are not a run");
+        // the day's limit refuses in its own name, and is written down the same way
+        newTap();
+        assertEquals(SW_OK, setTime(T0 + 400));
+        assertEquals(SW_OK, setLimits(500, 0));
+        assertEquals(SW_OK, load(buildProof(KEYSET, 600, 20)).getSW());
+        long refusedBefore = logRefused();
+        assertEquals(SW_OVER_LIMIT, spend(8).getSW(), "600 is over a day of 500");
+        assertTrue(logRefused() > refusedBefore, "a spend over the day is a refusal in the log as well");
+    }
+
+    @Test
+    @DisplayName("The log keeps the last eight taps, newest first, and the counts keep all of them")
+    void testTheLogKeepsEight() {
+        ready();
+        long total = 0;
+        for (int i = 0; i < 11; i++) assertEquals(SW_OK, load(buildProof(KEYSET, 10 + i, i + 1)).getSW());
+        for (int i = 0; i < 11; i++) {
+            newTap();
+            assertEquals(SW_OK, setTime(T0 + 100 * (i + 1)));
+            assertEquals(SW_OK, spend(i).getSW());
+            total += 10 + i;
+            assertEquals(i + 1, logTaps());
+            assertEquals(Math.min(i + 1, 8), logHeld());
+            assertEquals(total, logSats());
+        }
+        for (int k = 0; k < 8; k++) {
+            assertArrayEquals(new long[] { T0 + 100 * (11 - k), 10 + (10 - k), 1, 0, 0 }, logTap(k), "tap " + k + " back");
+        }
+    }
+
+    // =========================================================================
     // The day
     // =========================================================================
 
@@ -2347,8 +2504,15 @@ class CashuAppletTest {
         assertFalse(verify.contains("scratch"));
         assertFalse(verify.contains("loadGrant"));
         int uses = count(code, "loadGrant[0]");
-        // set once in ALLOW_LOAD, read in the load authority, in CLEAR_SPENT, and in LOAD_PROOF (where a change-grant load clears the note), and nowhere else
-        assertEquals(4, uses, "loadGrant is set by ALLOW_LOAD and read by requireLoadAuthority, CLEAR_SPENT and LOAD_PROOF: " + uses);
+        // set once in ALLOW_LOAD, read in the load authority, in CLEAR_SPENT, in LOAD_PROOF (where a change-grant load clears the note), and
+        // in GET_LOG (the owner's phone may read the card's log with no PIN), and nowhere else
+        assertEquals(5, uses, "loadGrant is set by ALLOW_LOAD and read by requireLoadAuthority, CLEAR_SPENT, LOAD_PROOF and GET_LOG: " + uses);
+        String getLog = body(code, "private void processGetLog(", "private boolean dayIsOver(");
+        assertTrue(getLog.contains("loadGrant[0]") && !getLog.contains("cardLog[") || !getLog.contains("cardLog[(short)(LOG_TAPS_OFFSET + 3)] ="), "GET_LOG reads the grant, and writes nothing to the log");
+        // the log is written in two places, and they are the spend and the refusal of one
+        assertEquals(1, count(code, "private short logEntry("));
+        assertEquals(3, count(code, "logEntry()"), "the log's entry is asked for by the spend and by the refusal, and nowhere else");
+        assertFalse(code.contains("arrayFillNonAtomic(cardLog, (short) 0") || code.contains("cardLog = new byte[LOG_LEN];\n        cardLog"), "nothing clears the log");
         assertTrue(body(code, "private void processAllowLoad(", "private short requireOwnerProof(").contains("loadGrant[0] = (byte) 1"));
         assertTrue(body(code, "private void requireLoadAuthority(", "private void requireNothingUnspent(").contains("loadGrant[0]"));
         assertTrue(body(code, "private void processClearSpent(", "private void processSetCard(").contains("loadGrant[0]"));
@@ -2546,6 +2710,12 @@ class CashuAppletTest {
            .append("\", \"sw\": \"").append(String.format("%04x", r.getSW()))
            .append("\", \"data\": \"").append(toHex(r.getData())).append("\"},\n");
         return r;
+    }
+
+    /** The card taken out of the field and put back, written down as that: a model is to do the same, and send nothing. */
+    private void sayReset(StringBuilder out, String name) {
+        simulator.reset();
+        out.append("  {\"name\": ").append(jsonString(name)).append(", \"kind\": \"reset\", \"apdu\": \"\", \"sw\": \"\", \"data\": \"\"},\n");
     }
 
     private byte[] sayNonce(StringBuilder out) {
@@ -2825,6 +2995,36 @@ class CashuAppletTest {
         owner(out, "both taken off", SW_OK, L_LIMIT, OWNER, concat(u32(0), u32(0)), p -> setLimitsCommand(p, 0, 0));
         say(out, "the info: no limits", "exact", SW_OK, infoTap);
         say(out, "CLEAR_SPENT: the card is empty again", "exact", SW_OK, clear);
+
+        // the card's own log: every spend and every refusal above is in it, as one tap, for the card has not left the field
+        CommandAPDU getLog = new CommandAPDU(CLA, INS_GET_LOG, 0, 0, 256);
+        say(out, "the log, to the PIN: all of the above as one time in the field", "exact", SW_OK, getLog);
+        sayReset(out, "the card is taken out of the field and put back");
+        say(out, "select", "exact", SW_OK, select);
+        say(out, "the log is not for a reader with no PIN", "exact", SW_SECURITY_NOT_SATIS, getLog);
+        owner(out, "the owner's grant", SW_OK, L_LOAD, OWNER, new byte[0], p -> allowLoadCommand(p));
+        say(out, "opens it, with no PIN", "exact", SW_OK, getLog);
+        owner(out, "a limit of 100 on a tap, to be tried", SW_OK, L_LIMIT, OWNER, concat(u32(0), u32(100)), p -> setLimitsCommand(p, 0, 100));
+        for (int i = 0; i < 3; i++) {
+            say(out, "load 100, for the log", "exact", SW_OK, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 100, 31 + i), 1));
+        }
+        say(out, "the PIN", "exact", SW_OK, verifyOk);
+        say(out, "spend 100: the tap's limit", "sig", SW_OK, new CommandAPDU(CLA, INS_SPEND_PROOF, 0, 0, 64));
+        say(out, "a second is refused, and written down", "exact", SW_OVER_TAP_LIMIT, new CommandAPDU(CLA, INS_SPEND_PROOF, 1, 0, 64));
+        say(out, "and again", "exact", SW_OVER_TAP_LIMIT, new CommandAPDU(CLA, INS_SPEND_PROOF, 1, 0, 64));
+        say(out, "the log: a new tap, one spend and two refusals in it, and no mark", "exact", SW_OK, getLog);
+        say(out, "a third refusal inside ten seconds of the clock", "exact", SW_OVER_TAP_LIMIT, new CommandAPDU(CLA, INS_SPEND_PROOF, 1, 0, 64));
+        say(out, "the log: the tap is marked, and the run counted", "exact", SW_OK, getLog);
+        sayReset(out, "taken away and put back again");
+        say(out, "select", "exact", SW_OK, select);
+        say(out, "the PIN", "exact", SW_OK, verifyOk);
+        time(out, "eleven seconds on", SW_OK, OTHER_SIGNER, T0 + 121);
+        say(out, "the next tap: a spend within the limit", "sig", SW_OK, new CommandAPDU(CLA, INS_SPEND_PROOF, 1, 0, 64));
+        say(out, "the log: a third tap, newest first, with nothing refused in it", "exact", SW_OK, getLog);
+        owner(out, "the limit taken off again", SW_OK, L_LIMIT, OWNER, concat(u32(0), u32(0)), p -> setLimitsCommand(p, 0, 0));
+        say(out, "spend the last", "sig", SW_OK, new CommandAPDU(CLA, INS_SPEND_PROOF, 2, 0, 64));
+        say(out, "CLEAR_SPENT", "exact", SW_OK, clear);
+        say(out, "leaves the log as it is", "exact", SW_OK, getLog);
 
         // the owner replaces itself, and locks
         say(out, "SET_OWNER with no proof", "exact", SW_OWNER_PROOF, setOwnerOpenCommand(OTHER_OWNER));

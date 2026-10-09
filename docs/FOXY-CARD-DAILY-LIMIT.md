@@ -372,6 +372,66 @@ is how a phone tells that a card has no limit on a tap to set.
 **A different time key** (rule 4) clears the tap start and its count with the
 clock and the day's window. The limit itself stays.
 
+## 6b. The log
+
+The card keeps its own account of what it has signed for and what it has
+refused. It is the only record of a card's use that no terminal's honesty is
+needed for, and it is what a holder reads to find out what a tap really took.
+
+**Only the card writes it.** A `SPEND` writes it in the transaction that burns
+the piece: no piece is burned that the log does not have. A `SPEND` refused for
+being over a limit (`6A8F`, `6A95`) writes it and then refuses. No command sets
+it, moves it back or clears it, for the PIN or for the owner, and `CLEAR_SPENT`,
+`SET_LIMIT`, `CHANGE_PIN`, `SET_CARD` and `LOCK_CARD` leave it as it is. The
+counts only go up, and stop at the top of four bytes.
+
+**What it holds** (117 bytes, permanent):
+
+| Field | Size | |
+|---|---|---|
+| taps | 4 | taps in which anything was signed for or refused, ever |
+| sats | 4 | sats signed for, ever |
+| refused | 4 | spends refused for being over a limit, ever |
+| runs | 4 | times a third spend was refused inside ten seconds of the clock (below) |
+| run start, run length | 4, 1 | the run of refusals in hand: the clock at its first, and how many |
+| the last eight taps | 8 × 12 | a ring; the tap numbered n is at (n − 1) mod 8. Each: the clock when it began (4), sats signed for in it (4), pieces signed (1), spends refused in it (1), flags (1; bit 0 is the mark), and a byte of nothing |
+
+**A tap, here, is one time in a reader's field**: from the card being powered
+to its being taken away (a byte of RAM that is gone with the power, and not
+with a SELECT, says whether this one has an entry yet). The limit on one tap
+counts by the clock, because that is what bounds a terminal; the log counts by
+the field, because that is what a person did. A terminal that cuts the field to
+begin again shows as more taps, and the counts count every one, so the ring
+being pushed round hides nothing from a phone that remembers the counts it saw.
+
+**It records what was signed for, not the price.** The card does not know the
+price. It cannot say that a payment was too much; it says what left, and when.
+
+**The mark.** A terminal that keeps to the limits is never refused: `GET_INFO`
+says what the day and the tap have left, before anything is asked for. A
+refusal is therefore a terminal that asked for more than it was allowed. A run
+of **three inside ten seconds of the card's clock** (from the run's first
+refusal) is one trying the limit again and again: the count of runs goes up
+once, at the third, and the tap in which the third or any later refusal of the
+run falls is marked. Ten seconds of the clock, and not three in a row at any
+distance: a terminal that does not know of a limit and is refused once at each
+of three visits is not that. A clock that is behind the run's start (rule 4
+sets it back to nothing) begins a new run. A card with no limit refuses
+nothing, and so marks nothing: the mark needs a limit to be set.
+
+**What a mark is not.** It is not proof of theft, and its absence is not proof
+of honesty. A terminal that takes what the limits allow, or that walks round
+them by signing itself a later time (5.2, with the interim signer), is never
+refused and leaves no mark; what it took is in the taps and the counts all the
+same.
+
+**Reading it: `GET_LOG` (`18`).** Sixteen bytes of counts (taps, sats, refused,
+runs), then the taps the ring holds, newest first, twelve bytes each: 112 bytes
+at the most. For whoever the card is open to: the PIN verified in this tap, or
+the owner's grant (`ALLOW_LOAD`), so the owner's phone reads it with no PIN. It
+says when a card was used and for how much, which a stranger's reader is not
+told (`6982`). A card with no PIN yet has an empty log, and answers anyone.
+
 ## 7. The owner
 
 ### 7.1 The key
@@ -478,6 +538,7 @@ or changed from `FOXY-CARD-SPEC.md` 5.2 and the allowance draft.
 | `15` | AUTH | | 16 random bytes | 16 of the card's own and a signature |
 | `16` | **GET_CARD** | | | format, record set, unit, limit (4), refund key (33), time key (65), mint length, mint |
 | `17` | **GET_PIECES** | | P1 = the first slot to report | one page: the first slot the page does not cover (1), then for each slot in the range that is not empty a tag (1) and, for an unspent slot, its 81 bytes (8.1). `6A83` for a P1 of 64 or more |
+| `18` | **GET_LOG** | the PIN verified in this tap, or the owner's grant; nothing on a card with no PIN yet | | the card's own log (6b): 16 bytes of counts, then up to eight taps of 12 bytes, newest first. `6982` to anyone else |
 | `20` | **SPEND_PROOF** | PIN, if one is set; a time, if a limit is set | P1 = the slot | the 64-byte signature; `6A8F` over the day; `6A92` with no time. **Not** opened by `ALLOW_LOAD`, nor by the tap after a payment. Notes, in permanent memory, that the card has paid: the next tap may load with no PIN (8.2) `6A95` over the limit on one tap (6a). |
 | `30` | **LOAD_PROOF** | an owner; a PIN set, and verified or `ALLOW_LOAD` given in this tap or this tap being the one after a payment (8.2); a card record; a time | 81 bytes | `6982` with no verified PIN and no grant (the gate comes first); then `6A90` with no owner; `6A92` with no time; `6A94` for a piece whose nonce is already in a slot, spent or not (checked last, after the length and the piece itself, and before anything is written) |
 | `31` | **CLEAR_SPENT** | the PIN, if one is set, or `ALLOW_LOAD` given in this tap, or the tap after a payment | | |

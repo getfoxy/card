@@ -28,6 +28,7 @@ import javacardx.crypto.*;
  *   0x15  AUTH             — prove this is the card: sign the reader's nonce and its own
  *   0x16  GET_CARD         — the card record: mint, unit, refund key, limit, time key
  *   0x17  GET_PIECES       — every slot's state and every unspent piece, a page at a time (P1 = the first slot)
+ *   0x18  GET_LOG          — the card's own account of its taps: what it signed for, what it refused
  *   0x20  SPEND_PROOF      — mark spent + sign that slot's own secret (no message is taken)
  *   0x30  LOAD_PROOF       — store new proof (an owner, a time, and a PIN or the owner's grant)
  *   0x31  CLEAR_SPENT      — free spent slots (PIN, or the owner's grant)
@@ -115,6 +116,7 @@ public class CashuApplet extends Applet {
     static final byte INS_AUTH             = (byte) 0x15;
     static final byte INS_GET_CARD         = (byte) 0x16;
     static final byte INS_GET_PIECES       = (byte) 0x17;
+    static final byte INS_GET_LOG          = (byte) 0x18;
     static final byte INS_SPEND_PROOF      = (byte) 0x20;
     // 0x21 was SIGN_ARBITRARY. It answers 6D00 and must stay unassigned.
     static final byte INS_LOAD_PROOF       = (byte) 0x30;
@@ -204,6 +206,42 @@ public class CashuApplet extends Applet {
     static final short EC_POINT_LEN        = (short) 65;
 
     static final short AUTH_NONCE_LEN      = (short) 16;
+
+    // -------------------------------------------------------------------------
+    // The log (persistent): the card's own account of what it has signed for
+    // and what it has refused. A spend writes it, in the transaction that
+    // burns the piece, and a spend refused for being over a limit writes it
+    // before it is refused. Nothing else does: no command sets it, moves it
+    // back or clears it, for the PIN or for the owner. The counts only go up,
+    // and stop at the top of four bytes.
+    //
+    // A tap, here, is one time in a reader's field: from the card being
+    // powered to its being taken away. (The limit on one tap counts by the
+    // clock, because that bounds a terminal; this counts by the field,
+    // because that is what a person did.) A terminal that cuts the field to
+    // begin again shows as more taps, and the totals count them all.
+    // -------------------------------------------------------------------------
+    static final short LOG_TAPS_OFFSET      = (short) 0;   // taps in which anything was signed for or refused, ever
+    static final short LOG_SATS_OFFSET      = (short) 4;   // sats signed for, ever
+    static final short LOG_REFUSED_OFFSET   = (short) 8;   // spends refused for being over a limit, ever
+    static final short LOG_TAMPERS_OFFSET   = (short) 12;  // times a third spend was refused inside ten seconds of the clock
+    static final short LOG_RUN_AT_OFFSET    = (short) 16;  // the clock at the first refusal of the run in hand
+    static final short LOG_RUN_OFFSET       = (short) 20;  // how many refusals are in that run (1 byte)
+    static final short LOG_HEAD_LEN         = (short) 21;
+    // the last eight taps, in a ring: the tap numbered n is at (n - 1) mod 8
+    static final short LOG_ENTRIES          = (short) 8;
+    static final short LOG_ENTRY_LEN        = (short) 12;
+    static final short LOG_E_TIME           = (short) 0;   // the clock when the tap's first entry was made (4)
+    static final short LOG_E_SATS           = (short) 4;   // sats signed for in it (4)
+    static final short LOG_E_PIECES         = (short) 8;   // pieces signed (1, stops at 255)
+    static final short LOG_E_REFUSED        = (short) 9;   // spends refused in it for being over a limit (1, stops at 255)
+    static final short LOG_E_FLAGS          = (short) 10;  // bit 0: the third refusal of a run, or one after it, was in this tap
+    static final byte  LOG_FLAG_TAMPER      = (byte) 0x01;
+    static final short LOG_LEN              = (short) 117; // LOG_HEAD_LEN + LOG_ENTRIES * LOG_ENTRY_LEN
+    // GET_LOG's answer: the four counts, then the taps the ring holds, newest first
+    static final short LOG_ANSWER_HEAD      = (short) 16;
+    // a run of this many refusals inside one tap's ten seconds is a terminal trying the limit, and is marked
+    static final short TAMPER_RUN           = (short) 3;
 
     // The owner: a P-256 public key the card is given, a nonce of 16 it gives
     // for each proof, and a proof that is an ECDSA signature in DER form, 72
@@ -400,6 +438,8 @@ public class CashuApplet extends Applet {
     /** 86 400 seconds, big-endian: how long a day is. */
     private static final byte[] DAY_SECONDS = { (byte) 0x00, (byte) 0x01, (byte) 0x51, (byte) 0x80 };
 
+    private static final byte[] ONE = { (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x01 };
+
     /**
      * 10 seconds, big-endian: how long a tap is, for the limit on one tap.
      * Longer than a card is held to a phone to pay, so one tap is one window;
@@ -527,6 +567,10 @@ public class CashuApplet extends Applet {
     private static final short X_TAP   = (short) 116;
     private static final short X_LEN   = (short) 120;
     private byte[] scratch;
+    /** The log (LOG_*). Permanent. */
+    private byte[] cardLog;
+    /** Whether this time in the field has an entry in the log yet. Gone with the power, not with a SELECT. */
+    private byte[] tapOpen;
     private MessageDigest sha;
     private RandomData rng;
 
@@ -572,6 +616,8 @@ public class CashuApplet extends Applet {
         loadGrant       = JCSystem.makeTransientByteArray((short) 1, JCSystem.CLEAR_ON_DESELECT);
         changeGrant     = JCSystem.makeTransientByteArray((short) 1, JCSystem.CLEAR_ON_DESELECT);
         scratch         = JCSystem.makeTransientByteArray(X_LEN, JCSystem.CLEAR_ON_DESELECT);
+        cardLog         = new byte[LOG_LEN];
+        tapOpen         = JCSystem.makeTransientByteArray((short) 1, JCSystem.CLEAR_ON_RESET);
         sha             = MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
         rng             = RandomData.getInstance(RandomData.ALG_SECURE_RANDOM);
         sha.reset();
@@ -677,6 +723,7 @@ public class CashuApplet extends Applet {
             case INS_AUTH:             processAuth(apdu);           break;
             case INS_GET_CARD:         processGetCard(apdu);        break;
             case INS_GET_PIECES:       processGetPieces(apdu);      break;
+            case INS_GET_LOG:          processGetLog(apdu);         break;
             case INS_SPEND_PROOF:      processSpendProof(apdu);     break;
             case INS_LOAD_PROOF:       processLoadProof(apdu);      break;
             case INS_CLEAR_SPENT:      processClearSpent(apdu);     break;
@@ -931,7 +978,7 @@ public class CashuApplet extends Applet {
             short carry = addUint32Carry(scratch, X_SUM, proofStorage, (short)(base + PROOF_AMOUNT_OFFSET));
             // a sum that wraps is over any limit
             if (carry != 0 || cmpUint32(scratch, X_SUM, cardRecord, CARD_LIMIT_OFFSET) > 0) {
-                ISOException.throwIt(SW_OVER_LIMIT);
+                refuseOverLimit(SW_OVER_LIMIT);
             }
         }
 
@@ -948,7 +995,7 @@ public class CashuApplet extends Applet {
         boolean newTap = false;
         if (tapLimited) {
             if (isZero(cardRecord, CARD_NOW_OFFSET, (short) 4)) ISOException.throwIt(SW_NO_TIME);
-            newTap = windowIsOver(CARD_TAP_WINDOW_OFFSET, TAP_SECONDS);
+            newTap = windowIsOver(cardRecord, CARD_TAP_WINDOW_OFFSET, TAP_SECONDS);
             if (newTap) {
                 Util.arrayFillNonAtomic(scratch, X_TAP, (short) 4, (byte) 0);
             } else {
@@ -956,7 +1003,7 @@ public class CashuApplet extends Applet {
             }
             short over = addUint32Carry(scratch, X_TAP, proofStorage, (short)(base + PROOF_AMOUNT_OFFSET));
             if (over != 0 || cmpUint32(scratch, X_TAP, cardRecord, CARD_TAP_LIMIT_OFFSET) > 0) {
-                ISOException.throwIt(SW_OVER_TAP_LIMIT);
+                refuseOverLimit(SW_OVER_TAP_LIMIT);
             }
         }
 
@@ -1002,7 +1049,13 @@ public class CashuApplet extends Applet {
         proofStorage[(short)(base + PROOF_STATUS_OFFSET)] = STATUS_SPENT;
         // and the next tap may put the change on with no PIN (see select)
         changeDue[0] = (byte) 1;
+        // and the card's own account of it, with the burn: no piece is burned that the log does not have
+        short entry = logEntry();
+        addUint32Stop(cardLog, (short)(entry + LOG_E_SATS), proofStorage, (short)(base + PROOF_AMOUNT_OFFSET));
+        if (cardLog[(short)(entry + LOG_E_PIECES)] != (byte) 0xFF) cardLog[(short)(entry + LOG_E_PIECES)]++;
+        addUint32Stop(cardLog, LOG_SATS_OFFSET, proofStorage, (short)(base + PROOF_AMOUNT_OFFSET));
         JCSystem.commitTransaction();
+        tapOpen[0] = (byte) 1;
 
         apdu.setOutgoingAndSend((short) 0, sigLen);
     }
@@ -1736,20 +1789,119 @@ public class CashuApplet extends Applet {
         return carry;
     }
 
+    // ---- the log ---------------------------------------------------------------
+
+    /**
+     * Where this tap's entry is in the log, begun if nothing in this time in
+     * the field has been written down yet: the count of taps goes up by one,
+     * and the place the ring gives it is cleared and given the clock. Called
+     * inside a transaction; the caller marks the tap open once it has
+     * committed (`tapOpen`, which is RAM and would not be undone with it).
+     */
+    private short logEntry() {
+        if (tapOpen[0] != (byte) 1) addUint32Stop(cardLog, LOG_TAPS_OFFSET, ONE, (short) 0);
+        // the tap numbered n is at (n - 1) mod 8: eight divides 256, so the last byte says it
+        short at = (short)(LOG_HEAD_LEN + (short)(((short)((cardLog[(short)(LOG_TAPS_OFFSET + 3)] & 0xFF) - 1) & 0x07) * LOG_ENTRY_LEN));
+        if (tapOpen[0] != (byte) 1) {
+            Util.arrayFillNonAtomic(cardLog, at, LOG_ENTRY_LEN, (byte) 0);
+            Util.arrayCopy(cardRecord, CARD_NOW_OFFSET, cardLog, (short)(at + LOG_E_TIME), (short) 4);
+        }
+        return at;
+    }
+
+    /**
+     * A spend that is over a limit: written down, and then refused with `sw`.
+     *
+     * A terminal that keeps to the limits never causes one: what the card has
+     * left of its day and of its tap is in GET_INFO, to be read before
+     * anything is asked for. So a refusal is a terminal that asked for more
+     * than it was allowed, and a run of three inside one tap's ten seconds of
+     * the card's clock is one trying the limit again and again: the tap is
+     * marked, and the count of such runs goes up. (Ten seconds of the clock,
+     * and not three in a row at any distance: a terminal that does not know
+     * of a limit and is refused once at each of three visits is not that.)
+     */
+    private void refuseOverLimit(short sw) {
+        JCSystem.beginTransaction();
+        short entry = logEntry();
+        addUint32Stop(cardLog, LOG_REFUSED_OFFSET, ONE, (short) 0);
+        if (cardLog[(short)(entry + LOG_E_REFUSED)] != (byte) 0xFF) cardLog[(short)(entry + LOG_E_REFUSED)]++;
+        /* A new run: the first refusal there has been, or ten seconds on from
+         * the last run's first, or a clock that is now behind that (a new time
+         * key sets the clock back to nothing, and a run begun by the old one
+         * would otherwise never end). */
+        if (cardLog[LOG_RUN_OFFSET] == (byte) 0
+            || cmpUint32(cardRecord, CARD_NOW_OFFSET, cardLog, LOG_RUN_AT_OFFSET) < 0
+            || windowIsOver(cardLog, LOG_RUN_AT_OFFSET, TAP_SECONDS)) {
+            Util.arrayCopy(cardRecord, CARD_NOW_OFFSET, cardLog, LOG_RUN_AT_OFFSET, (short) 4);
+            cardLog[LOG_RUN_OFFSET] = (byte) 1;
+        } else if (cardLog[LOG_RUN_OFFSET] != (byte) 0xFF) {
+            cardLog[LOG_RUN_OFFSET]++;
+        }
+        short run = (short)(cardLog[LOG_RUN_OFFSET] & 0xFF);
+        if (run == TAMPER_RUN) addUint32Stop(cardLog, LOG_TAMPERS_OFFSET, ONE, (short) 0);
+        if (run >= TAMPER_RUN) cardLog[(short)(entry + LOG_E_FLAGS)] |= LOG_FLAG_TAMPER;
+        JCSystem.commitTransaction();
+        tapOpen[0] = (byte) 1;
+        ISOException.throwIt(sw);
+    }
+
+    /**
+     * GET_LOG: the card's own account of its taps. Sixteen bytes of counts
+     * (taps, sats signed for, spends refused for being over a limit, runs of
+     * three such refusals: four bytes each, big-endian), then the taps the
+     * ring holds, newest first, twelve bytes each: the clock when it began
+     * (4), sats signed for in it (4), pieces signed (1), spends refused (1),
+     * flags (1; bit 0, a run of three refusals reached or gone past in it),
+     * and a byte of nothing.
+     *
+     * For whoever the card is open to: the PIN verified in this tap, or the
+     * owner's grant (ALLOW_LOAD). It says when the card was used and for how
+     * much, which is more than a stranger's reader should be told. A card
+     * with no PIN yet has nothing in it, and answers anyone.
+     */
+    private void processGetLog(APDU apdu) {
+        if (pinState[0] != (byte) 0 && pinVerifiedFlag[0] != (byte) 1 && loadGrant[0] != (byte) 1) {
+            ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
+        }
+        byte[] buf = apdu.getBuffer();
+        Util.arrayCopyNonAtomic(cardLog, (short) 0, buf, (short) 0, LOG_ANSWER_HEAD);
+        short held = LOG_ENTRIES;
+        if (isZero(cardLog, LOG_TAPS_OFFSET, (short) 3) && (short)(cardLog[(short)(LOG_TAPS_OFFSET + 3)] & 0xFF) < LOG_ENTRIES) {
+            held = (short)(cardLog[(short)(LOG_TAPS_OFFSET + 3)] & 0xFF);
+        }
+        short newest = (short)(((short)((cardLog[(short)(LOG_TAPS_OFFSET + 3)] & 0xFF) - 1)) & 0x07);
+        short out = LOG_ANSWER_HEAD;
+        for (short k = 0; k < held; k++) {
+            short at = (short)(LOG_HEAD_LEN + (short)(((short)(newest - k) & 0x07) * LOG_ENTRY_LEN));
+            Util.arrayCopyNonAtomic(cardLog, at, buf, out, LOG_ENTRY_LEN);
+            out += LOG_ENTRY_LEN;
+        }
+        apdu.setOutgoingAndSend((short) 0, out);
+    }
+
     /**
      * Whether the window has run its day: `now` is at least 86 400 seconds past
      * the window's start. A window whose end is past what four bytes hold never
      * ends. Works in scratch[X_NUM], which nothing live is using here.
      */
     private boolean dayIsOver() {
-        return windowIsOver(CARD_WINDOW_OFFSET, DAY_SECONDS);
+        return windowIsOver(cardRecord, CARD_WINDOW_OFFSET, DAY_SECONDS);
     }
 
-    /** Whether the window that began at cardRecord[`windowAt`] and lasts `seconds` (4, big-endian) has ended by the card's clock. */
-    private boolean windowIsOver(short windowAt, byte[] seconds) {
-        Util.arrayCopyNonAtomic(cardRecord, windowAt, scratch, X_NUM, (short) 4);
+    /** Whether the window that began at `from[windowAt]` and lasts `seconds` (4, big-endian) has ended by the card's clock. */
+    private boolean windowIsOver(byte[] from, short windowAt, byte[] seconds) {
+        Util.arrayCopyNonAtomic(from, windowAt, scratch, X_NUM, (short) 4);
         if (addUint32Carry(scratch, X_NUM, seconds, (short) 0) != 0) return false;
         return cmpUint32(cardRecord, CARD_NOW_OFFSET, scratch, X_NUM) >= 0;
+    }
+
+    /** `acc` += `src`, four bytes each, big-endian; a sum past the top of four bytes stops there. */
+    private static void addUint32Stop(byte[] acc, short accOff, byte[] src, short srcOff) {
+        if (addUint32Carry(acc, accOff, src, srcOff) != 0) {
+            acc[accOff] = (byte) 0xFF; acc[(short)(accOff + 1)] = (byte) 0xFF;
+            acc[(short)(accOff + 2)] = (byte) 0xFF; acc[(short)(accOff + 3)] = (byte) 0xFF;
+        }
     }
 
     /** Whether two ranges are the same, looking at every byte whatever it finds. */
