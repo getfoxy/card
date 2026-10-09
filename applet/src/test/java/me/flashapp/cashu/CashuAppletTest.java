@@ -187,6 +187,19 @@ class CashuAppletTest {
         void leaveATransactionOpen() {
             transactionDepth = 1;
         }
+
+        /**
+         * How many transactions are to commit before the card is taken out of the field, the instant after the last of them has:
+         * 0 is never. The commit is made, and what the applet does next is not done: an exception it does not know unwinds it, as
+         * a power loss would end it, and nothing is answered.
+         */
+        int commitsUntilTear;
+
+        @Override
+        public void commitTransaction() {
+            super.commitTransaction();
+            if (commitsUntilTear > 0 && --commitsUntilTear == 0) throw new IllegalStateException("the card left the field after this commit");
+        }
     }
 
     private ExposedRuntime runtime;
@@ -522,7 +535,7 @@ class CashuAppletTest {
         // what a phone sends: iOS chooses by the name in the app's Info.plist, and Foxy by the same ten bytes
         ResponseAPDU whole = transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_HEX), 256));
         assertEquals(SW_OK, whole.getSW());
-        assertArrayEquals(new byte[] { 0x01, 0x07 }, whole.getData(), "the same answer either way: version 1.7");
+        assertArrayEquals(new byte[] { 0x01, 0x08 }, whole.getData(), "the same answer either way: version 1.8");
         assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)), "and its instructions follow");
     }
 
@@ -531,21 +544,21 @@ class CashuAppletTest {
     void testSelect() {
         ResponseAPDU resp = transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR)));
         assertEquals(SW_OK, resp.getSW());
-        assertArrayEquals(new byte[] { 0x01, 0x07 }, resp.getData(), "version 1.7: the same card with twice the places");
+        assertArrayEquals(new byte[] { 0x01, 0x08 }, resp.getData(), "version 1.8: a payment's pieces are burned outside the transaction that commits it");
         assertNotEquals(SW_OK, sw(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(UPSTREAM_AID))),
             "an upstream reader must not find this applet under upstream's AID: the wire is not the same");
     }
 
     @Test
-    @DisplayName("GET_INFO on a new card: 30 bytes: version 1.7, 128 empty slots, no PIN, three tries, format 4, capabilities 3F, no record, no limit, no owner, no time, no change due")
+    @DisplayName("GET_INFO on a new card: 30 bytes: version 1.8, 128 empty slots, no PIN, three tries, format 4, capabilities 7F, no record, no limit, no owner, no time, no change due")
     void testInfoFresh() {
         byte[] d = info();
         assertEquals(30, d.length);
-        assertEquals(1, d[0]); assertEquals(7, d[1]);
+        assertEquals(1, d[0]); assertEquals(8, d[1]);
         assertEquals(MAX_PROOFS, d[2] & 0xFF);
         assertEquals(0, d[3]); assertEquals(0, d[4]);
         assertEquals(MAX_PROOFS, d[5] & 0xFF);
-        assertEquals(0x3F, d[6], "secp256k1, Schnorr, PIN, the limit on one payment waited for and not refused, the 1.6 forms (several pieces to a LOAD_PROOF, GET_PIECES by name), and more than sixty-four places with the short listing (it was 1F, 0F and 07 before)");
+        assertEquals(0x7F, d[6], "secp256k1, Schnorr, PIN, the limit on one payment waited for and not refused, the 1.6 forms (several pieces to a LOAD_PROOF, GET_PIECES by name), more than sixty-four places with the short listing, and a payment's pieces burned outside its transaction so that it may be of any number (it was 3F, 1F, 0F and 07 before)");
         assertEquals(0, d[7], "no PIN");
         assertEquals(4, d[8], "format");
         assertEquals(3, d[9], "tries");
@@ -2171,31 +2184,599 @@ class CashuAppletTest {
     }
 
     @Test
-    @DisplayName("The burn is one transaction of every place named, whatever their number: ALL_MOST is MAX_PROOFS (128) and allSlots is that long; the count is looked at before the places are copied; the answer to a transaction that cannot be had is 6A96 after an abort, and the signature is sent after it")
+    @DisplayName("A payment of any number of places is committed by one transaction of the same size, and its places are marked after it: ALL_MOST is MAX_PROOFS (128) and allSlots is that long; the count is looked at before the places are copied; the signature is made first, burnList is written before the transaction and outside it, the transaction sets burnPending together with the day, changeDue, the log and the last signature and writes no place, finishBurn follows the commit and comes before the receipt and the answer; a transaction that cannot be had is aborted and is 6A96 and sets nothing; process() finishes a pending burn before it looks at anything, SELECT included")
     void testTheBurnIsOneTransactionOfEveryPlaceNamed() throws Exception {
         assertEquals(128, CashuApplet.ALL_MOST);
         assertEquals(CashuApplet.MAX_PROOFS, CashuApplet.ALL_MOST);
         String code = appletCode();
-        assertTrue(code.contains("allSlots        = JCSystem.makeTransientByteArray(ALL_MOST, JCSystem.CLEAR_ON_DESELECT)"), "RAM for every place the card has");
+        String flat = code.replaceAll("\\s+", " ");
+        assertTrue(flat.contains("allSlots = JCSystem.makeTransientByteArray(ALL_MOST, JCSystem.CLEAR_ON_DESELECT)"), "RAM for every place the card has");
         String begin = body(code, "private void processSpendAllBegin(", "private void processSpendAllOutputs(");
         assertTrue(begin.indexOf("if (n > ALL_MOST) ISOException.throwIt(SW_TOO_MANY);") > 0
             && begin.indexOf("if (n > ALL_MOST) ISOException.throwIt(SW_TOO_MANY);") < begin.indexOf("arrayCopyNonAtomic(buf, ISO7816.OFFSET_CDATA, allSlots"),
             "more than that is refused before the places are copied");
         assertTrue(begin.contains("allState[1] = (byte) n;"));
-        String sign = body(code, "private void processSpendAllSign(", "private void processSpendAllAgain(");
+
+        // the two fields that carry the burn last: a power loss must not clear them
+        assertTrue(flat.contains("private byte[] burnList;") && flat.contains("private byte[] burnPending;"));
+        assertTrue(flat.contains("burnList = new byte[(short)(MAX_PROOFS + 1)];"), "the count, and a byte for each place the card has");
+        assertTrue(flat.contains("burnPending = new byte[1];"), "one byte");
+        assertFalse(flat.contains("burnList = JCSystem") || flat.contains("burnPending = JCSystem"), "and neither is RAM");
+
+        String sign = body(code, "private void processSpendAllSign(", "private void finishBurn(");
+        String finish = body(code, "private void finishBurn(", "private void processSpendAllAgain(");
+        String process = body(code, "public void process(", "private void processGetInfo(");
+
+        // ---- SPEND_ALL_SIGN: the order
         assertTrue(sign.contains("short n = (short)(allState[1] & 0xFF);"), "128 is read as 128, and not as a negative byte");
-        assertEquals(2, count(sign, "beginTransaction"), "the burn's and the receipt's");
+        int signed = sign.indexOf("short sigLen = schnorrHW.sign(");
+        int listCount = sign.indexOf("burnList[0] = (byte) n;");
+        int listCopy = sign.indexOf("Util.arrayCopyNonAtomic(allSlots, (short) 0, burnList, (short) 1, n);");
         int tryAt = sign.indexOf("try {");
         int begins = sign.indexOf("JCSystem.beginTransaction();", tryAt);
-        int loop = sign.indexOf("for (short i = 0; i < n; i++) {", begins);
-        int commit = sign.indexOf("JCSystem.commitTransaction();", loop);
+        int pending = sign.indexOf("burnPending[0] = (byte) 1;", begins);
+        int commit = sign.indexOf("JCSystem.commitTransaction();", pending);
         int caught = sign.indexOf("} catch (TransactionException e) {", commit);
         int abort = sign.indexOf("JCSystem.abortTransaction();", caught);
         int refused = sign.indexOf("ISOException.throwIt(SW_TOO_MANY);", abort);
+        int finishes = sign.indexOf("finishBurn();", refused);
+        int receiptBegins = sign.indexOf("JCSystem.beginTransaction();", finishes);
         int answer = sign.lastIndexOf("apdu.setOutgoingAndSend((short) 0, sigLen);");
-        assertTrue(tryAt > 0 && tryAt < begins && begins < loop && loop < commit && commit < caught && caught < abort && abort < refused && refused < answer,
-            "every place is burned in the one transaction, and a transaction that fails is aborted and refused, before the signature is answered");
-        assertFalse(sign.substring(caught, refused).contains("setOutgoingAndSend"), "and nothing is answered in between");
+        assertTrue(signed > 0 && signed < listCount && listCount < listCopy && listCopy < tryAt && tryAt < begins && begins < pending
+                && pending < commit && commit < caught && caught < abort && abort < refused && refused < finishes
+                && finishes < receiptBegins && receiptBegins < answer,
+            "the signature first; the list written, outside the transaction and before it; the transaction, with burnPending set in it; its commit; a failure aborted and refused; "
+            + "finishBurn after all that and before the receipt's transaction; the answer last");
+        assertEquals("ISOException.throwIt(SW_TOO_MANY);}", sign.substring(refused, finishes).replaceAll("\\s+", ""), "a failed transaction is refused there and then: nothing runs between the refusal and the end of the catch");
+
+        // ---- the transaction: the payment itself, and no place in it
+        String tx = sign.substring(begins, commit);
+        assertTrue(tx.contains("burnPending[0] = (byte) 1;") && tx.contains("changeDue[0] = (byte) 1;") && tx.contains("CARD_SPENT_OFFSET") && tx.contains("logEntry()")
+                && tx.contains("addUint32Stop(cardLog, LOG_SATS_OFFSET") && tx.contains("lastSig[0] = (byte) 1;") && tx.contains(", lastSig, (short) 1, (short) 64)"),
+            "burnPending is set in it with the day's count, changeDue, the log and the last signature");
+        assertFalse(tx.contains("proofStorage") || tx.contains("STATUS_SPENT") || tx.contains("allSlots") || tx.contains("burnList")
+                || tx.contains("finishBurn") || tx.contains("for (") || tx.contains("while ("),
+            "no place is written in it, no list is read in it and it has no loop: it is the same size whatever the number of places");
+        assertFalse(sign.contains("STATUS_SPENT") || sign.contains("proofStorage"), "SPEND_ALL_SIGN names no place's status at all: finishBurn does");
+        assertEquals(1, count(sign, "burnPending"), "SPEND_ALL_SIGN names burnPending once, to set it, and never to clear it");
+        assertEquals(2, count(sign, "burnList"), "and burnList twice, to write the count and the places, both before the transaction");
+        assertEquals(1, count(sign, "finishBurn()"), "and finishBurn once");
+        assertEquals(2, count(sign, "beginTransaction"), "the payment's transaction and the receipt's");
+        String failure = sign.substring(caught, refused);
+        assertFalse(failure.contains("burnPending") || failure.contains("burnList") || failure.contains("finishBurn") || failure.contains("setOutgoingAndSend"),
+            "a failed transaction sets no note, marks nothing and answers nothing but 6A96");
+
+        // ---- finishBurn
+        String f = finish.replaceAll("\\s+", " ");
+        assertTrue(f.contains("short n = (short)(burnList[0] & 0xFF);"), "the count is read as a number, so that 128 and more are not negative");
+        assertTrue(f.contains("if (n > MAX_PROOFS) n = MAX_PROOFS;"), "and is held to the places there are");
+        assertTrue(f.contains("for (short i = 0; i < n; i++) {"), "every place in the list, from the first");
+        assertTrue(f.contains("short idx = (short)(burnList[(short)(i + 1)] & 0xFF);"), "the place numbers follow the count");
+        assertTrue(f.contains("if (idx >= MAX_PROOFS) continue;"), "a number that is no place is passed over");
+        assertTrue(f.contains("short at = (short)(idx * PROOF_SIZE + PROOF_STATUS_OFFSET);"), "the place's status byte");
+        assertTrue(f.contains("if (proofStorage[at] != STATUS_SPENT) proofStorage[at] = STATUS_SPENT;"), "marked spent");
+        int mark = finish.indexOf("proofStorage[at] = STATUS_SPENT;");
+        int clear = finish.indexOf("burnPending[0] = (byte) 0;");
+        assertTrue(mark > 0 && clear > mark, "the note is cleared after the places are marked");
+        assertEquals("}", finish.substring(clear + "burnPending[0] = (byte) 0;".length()).replaceAll("\\s+", ""), "and clearing it is the last thing finishBurn does");
+        assertEquals(1, count(finish, "burnPending"), "finishBurn names burnPending once, to clear it");
+        assertEquals(2, count(finish, "STATUS_SPENT"), "and writes only that one status, in that one place");
+        assertFalse(finish.contains("beginTransaction") || finish.contains("commitTransaction") || finish.contains("burnList[0] =") || finish.contains("cardLog")
+                || finish.contains("lastSig") || finish.contains("changeDue") || finish.contains("cardRecord") || finish.contains("STATUS_EMPTY") || finish.contains("STATUS_UNSPENT"),
+            "it is outside any transaction, writes only statuses to spent and the note to 0, and never the list");
+
+        // ---- process(): a pending burn is finished before anything else
+        int gets = process.indexOf("byte[] buf = apdu.getBuffer();");
+        int checks = process.indexOf("if (burnPending[0] != (byte) 0) finishBurn();");
+        int selecting = process.indexOf("selectingApplet()");
+        int classByte = process.indexOf("OFFSET_CLA");
+        int givesUp = process.indexOf("allState[0] = (byte) 0");
+        int dispatch = process.indexOf("switch");
+        assertTrue(gets >= 0 && gets < checks && checks < selecting && selecting < classByte && classByte < givesUp && givesUp < dispatch,
+            "process() finishes a pending burn before the SELECT test, the class byte, the giving up of a payment and any dispatch");
+        assertEquals(1, count(process, "finishBurn"), "once");
+        assertEquals(1, count(process, "burnPending"), "and burnPending is read there and not written");
+        assertFalse(process.contains("burnList"), "process() does not look at the list");
+        // and nothing else in the applet names either field, or calls finishBurn
+        String rest = code.replace(sign, "").replace(finish, "").replace(process, "");
+        assertEquals(2, count(rest, "burnPending"), "elsewhere, the declaration and the allocation: nothing else reads or writes the note");
+        assertEquals(2, count(rest, "burnList"), "elsewhere, the declaration and the allocation: nothing else reads or writes the list");
+        assertEquals(0, count(rest, "finishBurn"), "and nothing else calls finishBurn");
+    }
+
+    // ---- 1.8: a payment's places are marked after the transaction that commits it ---------------------
+
+    /** Every persistent array a command could change, by the applet's name for it. */
+    private static final String[] PERSISTENT = { "proofStorage", "slotHex", "cardLocked", "pinState", "cardRecord", "ownerSet", "changeDue",
+        "cardLog", "cardReceipts", "lastSig", "burnList", "burnPending" };
+
+    /** All of what lasts, copied. */
+    private java.util.Map<String, byte[]> persistent() throws Exception {
+        java.util.Map<String, byte[]> m = new java.util.LinkedHashMap<>();
+        for (String name : PERSISTENT) m.put(name, field(name).clone());
+        return m;
+    }
+    /** All of what lasts, put back as it was copied. */
+    private void putPersistent(java.util.Map<String, byte[]> m) throws Exception {
+        for (java.util.Map.Entry<String, byte[]> e : m.entrySet()) System.arraycopy(e.getValue(), 0, field(e.getKey()), 0, e.getValue().length);
+    }
+    private void assertPersistent(java.util.Map<String, byte[]> want, String what) throws Exception {
+        for (String name : PERSISTENT) assertArrayEquals(want.get(name), field(name), what + ": " + name);
+    }
+    /** A place's status as the applet holds it, read where no command is spent on it: 0 empty, 1 unspent, 2 spent. */
+    private int statusOf(int place) throws Exception {
+        return field("proofStorage")[place * CashuApplet.PROOF_SIZE + CashuApplet.PROOF_STATUS_OFFSET];
+    }
+    private void setStatusOf(int place, int status) throws Exception {
+        field("proofStorage")[place * CashuApplet.PROOF_SIZE + CashuApplet.PROOF_STATUS_OFFSET] = (byte) status;
+    }
+    /**
+     * A card as a tear leaves it between a payment's commit and the marking of its places: the payment is made (the day, the log,
+     * the signature and changeDue are as the commit left them), burnPending says so, and of the places named the ones `marked`
+     * says are spent and the others are not.
+     */
+    private void tornAfterTheCommit(int[] places, boolean[] marked) throws Exception {
+        for (int k = 0; k < places.length; k++) setStatusOf(places[k], marked[k] ? 2 : 1);
+        field("burnPending")[0] = 1;
+    }
+    private static boolean[] all(int n, boolean value) {
+        boolean[] b = new boolean[n];
+        Arrays.fill(b, value);
+        return b;
+    }
+
+    /**
+     * A card that has paid, and what a tear test starts from. Pieces 0 to pop-1 are loaded, piece i worth 1 + i. Places n+left on
+     * are paid in a payment of their own first (`before`, and spent), places n to n+left-1 are left unspent, and the places
+     * 0 to n-1 are paid in one payment, named from the last to the first. Places past the pieces are empty.
+     */
+    private static final class Paid {
+        int pop;
+        int[] places, before, left;
+        byte[] signature;
+        long worthLeft;
+        java.util.Map<String, byte[]> after;
+    }
+
+    private Paid paidCard(int n, int beforeCount, int leftCount) throws Exception {
+        Paid p = new Paid();
+        simulator = freshCard();
+        ready();
+        p.pop = n + leftCount + beforeCount;
+        loadMany(p.pop, i -> buildProof(KEYSET, 1 + i, i + 1));
+        p.places = new int[n];
+        for (int k = 0; k < n; k++) p.places[k] = n - 1 - k;
+        p.left = new int[leftCount];
+        for (int k = 0; k < leftCount; k++) { p.left[k] = n + k; p.worthLeft += 1 + n + k; }
+        p.before = new int[beforeCount];
+        for (int k = 0; k < beforeCount; k++) p.before[k] = n + leftCount + k;
+        if (beforeCount > 0) assertEquals(SW_OK, spendAll(p.before, new byte[0][]).getSW());
+        ResponseAPDU r = spendAll(p.places, new byte[][] { output(3, blinded(1)) });
+        assertEquals(SW_OK, r.getSW());
+        assertEquals(64, r.getData().length);
+        p.signature = r.getData();
+        // the payment is made and its places are marked with no command after it: the signing marked them itself
+        assertEquals(0, field("burnPending")[0], "the note is cleared when the signing ends");
+        for (int place : p.places) assertEquals(2, statusOf(place), "place " + place + " is spent when the signing ends");
+        p.after = persistent();
+        return p;
+    }
+
+    /** The card as the payment and its marking left it, taken out of the field and put back; with a SELECT and the PIN, unless the first command is to be the SELECT. */
+    private void prepare(Paid p, boolean theFirstCommandIsTheSelect) throws Exception {
+        putPersistent(p.after);
+        simulator.reset();
+        if (!theFirstCommandIsTheSelect) {
+            reselect();
+            assertEquals(SW_OK, verify(TEST_PIN));
+        }
+    }
+
+    /** Commands to be the first the card is sent after a tear, each by the name it goes by in a message. */
+    private java.util.LinkedHashMap<String, java.util.function.Supplier<ResponseAPDU>> firstCommands(Paid p) {
+        java.util.LinkedHashMap<String, java.util.function.Supplier<ResponseAPDU>> c = new java.util.LinkedHashMap<>();
+        int place = p.places[0];
+        byte[] newPiece = buildProof(KEYSET, 7, 200);
+        c.put("SELECT", () -> transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR))));
+        c.put("GET_INFO", () -> transmit(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)));
+        c.put("GET_INFO asked for the limit on one payment", () -> transmit(new CommandAPDU(CLA, INS_GET_INFO, 1, 0, 256)));
+        c.put("GET_BALANCE", () -> transmit(new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4)));
+        c.put("GET_PROOF_COUNT", () -> transmit(new CommandAPDU(CLA, INS_GET_PROOF_COUNT, 0, 0, 256)));
+        c.put("GET_PIECES whole", () -> pieces(0));
+        c.put("GET_PIECES named", () -> somePieces(new byte[] { (byte) place }));
+        c.put("GET_PIECES short", () -> shortPieces(0));
+        c.put("GET_PROOF of a place paid with", () -> transmit(new CommandAPDU(CLA, INS_GET_PROOF, place, 0, 256)));
+        c.put("GET_SLOT_STATUS", () -> transmit(new CommandAPDU(CLA, INS_GET_SLOT_STATUS, 0, 0, 256)));
+        c.put("SPEND_ALL_BEGIN naming a place paid with", () -> transmit(beginCommand(place)));
+        c.put("LOAD_PROOF", () -> load(newPiece));
+        c.put("CLEAR_SPENT", () -> transmit(new CommandAPDU(CLA, INS_CLEAR_SPENT, 0, 0, 1)));
+        c.put("SPEND_ALL_AGAIN", () -> transmit(new CommandAPDU(CLA, INS_SPEND_ALL_AGAIN, 0, 0, 64)));
+        c.put("GET_LOG", () -> logAnswer());
+        c.put("GET_PUBKEY", () -> transmit(new CommandAPDU(CLA, INS_GET_PUBKEY, 0, 0, 256)));
+        c.put("VERIFY_PIN", () -> transmit(new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, TEST_PIN)));
+        c.put("an instruction the card does not know", () -> transmit(new CommandAPDU(CLA, 0x7E, 0, 0)));
+        c.put("a class the card does not know", () -> transmit(new CommandAPDU(0x80, INS_GET_INFO, 0, 0, 256)));
+        return c;
+    }
+
+    @Test
+    @DisplayName("Committed, not yet marked: a card taken away after a payment's transaction and before its places were marked (burnPending 1, the places still unspent) has them marked as the first thing done by whatever command comes next - SELECT, GET_INFO, GET_BALANCE, GET_PROOF_COUNT, GET_PIECES whole, named and short, GET_PROOF, GET_SLOT_STATUS, SPEND_ALL_BEGIN (6985), LOAD_PROOF, CLEAR_SPENT, SPEND_ALL_AGAIN, GET_LOG, VERIFY_PIN and those the card refuses - for payments of 1, 12, 64 and 128 places: the answer and everything that lasts are those of the same command after a payment that was marked, and burnPending is 0")
+    void testACommittedPaymentIsMarkedBeforeAnyCommandLooksAtAPlace() throws Exception {
+        for (int n : new int[] { 1, 12, 64, 128 }) {
+            int others = n == 128 ? 0 : 5;
+            Paid p = paidCard(n, others, others);
+            java.util.LinkedHashMap<String, java.util.function.Supplier<ResponseAPDU>> commands = firstCommands(p);
+            for (String name : commands.keySet()) {
+                String what = n + " places, " + name;
+                boolean select = name.equals("SELECT");
+                // the control: the same command after a payment that was marked
+                prepare(p, select);
+                ResponseAPDU control = commands.get(name).get();
+                java.util.Map<String, byte[]> controlState = persistent();
+                // and after a tear: the places as they were before the payment, and the note that it was made.
+                // Where the first command is the SELECT, the card is taken out of the field with the note in it, as a tear does
+                // it; for the others a SELECT and the PIN have had to come first, and the tear is after them
+                if (select) {
+                    putPersistent(p.after);
+                    tornAfterTheCommit(p.places, all(n, false));
+                    simulator.reset();
+                } else {
+                    prepare(p, false);
+                    tornAfterTheCommit(p.places, all(n, false));
+                }
+                for (int place : p.places) assertEquals(1, statusOf(place), what + ": unspent, as the tear left place " + place);
+                assertEquals(1, field("burnPending")[0], what + ": the payment is noted");
+                ResponseAPDU torn = commands.get(name).get();
+                assertEquals(control.getSW(), torn.getSW(), what + ": the same status as after a payment that was marked");
+                assertArrayEquals(control.getData(), torn.getData(), what + ": the same answer");
+                assertPersistent(controlState, what + ": everything that lasts");
+                assertEquals(0, field("burnPending")[0], what + ": the note is cleared");
+                int want = name.equals("CLEAR_SPENT") ? 0 : 2;
+                for (int place : p.places) assertEquals(want, statusOf(place), what + ": place " + place);
+                // and the answer says what the marked places make it say
+                byte[] d = torn.getData();
+                if (name.equals("SELECT")) {
+                    assertArrayEquals(new byte[] { 0x01, 0x08 }, d, what);
+                } else if (name.equals("GET_INFO")) {
+                    assertEquals(others, d[3] & 0xFF, what + ": unspent");
+                    assertEquals(n + others, d[4] & 0xFF, what + ": spent");
+                    assertEquals(128 - p.pop, d[5] & 0xFF, what + ": empty");
+                } else if (name.equals("GET_BALANCE")) {
+                    assertEquals(p.worthLeft, readUint32(d, 0), what);
+                } else if (name.equals("GET_PROOF_COUNT")) {
+                    assertEquals(p.pop, d[0] & 0xFF, what + ": places in use, spent or not");
+                } else if (name.equals("GET_SLOT_STATUS")) {
+                    for (int place : p.places) assertEquals(2, d[place], what + ": place " + place);
+                    for (int place : p.left) assertEquals(1, d[place], what + ": place " + place + " was not paid with");
+                } else if (name.equals("GET_PROOF of a place paid with")) {
+                    assertEquals(2, d[0], what);
+                } else if (name.startsWith("SPEND_ALL_BEGIN")) {
+                    assertEquals(SW_CONDITIONS_NOT_SATIS, torn.getSW(), what + ": spent");
+                } else if (name.equals("CLEAR_SPENT")) {
+                    assertEquals(n + others, d[0] & 0xFF, what + ": every spent place freed, the payment's among them");
+                } else if (name.equals("SPEND_ALL_AGAIN")) {
+                    assertArrayEquals(p.signature, d, what + ": the payment's signature");
+                } else if (name.equals("LOAD_PROOF")) {
+                    assertEquals(n == 128 ? SW_NO_SPACE : SW_OK, torn.getSW(), what);
+                } else if (name.startsWith("an instruction")) {
+                    assertEquals(SW_INS_NOT_SUPPORTED, torn.getSW(), what);
+                } else if (name.startsWith("a class")) {
+                    assertEquals(SW_CLA_NOT_SUPPORTED, torn.getSW(), what);
+                }
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("Marked part way: a card taken away while the places were being marked (some of the listed places spent, some not, burnPending 1) has the rest marked by the next command and nothing else touched - not an unspent place the list does not name, nor a spent one, nor an empty one; the same again changes nothing; for 12, 64 and 128 places with the first marked, the last, the first half, every other one, all but the middle one, all (taken away just before the note was cleared) and none")
+    void testAPartlyMarkedPaymentIsFinishedAndNothingElseIsTouched() throws Exception {
+        for (int n : new int[] { 12, 64, 128 }) {
+            int others = n == 128 ? 0 : 5;
+            Paid p = paidCard(n, others, others);
+            for (int pattern = 0; pattern < 7; pattern++) {
+                boolean[] marked = new boolean[n];
+                for (int k = 0; k < n; k++) {
+                    marked[k] = pattern == 0 ? k == 0 : pattern == 1 ? k == n - 1 : pattern == 2 ? k < n / 2 : pattern == 3 ? k % 2 == 0 : pattern == 4 ? k != n / 2 : pattern == 5;
+                }
+                String what = n + " places, pattern " + pattern;
+                putPersistent(p.after);
+                tornAfterTheCommit(p.places, marked);
+                assertEquals(1, field("burnPending")[0], what);
+                assertEquals(p.worthLeft, balance(), what + ": the next command, whatever it is, finishes the marking before it answers");
+                assertPersistent(p.after, what + ": every place named is spent, and everything else is as it was");
+                // taken away again before the note was cleared: finished already, and finishing again changes nothing
+                field("burnPending")[0] = 1;
+                assertEquals(p.worthLeft, balance(), what + ": again");
+                assertPersistent(p.after, what + ": the same again changes nothing");
+                // and the same tear with the power gone: the SELECT that follows finishes it
+                putPersistent(p.after);
+                tornAfterTheCommit(p.places, marked);
+                simulator.reset();
+                reselect();
+                assertPersistent(p.after, what + ": after a power loss, the SELECT finishes the marking");
+                for (int place : p.left) assertEquals(1, statusOf(place), what + ": place " + place + " is not in the list and is unspent");
+                for (int place : p.before) assertEquals(2, statusOf(place), what + ": place " + place + " is not in the list and is spent");
+                for (int place = p.pop; place < 128; place++) assertEquals(0, statusOf(place), what + ": place " + place + " is not in the list and is empty");
+            }
+        }
+    }
+
+    /** That every one of the first `pop` places is unspent, the rest empty, nothing is noted and the list is as it was. */
+    private void assertUntouched(int pop, byte[] list, String what) throws Exception {
+        for (int place = 0; place < 128; place++) assertEquals(place < pop ? 1 : 0, statusOf(place), what + ": place " + place);
+        assertEquals(0, field("burnPending")[0], what + ": nothing is noted");
+        assertArrayEquals(list, field("burnList"), what + ": the list is as it was");
+    }
+
+    @Test
+    @DisplayName("A list nobody reads: burnPending 0 with burnList naming unspent places (as a card that was taken away before the payment's transaction committed has) burns nothing, whatever is sent - SELECT, a power-up, a begun payment, a refused signing, every instruction byte from 00 to FF; a payment made then overwrites the list and burns its own places, and what lies in the list past its count is never read")
+    void testAListNobodyReadsBurnsNothing() throws Exception {
+        ready();
+        loadMany(40, i -> buildProof(KEYSET, 1 + i, i + 1));
+        int[] stale = { 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 };
+        byte[] list = field("burnList");
+        list[0] = (byte) stale.length;
+        for (int k = 0; k < stale.length; k++) list[1 + k] = (byte) stale[k];
+        byte[] listBefore = list.clone();
+        assertEquals(0, field("burnPending")[0]);
+        assertUntouched(40, listBefore, "to begin with");
+        reselect();
+        assertUntouched(40, listBefore, "after SELECT");
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertUntouched(40, listBefore, "after VERIFY_PIN");
+        CommandAPDU[] some = {
+            new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256), new CommandAPDU(CLA, INS_GET_INFO, 1, 0, 256), new CommandAPDU(CLA, INS_GET_PUBKEY, 0, 0, 256),
+            new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4), new CommandAPDU(CLA, INS_GET_PROOF_COUNT, 0, 0, 256), new CommandAPDU(CLA, INS_GET_PROOF, 5, 0, 256),
+            new CommandAPDU(CLA, INS_GET_SLOT_STATUS, 0, 0, 256), new CommandAPDU(CLA, INS_GET_CARD, 0, 0, 256),
+            new CommandAPDU(CLA, INS_GET_PIECES, 0, 0, 256), new CommandAPDU(CLA, INS_GET_PIECES, 0, 2, new byte[] { 5, 6 }, 256), new CommandAPDU(CLA, INS_GET_PIECES, 0, 3, 256),
+            new CommandAPDU(CLA, INS_GET_LOG, 0, 0, 256), new CommandAPDU(CLA, INS_GET_LOG, 1, 0, 256), new CommandAPDU(CLA, INS_GET_NONCE, 0, 0, 16),
+            beginCommand(5, 6), new CommandAPDU(CLA, INS_SPEND_ALL_OUTPUTS, 0, 0, output(3, blinded(1))), new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256),
+            SIGN_ALL, new CommandAPDU(CLA, INS_SPEND_ALL_AGAIN, 0, 0, 64), new CommandAPDU(CLA, INS_CLEAR_SPENT, 0, 0, 1),
+            new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 7, 200), 1), setTimeCommand(T0 + 5, timeSignature(SIGNER, T0 + 5)),
+            new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, TEST_PIN), new CommandAPDU(CLA, 0x7E, 0, 0), new CommandAPDU(0x80, INS_GET_INFO, 0, 0, 256) };
+        for (int k = 0; k < some.length; k++) {
+            transmit(some[k]);
+            assertUntouched(k >= 20 ? 41 : 40, listBefore, "after command " + k + " (INS " + String.format("%02X", some[k].getINS()) + ")");
+        }
+        int pop = 41;       // the piece loaded above
+        for (int ins = 0; ins < 256; ins++) {
+            transmit(new CommandAPDU(CLA, ins, 0, 0));
+            assertUntouched(pop, listBefore, "after INS " + String.format("%02X", ins) + " with nothing else");
+        }
+        simulator.reset();
+        assertUntouched(pop, listBefore, "after a power loss");
+        reselect();
+        assertUntouched(pop, listBefore, "and a SELECT");
+        // a payment made now writes its own list, and burns what it names
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, spendAll(new int[] { 20, 21, 22 }, new byte[0][]).getSW());
+        assertEquals(0, field("burnPending")[0]);
+        byte[] listNow = field("burnList");
+        assertArrayEquals(new byte[] { 3, 20, 21, 22 }, Arrays.copyOf(listNow, 4), "the payment's count and its places, in the order named");
+        for (int place = 0; place < pop; place++) assertEquals(place >= 20 && place <= 22 ? 2 : 1, statusOf(place), "place " + place + ": only the payment's own are burned, and not those the old list named");
+        // a tear in its marking: the three are finished and the old list's places, which may lie past the count, are not
+        tornAfterTheCommit(new int[] { 20, 21, 22 }, all(3, false));
+        balance();
+        for (int place = 0; place < pop; place++) assertEquals(place >= 20 && place <= 22 ? 2 : 1, statusOf(place), "place " + place + " after finishing: nothing past the count is read");
+        assertEquals(0, field("burnPending")[0]);
+    }
+
+    @Test
+    @DisplayName("A transaction that fails sets no note: SPEND_ALL_SIGN answers 6A96 with no data and burns nothing, burnPending stays 0 though burnList now names the places (written before the transaction), no place changes and nothing that lasts but the list does, and the next command - or a power-up and a SELECT - burns nothing; the payment begun again goes through and burns its own, for 1, 12 and 128 places")
+    void testAFailedTransactionSetsNoNoteAndTheListIsNeverRead() throws Exception {
+        for (int n : new int[] { 1, 12, 128 }) {
+            String what = n + " places";
+            simulator = freshCard();
+            ready();
+            loadMany(128, i -> buildProof(KEYSET, 1 + i, i + 1));
+            int[] places = scrambled(n);
+            assertEquals(SW_OK, sw(beginCommand(places)), what);
+            java.util.Map<String, byte[]> before = persistent();
+            runtime.leaveATransactionOpen();
+            ResponseAPDU r = transmit(SIGN_ALL);
+            assertEquals(SW_TOO_MANY, r.getSW(), what + ": the terminal names fewer");
+            assertEquals(0, r.getData().length, what + ": and no signature leaves the card");
+            assertEquals(0, runtime.getTransactionDepth(), what + ": out of the transaction it was left in");
+            assertEquals(0, field("burnPending")[0], what + ": nothing was committed, so nothing is noted");
+            for (int place = 0; place < 128; place++) assertEquals(1, statusOf(place), what + ": place " + place + " is unspent");
+            for (String name : PERSISTENT) {
+                if (!name.equals("burnList")) assertArrayEquals(before.get(name), field(name), what + ": " + name + " is as it was");
+            }
+            byte[] list = field("burnList");
+            assertEquals(n, list[0] & 0xFF, what + ": the list was written before the transaction was begun, with the count");
+            for (int k = 0; k < n; k++) assertEquals(places[k], list[1 + k] & 0xFF, what + ": and the places");
+            // the next command, and a power-up and a SELECT, burn nothing
+            assertEquals(8256, balance(), what);
+            for (int place = 0; place < 128; place++) assertEquals(1, statusOf(place), what + ": place " + place + " after the next command");
+            simulator.reset();
+            reselect();
+            assertEquals(SW_OK, verify(TEST_PIN));
+            assertEquals(8256, balance(), what);
+            for (int place = 0; place < 128; place++) assertEquals(1, statusOf(place), what + ": place " + place + " after a power-up");
+            assertEquals(0, field("burnPending")[0], what);
+            // begun again, it is a payment, and it burns its own places
+            ResponseAPDU again = spendAll(places, new byte[0][]);
+            assertEquals(SW_OK, again.getSW(), what);
+            assertEquals(8256 - Arrays.stream(places).mapToLong(x -> 1 + x).sum(), balance(), what);
+            assertEquals(0, field("burnPending")[0], what);
+        }
+    }
+
+    @Test
+    @DisplayName("A list the applet could not have written is read safely: burnPending 1 with a count over 128 (129, 130, 200, 255), a place number of 128 or more, or a count of 0, and the next command raises nothing, marks the places in range and no others, and clears the note; 128 places at their largest are marked all of them")
+    void testAListOutOfRangeIsReadSafely() throws Exception {
+        ready();
+        loadMany(128, i -> buildProof(KEYSET, 1 + i, i + 1));
+        java.util.Map<String, byte[]> start = persistent();
+        // { count, then (place, entry) pairs to put in the list; every other entry is out of range }
+        int[][] cases = {
+            { 129, 1, 4, 2, 9, 3, 127 },
+            { 130, 1, 4, 2, 9, 3, 127 },
+            { 200, 1, 4, 2, 9, 3, 127 },
+            { 255, 1, 4, 2, 9, 3, 127 },
+            { 255, 1, 0, 128, 77 },
+            { 128, 128, 77 },
+            { 128, 1, 128, 2, 255, 3, 200 },
+            { 3, 1, 128, 2, 200, 3, 255 },
+            { 0, 1, 1, 2, 2, 3, 3 },
+            { 2, 1, 1, 2, 2, 3, 3 } };
+        for (int c = 0; c < cases.length; c++) {
+            int[] spec = cases[c];
+            putPersistent(start);
+            byte[] list = field("burnList");
+            list[0] = (byte) spec[0];
+            for (int i = 1; i < list.length; i++) list[i] = (byte) (128 + (i % 128));
+            boolean[] expect = new boolean[128];
+            int reads = Math.min(spec[0], 128);
+            for (int k = 1; k + 1 < spec.length; k += 2) {
+                list[spec[k]] = (byte) spec[k + 1];
+                if (spec[k] <= reads && spec[k + 1] < 128) expect[spec[k + 1]] = true;
+            }
+            field("burnPending")[0] = 1;
+            String what = "case " + c + " (count " + spec[0] + ")";
+            ResponseAPDU r = transmit(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256));
+            assertEquals(SW_OK, r.getSW(), what + ": no exception");
+            assertEquals(0, field("burnPending")[0], what + ": the note is cleared");
+            int spent = 0;
+            for (int place = 0; place < 128; place++) {
+                assertEquals(expect[place] ? 2 : 1, statusOf(place), what + ": place " + place);
+                if (expect[place]) spent++;
+            }
+            assertEquals(spent, r.getData()[4] & 0xFF, what + ": GET_INFO counts them");
+        }
+        // the largest honest list: 128 places, every one of them
+        putPersistent(start);
+        byte[] list = field("burnList");
+        list[0] = (byte) 128;
+        for (int k = 0; k < 128; k++) list[1 + k] = (byte) (127 - k);
+        field("burnPending")[0] = 1;
+        assertEquals(0, balance());
+        for (int place = 0; place < 128; place++) assertEquals(2, statusOf(place), "128 places: place " + place);
+    }
+
+    @Test
+    @DisplayName("After a payment burnPending is 0 and burnList holds the count and then the places in the order named, every place named is spent and no other, changeDue is set, the last signature is the one given, and the log, the day's charge and the receipt are the payment's, for 1, 33 and 128 places; a second payment in the same tap replaces the list (5 places then 3, 3 then 5)")
+    void testAfterAPaymentTheListIsWhatWasNamedAndNothingIsPending() throws Exception {
+        for (int n : new int[] { 1, 33, 128 }) {
+            String what = n + " places";
+            simulator = freshCard();
+            readyWithLimit(100000);
+            byte[][] sent = loadMany(128, i -> buildProof(KEYSET, 1 + i, i + 1));
+            int[] places = scrambled(n);
+            byte[][] named = new byte[n][];
+            boolean[] burned = new boolean[128];
+            long worth = 0;
+            for (int k = 0; k < n; k++) { named[k] = asSlot(sent[places[k]]); burned[places[k]] = true; worth += 1 + places[k]; }
+            byte[][] outputs = { output(3, blinded(1)), output(5, blinded(2)) };
+            ResponseAPDU r = spendAll(places, outputs);
+            assertEquals(SW_OK, r.getSW(), what);
+            // with no command after it
+            assertEquals(0, field("burnPending")[0], what + ": nothing is pending");
+            byte[] list = field("burnList");
+            assertEquals(n, list[0] & 0xFF, what + ": the count");
+            for (int k = 0; k < n; k++) assertEquals(places[k], list[1 + k] & 0xFF, what + ": the place named " + (k + 1) + "th");
+            for (int place = 0; place < 128; place++) assertEquals(burned[place] ? 2 : 1, statusOf(place), what + ": place " + place);
+            assertEquals(1, field("changeDue")[0], what + ": the next tap may put the change on");
+            assertEquals(1, field("lastSig")[0], what + ": there has been a signature");
+            assertArrayEquals(r.getData(), Arrays.copyOfRange(field("lastSig"), 1, 65), what + ": and it is the one given");
+            assertEquals(worth, spentToday(), what + ": the day's charge is the whole sum");
+            assertArrayEquals(new long[] { T0, worth, n, 0, 0 }, logTap(0), what + ": the log");
+            assertEquals(SW_OK, allowLoad());
+            Held held = heldReceipts();
+            assertEquals(1, held.count, what + ": one receipt");
+            assertArrayEquals(receiptFor(T0, worth, named, outputs), held.receipts.get(0), what + ": the payment's");
+        }
+        for (int[] sizes : new int[][] { { 5, 3 }, { 3, 5 } }) {
+            String what = sizes[0] + " places then " + sizes[1];
+            simulator = freshCard();
+            ready();
+            loadMany(128, i -> buildProof(KEYSET, 1 + i, i + 1));
+            int[] first = new int[sizes[0]], second = new int[sizes[1]];
+            for (int k = 0; k < first.length; k++) first[k] = 100 - 3 * k;
+            for (int k = 0; k < second.length; k++) second[k] = 10 + 7 * k;
+            assertEquals(SW_OK, spendAll(first, new byte[0][]).getSW(), what);
+            byte[] firstList = Arrays.copyOf(field("burnList"), 1 + first.length);
+            assertEquals(first.length, firstList[0], what);
+            ResponseAPDU r = spendAll(second, new byte[0][]);
+            assertEquals(SW_OK, r.getSW(), what);
+            byte[] list = field("burnList");
+            assertEquals(second.length, list[0] & 0xFF, what + ": the second payment's count replaces the first's");
+            for (int k = 0; k < second.length; k++) assertEquals(second[k], list[1 + k] & 0xFF, what + ": the second payment's place " + (k + 1));
+            assertEquals(0, field("burnPending")[0], what);
+            for (int place = 0; place < 128; place++) {
+                final int named = place;
+                boolean spent = Arrays.stream(first).anyMatch(x -> x == named) || Arrays.stream(second).anyMatch(x -> x == named);
+                assertEquals(spent ? 2 : 1, statusOf(place), what + ": place " + place);
+            }
+            assertArrayEquals(r.getData(), Arrays.copyOfRange(field("lastSig"), 1, 65), what + ": the last signature is the second's");
+            assertArrayEquals(new long[] { T0, Arrays.stream(first).mapToLong(x -> 1 + x).sum() + Arrays.stream(second).mapToLong(x -> 1 + x).sum(), first.length + second.length, 0, 0 },
+                logTap(0), what + ": one tap, both payments");
+        }
+    }
+
+    /** SPEND_ALL_SIGN, with the card to leave the field as the runtime says; what it answered, or null where nothing was. */
+    private ResponseAPDU signAndLose() {
+        try {
+            return transmit(SIGN_ALL);
+        } catch (RuntimeException e) {
+            return null;
+        } finally {
+            runtime.commitsUntilTear = 0;
+        }
+    }
+
+    @Test
+    @DisplayName("A card taken out of the field the instant after a payment's transaction commits (the note set, the places not marked, nothing answered) has paid: the day, the log, the last signature and the change note are the payment's, the receipt is not written, and the next command, SELECT or any other, marks every place before it looks at one, so that SPEND_ALL_AGAIN gives the signature and the places cannot be paid with again; and a card taken away after the receipt has the places marked and the receipt; for 1, 12, 64 and 128 places")
+    void testACardTornAtTheCommitHasPaidAndFinishesAtItsNextCommand() throws Exception {
+        for (int n : new int[] { 1, 12, 64, 128 }) {
+            for (int tearAfter = 1; tearAfter <= 2; tearAfter++) {
+                String what = n + " places, taken away after commit " + tearAfter + (tearAfter == 1 ? " (the payment's)" : " (the receipt's)");
+                simulator = freshCard();
+                readyWithLimit(100000);
+                byte[][] sent = loadMany(128, i -> buildProof(KEYSET, 1 + i, i + 1));
+                int[] places = scrambled(n);
+                byte[][] named = new byte[n][];
+                boolean[] burned = new boolean[128];
+                long worth = 0;
+                for (int k = 0; k < n; k++) { named[k] = asSlot(sent[places[k]]); burned[places[k]] = true; worth += 1 + places[k]; }
+                byte[][] outputs = { output(3, blinded(1)) };
+                assertEquals(SW_OK, sw(beginCommand(places)), what);
+                assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_SPEND_ALL_OUTPUTS, 0, 0, concat(outputs))), what);
+                runtime.commitsUntilTear = tearAfter;
+                ResponseAPDU lost = signAndLose();
+                assertTrue(lost == null || (lost.getSW() != SW_OK && lost.getData().length == 0), what + ": nothing is answered");
+                // the card as it was left, read where no command is spent
+                assertEquals(tearAfter == 1 ? 1 : 0, field("burnPending")[0], what + ": the note");
+                for (int place = 0; place < 128; place++) {
+                    assertEquals(burned[place] && tearAfter == 2 ? 2 : 1, statusOf(place), what + ": place " + place + " as the tear left it");
+                }
+                assertEquals(1, field("changeDue")[0], what + ": the change note is in the payment's transaction");
+                assertEquals(1, field("lastSig")[0], what + ": and so is the signature");
+                assertEquals(tearAfter == 1 ? 0 : 1, readUint32(field("cardReceipts"), 0), what + ": the receipt is the next transaction");
+                // the card goes out of the field and comes back
+                simulator.reset();
+                reselect();
+                assertEquals(0, field("burnPending")[0], what + ": the SELECT has finished it");
+                for (int place = 0; place < 128; place++) assertEquals(burned[place] ? 2 : 1, statusOf(place), what + ": place " + place + " after the SELECT");
+                assertEquals(SW_OK, verify(TEST_PIN));
+                assertEquals(8256 - worth, balance(), what);
+                assertEquals(worth, spentToday(), what + ": the day was charged in the transaction");
+                assertArrayEquals(new long[] { T0, worth, n, 0, 0 }, logTap(0), what + ": and so was the log");
+                ResponseAPDU again = transmit(new CommandAPDU(CLA, INS_SPEND_ALL_AGAIN, 0, 0, 64));
+                assertEquals(SW_OK, again.getSW(), what);
+                assertEquals(64, again.getData().length, what);
+                assertTrue(signedForAll(again.getData(), named, outputs, REFUND), what + ": the signature of the payment that was made");
+                assertEquals(SW_OK, allowLoad());
+                assertEquals(tearAfter == 1 ? 0 : 1, heldReceipts().count, what + ": a payment taken away before its receipt has none");
+                // a place paid with cannot be paid with again, and one not paid with can
+                assertEquals(SW_CONDITIONS_NOT_SATIS, sw(beginCommand(places[0])), what);
+                if (n < 128) {
+                    int other = -1;
+                    for (int place = 0; place < 128 && other < 0; place++) if (!burned[place]) other = place;
+                    assertEquals(SW_OK, spendAll(new int[] { other }, new byte[0][]).getSW(), what + ": place " + other + " was not part of it");
+                }
+            }
+        }
     }
 
     @Test
@@ -5439,13 +6020,13 @@ class CashuAppletTest {
     }
 
     @Test
-    @DisplayName("GET_INFO: byte 1 is 7 and byte 6 is 3F, and bytes 34..41 asked for with P1 = 1 are zero, as is the record behind them, however the limit on a payment has been used; nothing ever answers 6A95")
+    @DisplayName("GET_INFO: byte 1 is 8 and byte 6 is 7F, and bytes 34..41 asked for with P1 = 1 are zero, as is the record behind them, however the limit on a payment has been used; nothing ever answers 6A95")
     void testTheCardRemembersNothingOfThePaymentLimit() throws Exception {
         readyWithLimit(0);
         byte[] more = infoTap();
         assertEquals(1, more[0]);
-        assertEquals(7, more[1], "version 1.7");
-        assertEquals(0x3F, more[6], "capabilities 3F: the limit on one payment is waited for, not refused, the 1.6 forms are there, and so are 128 places with the short listing");
+        assertEquals(8, more[1], "version 1.8");
+        assertEquals(0x7F, more[6], "capabilities 7F: the limit on one payment is waited for, not refused, the 1.6 forms are there, so are 128 places with the short listing, and so is a payment burned outside its transaction");
         assertEquals(SW_OK, setLimits(1000, 100));
         assertEquals(100, paymentLimit());
         assertNothingRemembered("a limit set");
@@ -6167,10 +6748,10 @@ class CashuAppletTest {
     }
 
     @Test
-    @DisplayName("The spend marks the slot and counts the day in one transaction, refuses before anything is changed, and signs only after it commits; the wait before it burns, counts and writes nothing; the receipt is a second transaction, after the burn's and before the answer")
+    @DisplayName("The payment's one transaction counts the day and sets burnPending, changeDue, the log and the last signature and writes no place; it refuses before anything is changed and is begun after the signature is made; the places are marked after it commits and before the receipt and the answer; the wait before it burns, counts and writes nothing; the receipt is a second transaction, after the payment's and before the answer")
     void testSpendIsOneTransaction() throws Exception {
         String code = appletCode();
-        String body = body(code, "private void processSpendAllSign(", "private void processSpendAllAgain(");
+        String body = body(code, "private void processSpendAllSign(", "private void finishBurn(");
         // the refusals (over the day, no time) are the limits' own, asked for before anything is signed or changed;
         // the limit on one payment is not among them: it is waited for, and nothing names a refusal for it
         String limits = body(code, "private void requireUnderLimits(", "private short waitsFor(");
@@ -6196,32 +6777,36 @@ class CashuAppletTest {
         int begin = body.indexOf("beginTransaction");
         int window = body.indexOf("CARD_WINDOW_OFFSET");
         int charge = body.indexOf("CARD_SPENT_OFFSET", begin);
-        int burn = body.lastIndexOf("STATUS_SPENT");
+        int pending = body.indexOf("burnPending[0] = (byte) 1;");
         int commit = body.indexOf("commitTransaction");
+        int finish = body.indexOf("finishBurn();", commit);
         int sign = body.indexOf("schnorrHW.sign", waitEnd);
         int send = body.indexOf("setOutgoingAndSend", commit);
         assertTrue(refuse > waitEnd && refuse < begin, "the day is asked about again, as it stands, after the wait and before anything is changed");
         assertFalse(body.contains("CARD_TAP"), "the limit on one payment is not read, counted or written when the payment is signed for");
-        /* Signed into RAM first, then burned, then answered: a card pulled away while it signs (most of
-         * a second) has burned nothing and sent nothing, and no signature leaves before the burn. Burned
-         * first, a pull-away in that time lost the piece with no signature anywhere. */
-        assertTrue(sign > 0 && sign < begin && begin < window && window < charge && charge < burn && burn < commit && commit < send,
-            "signed first; the window, what the day has signed for and the slot change between begin and commit; and only then the answer");
+        /* Signed into RAM first, then committed, then answered: a card pulled away while it signs (most of
+         * a second) has burned nothing and sent nothing, and no signature leaves before the payment is
+         * committed. Burned first, a pull-away in that time lost the piece with no signature anywhere.
+         * The payment is the one transaction: the day's window and count, the note that it is made
+         * (burnPending), and then, after it has committed, the places are marked (finishBurn). */
+        assertTrue(sign > 0 && sign < begin && begin < window && window < charge && charge < pending && pending < commit && commit < finish && finish < send,
+            "signed first; the window, what the day has signed for and the note that the payment is made come between begin and commit; the places are marked after the commit; and only then the answer");
+        assertFalse(body.contains("STATUS_SPENT") || body.contains("proofStorage"), "no place is written in the signing: the places are marked by finishBurn, outside the transaction");
         assertEquals(2, count(body, "setOutgoingAndSend"), "'not yet' leaves the card in one place, in the wait, and the signature in one place, after both commits");
         assertEquals(send, body.lastIndexOf("setOutgoingAndSend"), "and the last is the signature's");
 
-        /* The receipt (6c): a second transaction, begun after the burn's has committed and committed before the signature is
-         * answered. What it says is true only of a payment that was made, and it is kept out of the burn's own transaction,
-         * which has to hold thirty-two places. */
-        assertEquals(2, count(body, "beginTransaction"), "two transactions: the burn's and the receipt's");
+        /* The receipt (6c): a second transaction, begun after the payment's has committed (and its places are marked) and
+         * committed before the signature is answered. What it says is true only of a payment that was made, and it is kept
+         * out of the payment's own transaction, which is kept small. */
+        assertEquals(2, count(body, "beginTransaction"), "two transactions: the payment's and the receipt's");
         assertEquals(2, count(body, "commitTransaction"));
         int receiptBegin = body.indexOf("beginTransaction", commit);
         int receiptCommit = body.indexOf("commitTransaction", receiptBegin);
-        assertTrue(receiptBegin > commit && receiptCommit > receiptBegin && receiptCommit < send, "the receipt is written after the burn commits and before the signature is answered");
+        assertTrue(receiptBegin > finish && receiptCommit > receiptBegin && receiptCommit < send, "the receipt is written after the payment commits and its places are marked, and before the signature is answered");
         assertFalse(body.substring(commit, receiptBegin).contains("setOutgoingAndSend"), "and nothing is answered between them");
         String burnPart = body.substring(0, receiptBegin);
         String receipt = body.substring(receiptBegin, receiptCommit);
-        assertEquals(1, count(burnPart, "Util.arrayCopy(cardRecord"), "a spend begins the day's window by copying the clock, in the burn's transaction, and writes no other part of the record");
+        assertEquals(1, count(burnPart, "Util.arrayCopy(cardRecord"), "a spend begins the day's window by copying the clock, in the payment's transaction, and writes no other part of the record");
         assertFalse(receipt.contains("proofStorage") || receipt.contains("STATUS_SPENT") || receipt.contains("cardLog") || receipt.contains("lastSig")
             || receipt.contains("changeDue") || receipt.contains("CARD_SPENT_OFFSET") || receipt.contains("CARD_WINDOW_OFFSET"), "the receipt's transaction burns and counts nothing");
         java.util.regex.Matcher writes = java.util.regex.Pattern.compile("Util\\.arrayCopy(?:NonAtomic)?\\([^,]*,[^,]*,\\s*([A-Za-z]+)|Util\\.arrayFillNonAtomic\\(([A-Za-z]+),|addUint32Stop\\(([A-Za-z]+),").matcher(receipt);

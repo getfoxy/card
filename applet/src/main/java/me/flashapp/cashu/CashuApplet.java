@@ -103,6 +103,9 @@ public class CashuApplet extends Applet {
     // FORMAT is what a reader checks before it reads a slot: 3 for this design
     // (2 was the allowance draft and the first limit).
     static final byte VERSION_MAJOR = (byte) 0x01;
+    // 1.8 burns a payment's pieces outside the transaction that commits the payment (see `finishBurn`):
+    // on the chip a transaction held about a dozen places and no more, and a payment of thirty-two was
+    // refused. Now a payment is of as many places as the card has, and capability bit 6 says so.
     // 1.7 is the same card with twice the places (128), so that it can hold a deep drawer of small
     // pieces; a place's number is seven bits where it was six, so GET_PIECES' tags changed, and the
     // short listing is a shorter one (see `processGetPieces`). Nothing it signs or stores for a piece
@@ -113,7 +116,7 @@ public class CashuApplet extends Applet {
     // payment, which asks no clock and is waited for (docs/FOXY-CARD-DAILY-LIMIT.md, section 6a).
     // 1.4 is one signature for a whole payment (NUT-11 SIG_ALL): format 4, in
     // which every piece's secret carries the flag and SPEND_PROOF is gone.
-    static final byte VERSION_MINOR = (byte) 0x07;
+    static final byte VERSION_MINOR = (byte) 0x08;
     static final byte FORMAT        = (byte) 0x04;
 
     // -------------------------------------------------------------------------
@@ -242,8 +245,8 @@ public class CashuApplet extends Applet {
     // output is its amount (4, big-endian) and its blinded message (33).
     // Every place the card has (it was thirty-two): a deep drawer holds its
     // money in small pieces, and a payment of most of a small card is many of
-    // them. The burn is one transaction whatever their number; a card whose
-    // transaction cannot hold so many refuses at SIGN with 6A96, nothing burned.
+    // them. The transaction that commits a payment is the same size whatever
+    // their number (`finishBurn`).
     static final short ALL_MOST            = MAX_PROOFS;
     static final short ALL_OUTPUT_LEN      = (short) 37;
 
@@ -684,6 +687,14 @@ public class CashuApplet extends Applet {
      * the terminal that asked has nothing. It asks again (SPEND_ALL_AGAIN).
      */
     private byte[] lastSig;
+    /**
+     * The places of the payment last committed: how many (1), then a byte
+     * each. Written before the payment's transaction, and read only while
+     * `burnPending` is set. See `finishBurn`.
+     */
+    private byte[] burnList;
+    /** 1 from the moment a payment is committed until every place in `burnList` has been marked spent. */
+    private byte[] burnPending;
     private RandomData rng;
 
     // -------------------------------------------------------------------------
@@ -742,6 +753,8 @@ public class CashuApplet extends Applet {
         allState        = JCSystem.makeTransientByteArray((short) 6, JCSystem.CLEAR_ON_DESELECT);
         allSum          = JCSystem.makeTransientByteArray((short) 4, JCSystem.CLEAR_ON_DESELECT);
         lastSig         = new byte[(short) 65];
+        burnList        = new byte[(short)(MAX_PROOFS + 1)];
+        burnPending     = new byte[1];
         rng             = RandomData.getInstance(RandomData.ALG_SECURE_RANDOM);
         sha.reset();
         sha.doFinal(AUTH_TAG, (short) 0, (short) AUTH_TAG.length, authTagHash, (short) 0);
@@ -825,6 +838,11 @@ public class CashuApplet extends Applet {
     public void process(APDU apdu) {
         byte[] buf = apdu.getBuffer();
 
+        /* A payment that was committed as the card left the field, with its
+         * pieces not all marked spent yet: they are marked now, before
+         * anything looks at a place (`finishBurn`). */
+        if (burnPending[0] != (byte) 0) finishBurn();
+
         if (selectingApplet()) {
             buf[0] = VERSION_MAJOR;
             buf[1] = VERSION_MINOR;
@@ -904,7 +922,8 @@ public class CashuApplet extends Applet {
         // secp256k1 + Schnorr + PIN + the limit on one payment is waited for, not refused
         // + GET_PIECES names places whole and LOAD_PROOF takes several pieces (bit 4)
         // + more than sixty-four places: seven-bit tags, and the short listing is P2 = 3 (bit 5)
-        buf[6] = (byte) 0x3F;
+        // + a payment's pieces are burned outside its transaction, so it may be of any number (bit 6)
+        buf[6] = (byte) 0x7F;
         buf[7] = pinState[0];
         // The fork's: the first eight bytes are upstream's, so a reader that
         // knows only those still reads them right.
@@ -1357,10 +1376,14 @@ public class CashuApplet extends Applet {
      * answer is sent only after the commit. (Burned first, a card pulled away
      * while signing had spent the pieces and given nothing for them.)
      *
-     * One transaction for all of it: every piece's place, what the day and the
-     * tap have signed for, and the card's own log. A card pulled away in it has
-     * done all of it or none. A set too large for one transaction on this card
-     * burns nothing and is `6A96`: the terminal names fewer.
+     * One transaction commits the payment: the note that its pieces are spent
+     * (`burnPending`), what the day has signed for, the card's own log and the
+     * signature kept for SPEND_ALL_AGAIN. A card pulled away in it has done all
+     * of it or none. The pieces' own status bytes are written after it, from
+     * the list written before it, and by the card's next command if it leaves
+     * the field first (`finishBurn`): the transaction is the same size for one
+     * piece as for all 128. Should it fail all the same, nothing is burned and
+     * the answer is `6A96`.
      */
     private void processSpendAllSign(APDU apdu) {
         if (allState[0] != (byte) 1) ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
@@ -1405,16 +1428,23 @@ public class CashuApplet extends Applet {
         shaAll.doFinal(buf, (short) 0, (short) 0, scratch, X_MSG);
         short sigLen = schnorrHW.sign(cardPrivKey, cardPubKey, scratch, X_MSG, buf, (short) 0);
 
+        /* The places, written down where `finishBurn` will find them. Not
+         * yet a burn: nothing reads this list until the transaction below
+         * has set `burnPending`, and a card that leaves before then has
+         * burned nothing. */
+        burnList[0] = (byte) n;
+        Util.arrayCopyNonAtomic(allSlots, (short) 0, burnList, (short) 1, n);
+
         try {
             JCSystem.beginTransaction();
             if (limited) {
                 if (newDay) Util.arrayCopy(cardRecord, CARD_NOW_OFFSET, cardRecord, CARD_WINDOW_OFFSET, (short) 4);
                 Util.arrayCopy(scratch, X_SUM, cardRecord, CARD_SPENT_OFFSET, (short) 4);
             }
-            for (short i = 0; i < n; i++) {
-                short base = (short)((short)(allSlots[i] & 0xFF) * PROOF_SIZE);
-                proofStorage[(short)(base + PROOF_STATUS_OFFSET)] = STATUS_SPENT;
-            }
+            /* The payment itself: one byte, whatever the number of places.
+             * From the moment this commits every place in the list is spent,
+             * whether or not its status byte says so yet. */
+            burnPending[0] = (byte) 1;
             // and the next tap may put the change on with no PIN (see select)
             changeDue[0] = (byte) 1;
             // and the card's own account of it, with the burn: no piece is burned that the log does not have
@@ -1433,12 +1463,14 @@ public class CashuApplet extends Applet {
             if (JCSystem.getTransactionDepth() != (byte) 0) JCSystem.abortTransaction();
             ISOException.throwIt(SW_TOO_MANY);
         }
+        // committed: the status bytes follow, here or at the card's next command
+        finishBurn();
         tapOpen[0] = (byte) 1;
 
         /* The receipt, after the burn and by itself: what it says is true
-         * only of a payment that was made, and it is kept out of the burn's
-         * own transaction, which has to hold every place named. A card pulled
-         * away between the two has the payment in its log and no receipt. */
+         * only of a payment that was made, and it is kept out of the payment's
+         * own transaction, which is kept small. A card pulled away between
+         * the two has the payment in its log and no receipt. */
         short slot = (short)((cardReceipts[3] & 0x0F) * RECEIPT_LEN + RECEIPTS_HEAD);
         JCSystem.beginTransaction();
         Util.arrayCopy(cardRecord, CARD_NOW_OFFSET, cardReceipts, slot, (short) 4);
@@ -1453,6 +1485,35 @@ public class CashuApplet extends Applet {
         JCSystem.commitTransaction();
 
         apdu.setOutgoingAndSend((short) 0, sigLen);
+    }
+
+    /**
+     * Mark every place of the payment last committed as spent, and take the
+     * note of it down.
+     *
+     * A payment used to burn its pieces inside its transaction, a status
+     * byte each. A chip's transaction holds only so much: on the card this
+     * runs on, a dozen places went through and thirty-two were refused. So
+     * the transaction now commits ONE byte for the burn, `burnPending`, with
+     * the day, the log and the signature as before; the places themselves
+     * were written to `burnList` before it began. Once it has committed the
+     * pieces are spent, and marking them is only bookkeeping: done here at
+     * the end of SIGN, and, should the card leave the field first, at the
+     * start of its very next command (`process`), before anything can look at
+     * a place. A byte written twice is the same byte, so doing it again from
+     * the top after a tear is safe. A card that leaves before the transaction
+     * commits has a list nobody reads, and has burned nothing.
+     */
+    private void finishBurn() {
+        short n = (short)(burnList[0] & 0xFF);
+        if (n > MAX_PROOFS) n = MAX_PROOFS;
+        for (short i = 0; i < n; i++) {
+            short idx = (short)(burnList[(short)(i + 1)] & 0xFF);
+            if (idx >= MAX_PROOFS) continue;
+            short at = (short)(idx * PROOF_SIZE + PROOF_STATUS_OFFSET);
+            if (proofStorage[at] != STATUS_SPENT) proofStorage[at] = STATUS_SPENT;
+        }
+        burnPending[0] = (byte) 0;
     }
 
     /**

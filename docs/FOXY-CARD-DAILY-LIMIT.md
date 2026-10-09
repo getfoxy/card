@@ -597,11 +597,11 @@ the signature and the swap, the pieces cannot be swapped by the card's
 signature at all (a card with a refund key: its owner's phone takes them back
 after their date, as section 6 of `FOXY-CARD-SPEC.md` has it).
 
-Not yet measured on the chip: how long `BEGIN` takes for thirty-two places
-or more (it is a few kilobytes of SHA-256) beside the one signature; nor
-whether the chip's transaction holds the burn of a payment that names all 128.
-Where it does not, `SIGN` answers `6A96` with nothing burned and no signature
-given, and the payment is taken in two parts.
+Measured on the chip, with 1.7: its transaction held the burn of eleven
+pieces and not of thirty-two (`SIGN` answered `6A96`, nothing burned, no
+signature given). 1.8 takes the burn out of the transaction (6d). Not yet
+measured: how long `BEGIN` takes for a hundred places (it is some kilobytes of
+SHA-256) beside the one signature.
 
 ## 6d. Time on the card
 
@@ -667,6 +667,40 @@ signs or stores for a piece is different:
 
 Bit 5 of the capabilities byte says a card has more than sixty-four places,
 seven-bit tags and the short listing; `GET_INFO`'s count of places is 128.
+
+**Version 1.8: the burn is not in the transaction.** A payment burned its
+pieces inside the transaction that committed it, a status byte for each. A
+chip's transaction holds only so much, and how much is not something a
+simulator has: jCardSim's has no size at all. On the card this runs on, a
+payment of eleven pieces went through and one of thirty-two was refused
+(`6A96`, by the `TransactionException` the code was already catching, with
+nothing burned). A deep drawer is a hundred pieces, and taking a card's money
+off is all of them.
+
+So the transaction is now the same size whatever the payment:
+
+1. The signature is made, into the answer's buffer. Nothing is written yet.
+2. The places are written to `burnList` (how many, then a byte each), outside
+   any transaction. Nothing reads that list unless `burnPending` is set.
+3. One transaction: the day's charge, `burnPending = 1`, the note that the
+   next tap may put change on, the log, and the signature kept for
+   `SPEND_ALL_AGAIN`. **From the moment it commits, the pieces are spent.**
+4. `finishBurn`: each place in the list has its status byte set to spent, one
+   plain write each, and `burnPending` is cleared.
+5. The receipt, in a transaction of its own, and then the answer.
+
+A card that leaves the field before step 3 commits has a list nobody reads,
+and has burned nothing. One that leaves after it, with some status bytes not
+yet written, finishes step 4 at the start of its very next command, before
+that command (or `SELECT`) looks at anything: `process` begins with it. A
+byte written twice is the same byte, so step 4 may be cut short and begun
+again any number of times. There is no state in which the payment is
+committed and one of its pieces can still be read as unspent by a command,
+and none in which a piece is marked spent for a payment that did not commit.
+
+Bit 6 of the capabilities byte says a card burns so, and a terminal may then
+name as many places in one payment as the card has. A terminal that reads a
+card without it should name few: eight, by what was seen on the chip.
 
 ## 7. The owner
 
@@ -802,7 +836,8 @@ card, and a phone that knows both pays with either. With the limit on one
 payment a wait and not a window (6a) the version is 1.5, the format is still
 4, and bit 3 of the capabilities byte says so. 1.6 is the same card made
 quicker to hold (6d), and bit 4 says so. 1.7 is the same card with 128 places
-(6d, 8.1), and bit 5 says so.
+(6d, 8.1), and bit 5 says so. 1.8 burns a payment's pieces outside its
+transaction (6d), so that a payment may be of any number, and bit 6 says so.
 
 **Every command in every state: the rule of section 3 worked through.** "Open"
 means nothing is needed beyond what the command's own row says; "refused" means
