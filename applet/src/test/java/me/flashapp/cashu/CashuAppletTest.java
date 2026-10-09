@@ -104,7 +104,7 @@ class CashuAppletTest {
 
     static final int MAX_PROOFS = 128;
     static final int SLOT = 82;
-    static final int MINT_MAX = 80;
+    static final int MINT_MAX = 77;   // 80 before the design (1.10): the proof, the record, the mint and it in one short APDU
 
     static final byte[] TEST_PIN  = { 0x31, 0x32, 0x33, 0x34 };
     static final byte[] WRONG_PIN = { 0x39, 0x39, 0x39, 0x39 };
@@ -247,6 +247,10 @@ class CashuAppletTest {
     static byte[] record(String mint, byte[] refund, byte[] timeKey) {
         byte[] m = mint.getBytes(StandardCharsets.US_ASCII);
         return concat(new byte[] { 0 }, refund, timeKey, new byte[] { (byte) m.length }, m);
+    }
+    /** The same, with the card's design after the mint (1.10): three characters, or three zeros for none. */
+    static byte[] record(String mint, byte[] refund, byte[] timeKey, String design) {
+        return concat(record(mint, refund, timeKey), design.getBytes(StandardCharsets.US_ASCII));
     }
 
     private static CommandAPDU changePinCommand(byte[] proof, byte[] newPin) {
@@ -535,7 +539,7 @@ class CashuAppletTest {
         // what a phone sends: iOS chooses by the name in the app's Info.plist, and Foxy by the same ten bytes
         ResponseAPDU whole = transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_HEX), 256));
         assertEquals(SW_OK, whole.getSW());
-        assertArrayEquals(new byte[] { 0x01, 0x09 }, whole.getData(), "the same answer either way: version 1.9");
+        assertArrayEquals(new byte[] { 0x01, 0x0A }, whole.getData(), "the same answer either way: version 1.10");
         assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)), "and its instructions follow");
     }
 
@@ -544,17 +548,17 @@ class CashuAppletTest {
     void testSelect() {
         ResponseAPDU resp = transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR)));
         assertEquals(SW_OK, resp.getSW());
-        assertArrayEquals(new byte[] { 0x01, 0x09 }, resp.getData(), "version 1.9: the PIN is taken sealed");
+        assertArrayEquals(new byte[] { 0x01, 0x0A }, resp.getData(), "version 1.10: the PIN is taken sealed");
         assertNotEquals(SW_OK, sw(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(UPSTREAM_AID))),
             "an upstream reader must not find this applet under upstream's AID: the wire is not the same");
     }
 
     @Test
-    @DisplayName("GET_INFO on a new card: 30 bytes: version 1.9, 128 empty slots, no PIN, three tries, format 4, capabilities FF, no record, no limit, no owner, no time, no change due")
+    @DisplayName("GET_INFO on a new card: 30 bytes: version 1.10, 128 empty slots, no PIN, three tries, format 4, capabilities FF, no record, no limit, no owner, no time, no change due")
     void testInfoFresh() {
         byte[] d = info();
         assertEquals(30, d.length);
-        assertEquals(1, d[0]); assertEquals(9, d[1]);
+        assertEquals(1, d[0]); assertEquals(10, d[1]);
         assertEquals(MAX_PROOFS, d[2] & 0xFF);
         assertEquals(0, d[3]); assertEquals(0, d[4]);
         assertEquals(MAX_PROOFS, d[5] & 0xFF);
@@ -2445,7 +2449,7 @@ class CashuAppletTest {
                 // and the answer says what the marked places make it say
                 byte[] d = torn.getData();
                 if (name.equals("SELECT")) {
-                    assertArrayEquals(new byte[] { 0x01, 0x09 }, d, what);
+                    assertArrayEquals(new byte[] { 0x01, 0x0A }, d, what);
                 } else if (name.equals("GET_INFO")) {
                     assertEquals(others, d[3] & 0xFF, what + ": unspent");
                     assertEquals(n + others, d[4] & 0xFF, what + ": spent");
@@ -4262,19 +4266,44 @@ class CashuAppletTest {
         ready();
         assertEquals(SW_OK, setLimit(5000));
         byte[] c = cardRecord();
-        assertEquals(106 + MINT.length(), c.length);
+        assertEquals(109 + MINT.length(), c.length, "the record, the mint, and three bytes of design after it");
         assertEquals(4, c[0]); assertEquals(1, c[1]); assertEquals(0, c[2]);
         assertEquals(5000, readUint32(c, 3));
         assertArrayEquals(REFUND, Arrays.copyOfRange(c, 7, 40));
         assertArrayEquals(SIGNER.pub, Arrays.copyOfRange(c, 40, 105), "the time key, uncompressed");
         assertEquals(MINT.length(), c[105] & 0xFF);
-        assertEquals(MINT, new String(Arrays.copyOfRange(c, 106, c.length), StandardCharsets.US_ASCII));
+        assertEquals(MINT, new String(Arrays.copyOfRange(c, 106, 106 + MINT.length()), StandardCharsets.US_ASCII));
+        assertArrayEquals(new byte[3], Arrays.copyOfRange(c, c.length - 3, c.length), "a record given without a design has none: three zeros");
         assertEquals(1, info()[11]);
         assertEquals(5000, readUint32(info(), 12));
         assertEquals(1, info()[16], "and it has an owner");
         // SET_CARD writes the record and not the limit, which is the owner's to set
         assertEquals(SW_OK, setCard("https://other.example.com", NO_REFUND));
         assertEquals(5000, limit(), "a new record leaves the limit as it was");
+    }
+
+    @Test
+    @DisplayName("The card's design: three characters after the mint, written by SET_CARD when given, zeros when not, refused when not a code")
+    void testCardDesign() {
+        ready();
+        byte[] withDesign = record(MINT, REFUND, SIGNER.pub, "FX1");
+        assertEquals(SW_OK, sw(setCardCommand(ownerProof(L_CARD, OWNER, nonceBytes(), withDesign), withDesign)));
+        byte[] c = cardRecord();
+        assertEquals("FX1", new String(Arrays.copyOfRange(c, c.length - 3, c.length), StandardCharsets.US_ASCII), "the design, after the mint");
+        assertEquals(MINT, new String(Arrays.copyOfRange(c, 106, c.length - 3), StandardCharsets.US_ASCII), "and the mint where it was");
+        byte[] bad = record(MINT, REFUND, SIGNER.pub, "fx1");
+        assertEquals(SW_WRONG_DATA, sw(setCardCommand(ownerProof(L_CARD, OWNER, nonceBytes(), bad), bad)), "lower case is not a code");
+        assertEquals("FX1", new String(Arrays.copyOfRange(cardRecord(), c.length - 3, c.length), StandardCharsets.US_ASCII), "and the record is as it was");
+        byte[] two = concat(record(MINT, REFUND, SIGNER.pub), "FX".getBytes(StandardCharsets.US_ASCII));
+        assertEquals(SW_WRONG_LENGTH, sw(setCardCommand(ownerProof(L_CARD, OWNER, nonceBytes(), two), two)), "two characters are no length a record has");
+        byte[] zeros = record(MINT, REFUND, SIGNER.pub, "\0\0\0");
+        assertEquals(SW_OK, sw(setCardCommand(ownerProof(L_CARD, OWNER, nonceBytes(), zeros), zeros)), "three zeros are none, and taken");
+        assertArrayEquals(new byte[3], Arrays.copyOfRange(cardRecord(), c.length - 3, c.length));
+        byte[] none = record(MINT, REFUND, SIGNER.pub, "FX1");
+        assertEquals(SW_OK, sw(setCardCommand(ownerProof(L_CARD, OWNER, nonceBytes(), none), none)));
+        none = record(MINT, REFUND, SIGNER.pub);
+        assertEquals(SW_OK, sw(setCardCommand(ownerProof(L_CARD, OWNER, nonceBytes(), none), none)), "the record as a phone that knows no design sends it");
+        assertArrayEquals(new byte[3], Arrays.copyOfRange(cardRecord(), c.length - 3, c.length), "which clears the design");
     }
 
     @Test
@@ -4296,9 +4325,9 @@ class CashuAppletTest {
         n = nonceBytes();
         assertEquals(SW_WRONG_DATA, sw(setCardCommand(ownerProof(L_CARD, OWNER, n, data), data)), "a time key that is not uncompressed");
         byte[] c = cardRecord();
-        assertEquals(MINT, new String(Arrays.copyOfRange(c, 106, c.length), StandardCharsets.US_ASCII));
+        assertEquals(MINT, new String(Arrays.copyOfRange(c, 106, c.length - 3), StandardCharsets.US_ASCII));
         assertArrayEquals(SIGNER.pub, Arrays.copyOfRange(c, 40, 105), "the time key is as it was");
-        assertEquals(SW_OK, setCard("x".repeat(MINT_MAX), REFUND), "eighty is kept");
+        assertEquals(SW_OK, setCard("x".repeat(MINT_MAX), REFUND), "seventy-seven is kept");
         // the longest a record and its proof can be: one short APDU of 255 data bytes
         byte[] longest = record("x".repeat(MINT_MAX), REFUND, SIGNER.pub);
         assertEquals(100 + MINT_MAX, longest.length);
@@ -4617,7 +4646,7 @@ class CashuAppletTest {
                 public CommandAPDU build(byte[] proof) { return setCardCommand(proof, data); }
                 public void assertDone(CashuAppletTest t) {
                     byte[] c = t.cardRecord();
-                    assertEquals("https://other.example.com", new String(Arrays.copyOfRange(c, 106, c.length), StandardCharsets.US_ASCII));
+                    assertEquals("https://other.example.com", new String(Arrays.copyOfRange(c, 106, c.length - 3), StandardCharsets.US_ASCII));
                     assertArrayEquals(OTHER_SIGNER.pub, Arrays.copyOfRange(c, 40, 105));
                 }
                 public String toString() { return "SET_CARD"; }
@@ -6034,7 +6063,7 @@ class CashuAppletTest {
         readyWithLimit(0);
         byte[] more = infoTap();
         assertEquals(1, more[0]);
-        assertEquals(9, more[1], "version 1.9");
+        assertEquals(10, more[1], "version 1.10");
         assertEquals((byte) 0xFF, more[6], "capabilities FF: the limit on one payment is waited for, not refused, the 1.6 forms are there, so are 128 places with the short listing, a payment burned outside its transaction, and the PIN taken sealed");
         assertEquals(SW_OK, setLimits(1000, 100));
         assertEquals(100, paymentLimit());

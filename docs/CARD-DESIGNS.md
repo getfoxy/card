@@ -13,15 +13,18 @@ the old one is still drawn as it was printed.
 | code | design | whose | drawn in Foxy |
 |---|---|---|---|
 | FL1 | Flash, first design: black card, the Flash bolt in a circle at its centre, chip at the top left, BEARER at the bottom right | Flash | yes |
+| FX1 | Foxy, first design: orange fur, a sleeping fox in a black circle at its centre, chip at the top left, ₿ and BEARER at the bottom right | Foxy | yes |
 
 Where the wallet keeps them: `FC_DESIGNS` in `build/app/26f-flashcard.js` of
 the wallet repository (getfoxy/iOS, https://github.com/getfoxy/iOS), and the
 drawing itself in `build/markup.html` there (the card on the FLASHCARD screen).
 
-## Not decided yet
+## How a card names its design
 
-A card does not yet say which design it is. Every card is drawn as FL1. For a
-card to name its design, the code has to be written on the card when it is
-made: three bytes in the card record (`SET_CARD`, read back by `GET_CARD`),
-which changes the record's layout and so the applet, its specification and
-the wallet's reader together.
+Since card software 1.10 the card's record carries the code: three bytes
+after the mint, written by `SET_CARD` when the phone gives them and read back
+by `GET_CARD` (FOXY-CARD-SPEC.md 5.1). A phone that sets a card up writes the
+design it chose for it (Foxy's own phone writes FX1), and every phone that
+reads the card draws it so. A card of 1.9 or earlier has no such field: the
+phone that set it up draws it as the design it wrote on its own file for it,
+and any other phone draws it as FL1.

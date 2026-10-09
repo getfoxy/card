@@ -207,12 +207,20 @@ the window with it, 5.3 rule 4). The limit is written by `SET_LIMIT`, `now` by
 | now | 4 | the latest signed time the card has accepted, seconds, big-endian; 0 until it has been told one. Written only by `SET_TIME` (and cleared only as 5.3 rule 4 says) |
 | window start | 4 | when the current day began; written by `SET_LIMIT` and by a `SPEND` that begins a new day |
 | spent today | 4 | what the card has signed for since the window began |
-| mint | 1 + up to 80 | the mint's address, as text |
+| mint | 1 + up to 77 | the mint's address, as text |
+| design | 3 | the card's face: a code of three characters, capital letters and digits, naming a design in docs/CARD-DESIGNS.md; zeros for none. Written by `SET_CARD` when given, cleared by one that is not (1.10) |
 
-The mint is at most 80 characters, not 96 as the earlier draft had it. The
-reason is one command: `SET_CARD` with the owner's proof on a card that has an
-owner carries a proof of up to 72 bytes, 100 bytes of record and the mint, and
-a short APDU holds 255 data bytes in all (1 + 72 + 100 + 80 = 253).
+The mint is at most 77 characters, not 96 as the earlier draft had it (80
+before the design). The reason is one command: `SET_CARD` with the owner's
+proof on a card that has an owner carries a proof of up to 72 bytes, 100 bytes
+of record, the mint and the design, and a short APDU holds 255 data bytes in
+all (1 + 72 + 100 + 77 + 3 = 253).
+
+`GET_CARD` answers the record as the table has it, the mint and then the three
+bytes of design; a phone that knows no design reads the mint by its length and
+ignores what follows. `SET_CARD` takes the record with the design after the
+mint, or without it, as a phone that knows none sends it: then the card has
+none.
 
 Kept apart from the record: the **owner key**, 65 bytes uncompressed, and a
 flag that one has been given (`GET_INFO` byte 16). See 5.6. Kept in RAM, gone

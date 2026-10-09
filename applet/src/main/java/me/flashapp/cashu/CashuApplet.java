@@ -118,7 +118,7 @@ public class CashuApplet extends Applet {
     // payment, which asks no clock and is waited for (docs/FOXY-CARD-DAILY-LIMIT.md, section 6a).
     // 1.4 is one signature for a whole payment (NUT-11 SIG_ALL): format 4, in
     // which every piece's secret carries the flag and SPEND_PROOF is gone.
-    static final byte VERSION_MINOR = (byte) 0x09;
+    static final byte VERSION_MINOR = (byte) 0x0A;
     static final byte FORMAT        = (byte) 0x04;
 
     // -------------------------------------------------------------------------
@@ -212,7 +212,7 @@ public class CashuApplet extends Applet {
     // 80, not 96: SET_CARD with the owner's proof carries a proof of up to 72
     // bytes and its length, 100 bytes of record and the mint, in one short
     // APDU of 255 data bytes.
-    static final short CARD_MINT_MAX       = (short) 80;
+    static final short CARD_MINT_MAX       = (short) 77;   // 80 before the design: a short APDU holds the proof, the record, the mint and it (1 + 72 + 100 + 77 + 3 = 253)
     // The time signer's public key, uncompressed (04 || X || Y). Written by
     // SET_CARD. The card's own copy of what it checks a time against.
     static final short CARD_TIMEKEY_OFFSET = (short) 120;
@@ -234,7 +234,10 @@ public class CashuApplet extends Applet {
     static final short CARD_TAP_LIMIT_OFFSET  = (short) 197;
     static final short CARD_TAP_WINDOW_OFFSET = (short) 201;
     static final short CARD_TAP_SPENT_OFFSET  = (short) 205;
-    static final short CARD_RECORD_LEN     = (short) 209;
+    /** The card's face: a code of three characters (capital letters and digits) naming its design, or zeros for none (1.10, docs/CARD-DESIGNS.md). */
+    static final short CARD_DESIGN_OFFSET  = (short) 209;
+    static final short CARD_DESIGN_LEN     = (short) 3;
+    static final short CARD_RECORD_LEN     = (short) 212;
     // SET_CARD's data: unit (1), refund key (33), time key (65), mint length (1), then the mint
     static final short SET_CARD_FIXED      = (short) 100;
     static final short SET_CARD_TIMEKEY_AT = (short) 34;
@@ -1753,7 +1756,9 @@ public class CashuApplet extends Applet {
         Util.arrayCopyNonAtomic(cardRecord, CARD_TIMEKEY_OFFSET, buf, (short) 40, EC_POINT_LEN);
         buf[105] = (byte) mintLen;
         Util.arrayCopyNonAtomic(cardRecord, CARD_MINT_OFFSET, buf, (short) 106, mintLen);
-        apdu.setOutgoingAndSend((short) 0, (short)(106 + mintLen));
+        // and, after the mint, the card's design: three characters, or zeros for none (1.10)
+        Util.arrayCopyNonAtomic(cardRecord, CARD_DESIGN_OFFSET, buf, (short)(106 + mintLen), CARD_DESIGN_LEN);
+        apdu.setOutgoingAndSend((short) 0, (short)(106 + mintLen + CARD_DESIGN_LEN));
     }
 
     // -------------------------------------------------------------------------
@@ -1959,8 +1964,19 @@ public class CashuApplet extends Applet {
         requireNothingUnspent();
         if (len < (short)(SET_CARD_FIXED + 1)) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         short mintLen = (short)(buf[(short)(at + SET_CARD_MINTLEN_AT)] & 0xFF);
-        if (mintLen < 1 || mintLen > CARD_MINT_MAX || len != (short)(SET_CARD_FIXED + mintLen)) {
+        /* After the mint, the design (3 bytes) or nothing: a phone that knows no
+         * design sends the record as it always did, and the card has none. */
+        boolean designGiven = len == (short)(SET_CARD_FIXED + mintLen + CARD_DESIGN_LEN);
+        if (mintLen < 1 || mintLen > CARD_MINT_MAX || (len != (short)(SET_CARD_FIXED + mintLen) && !designGiven)) {
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+        short designAt = (short)(at + SET_CARD_FIXED + mintLen);
+        if (designGiven && !isZero(buf, designAt, CARD_DESIGN_LEN)) {
+            // a code of three characters, capital letters and digits, or three zeros
+            for (short k = 0; k < CARD_DESIGN_LEN; k++) {
+                byte c = buf[(short)(designAt + k)];
+                if (!((c >= (byte) 'A' && c <= (byte) 'Z') || (c >= (byte) '0' && c <= (byte) '9'))) ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+            }
         }
         // a refund key is a compressed point, or 33 zeros for none
         byte r0 = buf[(short)(at + 1)];
@@ -1984,6 +2000,8 @@ public class CashuApplet extends Applet {
         cardRecord[CARD_MINTLEN_OFFSET] = (byte) mintLen;
         Util.arrayCopy(buf, (short)(at + SET_CARD_FIXED), cardRecord, CARD_MINT_OFFSET, mintLen);
         Util.arrayCopy(buf, keyAt, cardRecord, CARD_TIMEKEY_OFFSET, EC_POINT_LEN);
+        if (designGiven) Util.arrayCopy(buf, designAt, cardRecord, CARD_DESIGN_OFFSET, CARD_DESIGN_LEN);
+        else Util.arrayFillNonAtomic(cardRecord, CARD_DESIGN_OFFSET, CARD_DESIGN_LEN, (byte) 0);
         if (newKey) {
             // the clock is the old key's signer's to have set; the window is in its units
             Util.arrayFillNonAtomic(cardRecord, CARD_NOW_OFFSET, (short) 4, (byte) 0);
