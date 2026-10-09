@@ -1405,11 +1405,12 @@ public class CashuApplet extends Applet {
      * The PIN, as any spend. Every place named once, holding an unspent piece,
      * and all of one date (pieces with different dates have different lock
      * conditions, and a mint takes no one signature for those: `6A80`). The
-     * day's limit is held to what the pieces are worth together, before
-     * anything is hashed: over it, `6A8F`, written down in the log before it
-     * is refused. What the payment will wait for being over the limit on one
-     * payment is worked out from the same sum (`waitsFor`), and paid at SIGN.
-     * Answers what the pieces are worth (4, big-endian).
+     * day's limit and the wait on one payment are held to what leaves the
+     * card, the pieces less the change the card makes for itself (1.12),
+     * which is not known until SIGN: both are worked out there, at the first
+     * SIGN, before anything is burned. Only a sum that wraps is refused here,
+     * as over any day there is (`6A8F`). Answers what the pieces are worth
+     * (4, big-endian).
      */
     private void processSpendAllBegin(APDU apdu) {
         // D13: gate FIRST — a wrong or missing PIN throws before anything is looked at.
@@ -2017,17 +2018,19 @@ public class CashuApplet extends Applet {
     }
 
     /**
-     * The day's limit, held to what the pieces named at SPEND_ALL_BEGIN are
-     * worth together (`allSum`; `carry` where that sum wrapped). Leaves in
-     * scratch what the day (X_SUM) would have signed for with them.
+     * The day's limit, held to `sum`: what leaves the card for good, the
+     * pieces named at SPEND_ALL_BEGIN less the change the card makes for
+     * itself (`allNet`, at SIGN; `carry` where the pieces' sum wrapped, at
+     * BEGIN). Leaves in scratch what the day (X_SUM) would have signed for.
      *
      * A terminal that has the PIN picks the places, and nothing on the card
      * can tell its request from the holder's, so what bounds it is a number in
      * permanent memory, counted against a window that only time can end. The
-     * pieces are charged at their whole worth, not at the price of the
-     * payment: change that a terminal writes back is not something the card
-     * can check. A limit of 0 is no limit: nothing is checked, and nothing
-     * counted. Over it, the spend is written down and refused.
+     * card's own change is the one part of a payment it can check, and that
+     * part gives the day back; change a terminal writes back by other means
+     * it cannot, and that gives nothing back. A limit of 0 is no limit:
+     * nothing is checked, and nothing counted. Over it, the spend is written
+     * down and refused.
      */
     private void requireUnderLimits(byte[] sum, short sumOff, short carry) {
         boolean limited = !isZero(cardRecord, CARD_LIMIT_OFFSET, (short) 4);
@@ -2047,17 +2050,20 @@ public class CashuApplet extends Applet {
     }
 
     /**
-     * What the payment begun costs in time: the signatures of work to be done
-     * at SPEND_ALL_SIGN before it is signed (6a).
+     * What the payment costs in time: the signatures of work to be done at
+     * SPEND_ALL_SIGN before it is signed (6a).
      *
-     * With a limit on one payment of L and pieces worth S together, the first
-     * L is free and every L after it, whole or in part, is WAIT_SIGNS
-     * signatures: (ceil(S / L) - 1) * WAIT_SIGNS. Nothing is remembered from
-     * one payment to the next and no clock is asked, so there is nothing a
+     * With a limit on one payment of L and S leaving the card (`sum`: the
+     * pieces less the card's own change), a payment within L that makes no
+     * change costs nothing; otherwise every L of S, whole or in part, is
+     * WAIT_SIGNS signatures: ceil(S / L) * WAIT_SIGNS, and one L's worth for
+     * a payment within L that makes change. Nothing is remembered from one
+     * payment to the next and no clock is asked, so there is nothing a
      * terminal can replay or reset to make it less: a payment of ten limits
-     * waits for nine, today and at any other time. What a terminal can do is
+     * waits for ten, today and at any other time. What a terminal can do is
      * take the money a limit at a time, each a signature of its own, which is
-     * the rate this limit holds it to. No limit, or a payment within it: 0.
+     * the rate this limit holds it to. No limit: 0. A sum that wrapped
+     * (`carry`) waits the most.
      */
     private short waitsFor(byte[] sum, short sumOff, boolean change, boolean carry) {
         if (isZero(cardRecord, CARD_TAP_LIMIT_OFFSET, (short) 4)) return (short) 0;
