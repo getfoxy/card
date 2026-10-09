@@ -118,7 +118,7 @@ public class CashuApplet extends Applet {
     // payment, which asks no clock and is waited for (docs/FOXY-CARD-DAILY-LIMIT.md, section 6a).
     // 1.4 is one signature for a whole payment (NUT-11 SIG_ALL): format 4, in
     // which every piece's secret carries the flag and SPEND_PROOF is gone.
-    static final byte VERSION_MINOR = (byte) 0x0A;
+    static final byte VERSION_MINOR = (byte) 0x0B;
     static final byte FORMAT        = (byte) 0x04;
 
     // -------------------------------------------------------------------------

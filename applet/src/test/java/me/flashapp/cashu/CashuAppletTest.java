@@ -539,7 +539,7 @@ class CashuAppletTest {
         // what a phone sends: iOS chooses by the name in the app's Info.plist, and Foxy by the same ten bytes
         ResponseAPDU whole = transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_HEX), 256));
         assertEquals(SW_OK, whole.getSW());
-        assertArrayEquals(new byte[] { 0x01, 0x0A }, whole.getData(), "the same answer either way: version 1.10");
+        assertArrayEquals(new byte[] { 0x01, 0x0B }, whole.getData(), "the same answer either way: version 1.11");
         assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)), "and its instructions follow");
     }
 
@@ -548,17 +548,17 @@ class CashuAppletTest {
     void testSelect() {
         ResponseAPDU resp = transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR)));
         assertEquals(SW_OK, resp.getSW());
-        assertArrayEquals(new byte[] { 0x01, 0x0A }, resp.getData(), "version 1.10: the PIN is taken sealed");
+        assertArrayEquals(new byte[] { 0x01, 0x0B }, resp.getData(), "version 1.11: the PIN is taken sealed");
         assertNotEquals(SW_OK, sw(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(UPSTREAM_AID))),
             "an upstream reader must not find this applet under upstream's AID: the wire is not the same");
     }
 
     @Test
-    @DisplayName("GET_INFO on a new card: 30 bytes: version 1.10, 128 empty slots, no PIN, three tries, format 4, capabilities FF, no record, no limit, no owner, no time, no change due")
+    @DisplayName("GET_INFO on a new card: 30 bytes: version 1.11, 128 empty slots, no PIN, three tries, format 4, capabilities FF, no record, no limit, no owner, no time, no change due")
     void testInfoFresh() {
         byte[] d = info();
         assertEquals(30, d.length);
-        assertEquals(1, d[0]); assertEquals(10, d[1]);
+        assertEquals(1, d[0]); assertEquals(11, d[1]);
         assertEquals(MAX_PROOFS, d[2] & 0xFF);
         assertEquals(0, d[3]); assertEquals(0, d[4]);
         assertEquals(MAX_PROOFS, d[5] & 0xFF);
@@ -2449,7 +2449,7 @@ class CashuAppletTest {
                 // and the answer says what the marked places make it say
                 byte[] d = torn.getData();
                 if (name.equals("SELECT")) {
-                    assertArrayEquals(new byte[] { 0x01, 0x0A }, d, what);
+                    assertArrayEquals(new byte[] { 0x01, 0x0B }, d, what);
                 } else if (name.equals("GET_INFO")) {
                     assertEquals(others, d[3] & 0xFF, what + ": unspent");
                     assertEquals(n + others, d[4] & 0xFF, what + ": spent");
@@ -6063,7 +6063,7 @@ class CashuAppletTest {
         readyWithLimit(0);
         byte[] more = infoTap();
         assertEquals(1, more[0]);
-        assertEquals(10, more[1], "version 1.10");
+        assertEquals(11, more[1], "version 1.11");
         assertEquals((byte) 0xFF, more[6], "capabilities FF: the limit on one payment is waited for, not refused, the 1.6 forms are there, so are 128 places with the short listing, a payment burned outside its transaction, and the PIN taken sealed");
         assertEquals(SW_OK, setLimits(1000, 100));
         assertEquals(100, paymentLimit());

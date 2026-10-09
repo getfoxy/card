@@ -221,6 +221,10 @@ final class SchnorrHW {
         if (add32(N, (short)0, DELTA, (short)0, sc, (short)0) != (short)1) {
             ISOException.throwIt(CashuApplet.SW_CRYPTO_ERROR);
         }
+        // and DELTA's first bytes are zero, which the product by it (`mulByDelta`) leaves out
+        for (short i = 0; i < DELTA_FROM; i++) {
+            if (DELTA[i] != (byte)0) ISOException.throwIt(CashuApplet.SW_CRYPTO_ERROR);
+        }
         for (short i = 0; i < 32; i++) {
             if (sc[i] != (byte)0) {
                 ISOException.throwIt(CashuApplet.SW_CRYPTO_ERROR);
@@ -587,6 +591,38 @@ final class SchnorrHW {
     }
 
     /**
+     * out[64] = a[32] × DELTA: the schoolbook product of `mul256x256`, over
+     * DELTA's seventeen significant bytes only. Its first DELTA_FROM bytes
+     * are zero (2^256 − n is a 129-bit number), and multiplying by them was
+     * nearly half of every signature's time: three of the four products a
+     * signature makes are by DELTA. `init()` checks the zeros are there.
+     */
+    private static final short DELTA_FROM = (short) 15;
+    private static void mulByDelta(byte[] a, short aOff, byte[] out, short outOff) {
+        Util.arrayFillNonAtomic(out, outOff, (short)64, (byte)0);
+        for (short i = 31; i >= 0; i--) {
+            short ai = (short)(a[(short)(aOff+i)] & 0xFF);
+            if (ai == 0) continue;
+            short carry = 0;
+            for (short j = 31; j >= DELTA_FROM; j--) {
+                short bj  = (short)(DELTA[j] & 0xFF);
+                short pos = (short)(outOff + i + j + 1);
+                short cur = (short)(out[pos] & 0xFF);
+                short prod = (short)((short)(ai * bj) + cur + carry);
+                out[pos]  = (byte)(prod & 0xFF);
+                carry     = (short)((prod >> 8) & 0xFF);
+            }
+            // the carry out of the last column written, into the columns above it
+            short pos = (short)(outOff + i + DELTA_FROM);
+            while (carry != 0 && pos >= outOff) {
+                short s = (short)((short)(out[pos] & 0xFF) + carry);
+                out[pos--] = (byte)(s & 0xFF);
+                carry      = (short)((s >> 8) & 0xFF);
+            }
+        }
+    }
+
+    /**
      * Reduce a 512-bit value (64 bytes, big-endian) to 256-bit mod n.
      * Uses depth-2 DELTA reduction.  Result in out[32].
      *
@@ -603,10 +639,10 @@ final class SchnorrHW {
         // p = p_hi * 2^256 + p_lo
         // Step 1: t = p_hi * DELTA  (256×32-eff → 256 bits after mod-n reduction)
         // t fits in 48 bytes worst-case, but we compute mod-n in two steps.
-        mul256x256(p, pOff, DELTA, (short)0, work, tOff);
+        mulByDelta(p, pOff, work, tOff);
         // t = (p_hi * DELTA)_hi * 2^256 + (p_hi * DELTA)_lo
         // Apply identity again to t_hi part:
-        mul256x256(work, tOff, DELTA, (short)0, work, t2Off);
+        mulByDelta(work, tOff, work, t2Off);
         // t2_hi * DELTA < 2^128 * 2^128 = 2^256 < 2n → directly add, then subtract
         // Sum = t2_lo + t[32..63] + p[pOff+32..pOff+63]
         // But t2_hi is tiny (< 2^127), its contribution via DELTA:
@@ -663,7 +699,7 @@ final class SchnorrHW {
     private static void mulSmallByDelta(byte[] a, short aOff,
                                         byte[] out, short outOff,
                                         byte[] work, short workOff) {
-        mul256x256(a, aOff, DELTA, (short)0, work, workOff);
+        mulByDelta(a, aOff, work, workOff);
         for (short i = 0; i < 32; i++) {
             if (work[(short)(workOff + i)] != (byte)0) {
                 ISOException.throwIt(CashuApplet.SW_CRYPTO_ERROR);
