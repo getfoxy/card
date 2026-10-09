@@ -1569,26 +1569,30 @@ class CashuAppletTest {
     }
 
     @Test
-    @DisplayName("The short listing is gathered in the APDU buffer and sent when the buffer has no room for another entry of the most it can be (18 bytes), and once at the end for what is left: the flush is before each entry is written, the place in the buffer starts again at 0 after it, and the final send is there")
-    void testTheShortListingGathersAndFlushes() throws Exception {
+    @DisplayName("The short listing is gathered in the APDU buffer in one pass and sent once: an entry's cost is tested against the page before it is written, the place the next answer starts at is written first when the entries are known, no entry is sent by itself, nothing is measured in a pass of its own, and the chip's own compare says whether a place is named")
+    void testTheShortListingIsOnePassAndOneSend() throws Exception {
         String code = appletCode();
         String shortBody = body(code, "private void processGetShort(", "private boolean shortNamed(");
         assertEquals(128, CashuApplet.MAX_PROOFS);
         assertEquals(255, CashuApplet.PAGE_MAX);
         assertEquals(18, CashuApplet.SHORT_MOST, "place, keyset (8), date (4), 0xFF, amount (4)");
-        int room = shortBody.indexOf("short room = (short) buf.length;");
-        int flush = shortBody.indexOf("if ((short)(at + SHORT_MOST) > room) {");
-        int send = shortBody.indexOf("apdu.sendBytes((short) 0, at);", flush);
-        int reset = shortBody.indexOf("at = (short) 0;", send);
+        int start = shortBody.indexOf("short at = (short) 1;");
+        int cost = shortBody.indexOf("short cost = (short)(2 + (named ? 12 : 0) + (size < 0 ? 4 : 0));");
+        int fits = shortBody.indexOf("if ((short)(at + cost) > PAGE_MAX) break;");
         int firstWrite = shortBody.indexOf("buf[at++]");
-        int last = shortBody.lastIndexOf("if (at > 0) apdu.sendBytes((short) 0, at);");
-        assertTrue(room > 0 && room < flush && flush < send && send < reset && reset < firstWrite && firstWrite < last, "room, then before each entry the flush that sends and starts again at 0, then the entries, then the last send");
-        assertEquals(2, count(shortBody, "apdu.sendBytes("), "one in the loop and one at the end: an entry is not sent by itself");
-        assertTrue(shortBody.indexOf("apdu.setOutgoingLength(length)") < room, "the length of the answer is set before anything is sent");
-        // the length is worked out the way the entries are written: the same test for naming and for a size, and the page is held to PAGE_MAX
-        assertTrue(shortBody.contains("if ((short)(length + cost) > PAGE_MAX) break;"));
-        assertTrue(shortBody.contains("if (shortNamed(base, prev)) cost += (short) 12;") && shortBody.contains("if (sizeOf((short)(base + PROOF_AMOUNT_OFFSET)) < 0) cost += (short) 4;"));
-        assertTrue(shortBody.contains("(byte)(i | (short) 0x80)"), "0x80 on a place whose keyset and date follow");
+        int next = shortBody.indexOf("buf[0] = (byte) next;");
+        int outgoing = shortBody.indexOf("apdu.setOutgoing();");
+        int length = shortBody.indexOf("apdu.setOutgoingLength(at);");
+        int send = shortBody.indexOf("apdu.sendBytes((short) 0, at);");
+        assertTrue(start > 0 && start < cost && cost < fits && fits < firstWrite && firstWrite < next && next < outgoing && outgoing < length && length < send,
+            "the answer begins at 1; an entry's cost is known and tested against the page before it is written; the place the next answer starts at is written at 0 after the loop; the answer is sent once, after everything");
+        assertEquals(1, count(shortBody, "apdu.sendBytes("), "one send: no entry is sent by itself");
+        assertEquals(1, count(shortBody, "apdu.setOutgoingLength("), "one length, the answer's own, set once it is gathered");
+        assertFalse(shortBody.contains("room") || shortBody.contains("length + cost") || shortBody.contains("SHORT_MOST"), "no flush and no measuring pass");
+        assertTrue(shortBody.contains("(byte)(next | (short) 0x80)"), "0x80 on a place whose keyset and date follow");
+        String named = body(code, "private boolean shortNamed(", "private short sizeOf(");
+        assertEquals(2, count(named, "Util.arrayCompare("), "the keyset and the date compared by the chip");
+        assertFalse(named.contains("sameBytes("), "and not by a loop in bytecode");
     }
 
     @Test

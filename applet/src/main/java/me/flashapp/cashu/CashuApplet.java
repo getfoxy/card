@@ -1203,66 +1203,53 @@ public class CashuApplet extends Applet {
         byte[] buf = apdu.getBuffer();
         short from = (short)(buf[ISO7816.OFFSET_P1] & 0xFF);
         if (from >= MAX_PROOFS) ISOException.throwIt(SW_SLOT_OUT_OF_RANGE);
-
-        // what fits, as GET_PIECES: an entry is at most SHORT_MOST bytes, so one always does
-        short length = 1;
+        /* Gathered in the APDU buffer in one pass, and sent when it has no
+         * room for another entry (an entry is at most SHORT_MOST bytes, and
+         * a whole answer is at most PAGE_MAX, which the buffer holds): the
+         * place the next answer starts at goes first, once it is known. A
+         * send for each entry, and a pass to measure before the pass that
+         * gathered, were most of what a listing took. */
+        short at = (short) 1;
         short next = from;
         short prev = (short) -1;
         while (next < MAX_PROOFS) {
             short base = (short)(next * PROOF_SIZE);
             if (proofStorage[(short)(base + PROOF_STATUS_OFFSET)] == STATUS_UNSPENT) {
-                short cost = (short) 2;
-                if (shortNamed(base, prev)) cost += (short) 12;
-                if (sizeOf((short)(base + PROOF_AMOUNT_OFFSET)) < 0) cost += (short) 4;
-                if ((short)(length + cost) > PAGE_MAX) break;
-                length += cost;
+                boolean named = shortNamed(base, prev);
+                short size = sizeOf((short)(base + PROOF_AMOUNT_OFFSET));
+                short cost = (short)(2 + (named ? 12 : 0) + (size < 0 ? 4 : 0));
+                if ((short)(at + cost) > PAGE_MAX) break;
+                if (named) {
+                    buf[at++] = (byte)(next | (short) 0x80);
+                    Util.arrayCopyNonAtomic(proofStorage, (short)(base + PROOF_KEYSET_OFFSET), buf, at, (short) 8);
+                    Util.arrayCopyNonAtomic(proofStorage, (short)(base + PROOF_DATE_OFFSET), buf, (short)(at + 8), (short) 4);
+                    at += (short) 12;
+                } else {
+                    buf[at++] = (byte) next;
+                }
+                if (size < 0) {
+                    buf[at++] = (byte) 0xFF;
+                    Util.arrayCopyNonAtomic(proofStorage, (short)(base + PROOF_AMOUNT_OFFSET), buf, at, (short) 4);
+                    at += (short) 4;
+                } else {
+                    buf[at++] = (byte) size;
+                }
                 prev = base;
             }
             next++;
         }
-
-        apdu.setOutgoing();
-        apdu.setOutgoingLength(length);
-        /* Gathered in the APDU buffer, and sent when it has no room for another
-         * entry: a send for each entry was most of what a listing took, and a
-         * buffer that holds a whole answer, as these cards' do, makes it one. */
-        short room = (short) buf.length;
         buf[0] = (byte) next;
-        short at = (short) 1;
-        prev = (short) -1;
-        for (short i = from; i < next; i++) {
-            short base = (short)(i * PROOF_SIZE);
-            if (proofStorage[(short)(base + PROOF_STATUS_OFFSET)] != STATUS_UNSPENT) continue;
-            if ((short)(at + SHORT_MOST) > room) {
-                apdu.sendBytes((short) 0, at);
-                at = (short) 0;
-            }
-            if (shortNamed(base, prev)) {
-                buf[at++] = (byte)(i | (short) 0x80);
-                Util.arrayCopyNonAtomic(proofStorage, (short)(base + PROOF_KEYSET_OFFSET), buf, at, (short) 8);
-                Util.arrayCopyNonAtomic(proofStorage, (short)(base + PROOF_DATE_OFFSET), buf, (short)(at + 8), (short) 4);
-                at += (short) 12;
-            } else {
-                buf[at++] = (byte) i;
-            }
-            short size = sizeOf((short)(base + PROOF_AMOUNT_OFFSET));
-            if (size < 0) {
-                buf[at++] = (byte) 0xFF;
-                Util.arrayCopyNonAtomic(proofStorage, (short)(base + PROOF_AMOUNT_OFFSET), buf, at, (short) 4);
-                at += (short) 4;
-            } else {
-                buf[at++] = (byte) size;
-            }
-            prev = base;
-        }
-        if (at > 0) apdu.sendBytes((short) 0, at);
+        apdu.setOutgoing();
+        apdu.setOutgoingLength(at);
+        apdu.sendBytes((short) 0, at);
     }
 
     /** Whether the short listing says the keyset and date of the place at `base`: it does unless they are those of `prev`, the place listed before it in the same answer (-1: none). */
     private boolean shortNamed(short base, short prev) {
         if (prev < 0) return true;
-        return !sameBytes(proofStorage, (short)(base + PROOF_KEYSET_OFFSET), proofStorage, (short)(prev + PROOF_KEYSET_OFFSET), (short) 8)
-            || !sameBytes(proofStorage, (short)(base + PROOF_DATE_OFFSET), proofStorage, (short)(prev + PROOF_DATE_OFFSET), (short) 4);
+        // the chip's own compare: a keyset and a date are not secrets, and a loop in bytecode over them was most of an entry's cost
+        return Util.arrayCompare(proofStorage, (short)(base + PROOF_KEYSET_OFFSET), proofStorage, (short)(prev + PROOF_KEYSET_OFFSET), (short) 8) != (byte) 0
+            || Util.arrayCompare(proofStorage, (short)(base + PROOF_DATE_OFFSET), proofStorage, (short)(prev + PROOF_DATE_OFFSET), (short) 4) != (byte) 0;
     }
 
     /** The power of two the four bytes at `at` in the places are (0 to 31), or -1 where they are no power of two. */
@@ -1355,6 +1342,11 @@ public class CashuApplet extends Applet {
         Util.arrayFillNonAtomic(allSum, (short) 0, (short) 4, (byte) 0);
         short first = (short)((short)(allSlots[0] & 0xFF) * PROOF_SIZE);
         short carry = 0;
+        /* A place named twice is refused. Found by a bit a place: sixteen bytes
+         * of working room (X_OUT, which the hashing below writes over only
+         * after this loop) and one look per place, where looking back over
+         * every place named before it was most of a second for a hundred. */
+        Util.arrayFillNonAtomic(scratch, X_OUT, (short) 16, (byte) 0);
         for (short i = 0; i < n; i++) {
             short idx = (short)(allSlots[i] & 0xFF);
             if (idx >= MAX_PROOFS) ISOException.throwIt(SW_SLOT_OUT_OF_RANGE);
@@ -1362,9 +1354,10 @@ public class CashuApplet extends Applet {
             byte status = proofStorage[(short)(base + PROOF_STATUS_OFFSET)];
             if (status == STATUS_EMPTY)  ISOException.throwIt(SW_SLOT_EMPTY);
             if (status == STATUS_SPENT)  ISOException.throwIt(SW_ALREADY_SPENT);
-            for (short j = 0; j < i; j++) {
-                if (allSlots[j] == allSlots[i]) ISOException.throwIt(ISO7816.SW_WRONG_DATA);
-            }
+            short seen = (short)(X_OUT + (idx >> 3));
+            byte bit = (byte)(1 << (idx & 7));
+            if ((scratch[seen] & bit) != 0) ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+            scratch[seen] |= bit;
             if (!sameBytes(proofStorage, (short)(base + PROOF_DATE_OFFSET), proofStorage, (short)(first + PROOF_DATE_OFFSET), (short) 4)) {
                 ISOException.throwIt(ISO7816.SW_WRONG_DATA);
             }
