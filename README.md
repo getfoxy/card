@@ -117,7 +117,8 @@ Full reference: [`spec/APDU.md`](spec/APDU.md).
 | `B0` | `12` | GET_PROOF_COUNT | — | Count of non-empty slots |
 | `B0` | `13` | GET_PROOF | — | Full proof at a slot index |
 | `B0` | `14` | GET_SLOT_STATUS | — | One status byte per slot |
-| `B0` | `20` | SPEND_PROOF | ✔ (if set) | Mark spent + return 64-byte signature |
+| `B0` | `22`–`24` | SPEND_ALL_BEGIN / OUTPUTS / SIGN | ✔ (if set) | One signature for a whole payment (NUT-11 `SIG_ALL`): the places, the swap's outputs, then every place marked spent and one 64-byte signature |
+| `B0` | `25` | SPEND_ALL_AGAIN | ✔ (if set) | The last signature given, again |
 | `B0` | `21` | SIGN_ARBITRARY | ✔ (if set) | Sign 32 bytes, consuming no proof |
 | `B0` | `30` | LOAD_PROOF | ✔ | Store a proof in the next free slot |
 | `B0` | `31` | CLEAR_SPENT | ✔ | Reclaim spent slots |

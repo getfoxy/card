@@ -285,7 +285,9 @@ has most of them as commands and answers):
 | `15` | AUTH | | 16 random bytes | 16 of the card's own and a signature |
 | `16` | GET_CARD | | | format, record set, unit, limit (4), refund key (33), time key (65), mint length, mint |
 | `17` | GET_PIECES | | P1 = the first slot to report | one page: the first slot the page does not cover (1), then for each slot in the range that is not empty a tag (1) and, for an unspent slot, its 81 bytes (FOXY-CARD-DAILY-LIMIT.md 8.1). `6A83` for a P1 of 64 or more |
-| `20` | SPEND_PROOF | PIN, if one is set; a time, if a limit is set | P1 = the slot | the 64-byte signature; `6A8F` over the day; `6A92` with no time. Not opened by `ALLOW_LOAD` |
+| `20` | ~~SPEND_PROOF~~ | | | gone with format 4: `6D00`. Up to format 3 it signed for one slot, over that piece's secret alone |
+| `22` `23` `24` | SPEND_ALL_BEGIN, SPEND_ALL_OUTPUTS, SPEND_ALL_SIGN | PIN, if one is set; a time, if a limit is set | the places of a payment; then the swap's outputs, 37 bytes each; then nothing | **one** 64-byte signature over every piece and every output (NUT-11 `SIG_ALL`), with every place burned in the same transaction. The limits are held to the sum. Not opened by `ALLOW_LOAD` (FOXY-CARD-DAILY-LIMIT.md 6c) |
+| `25` | SPEND_ALL_AGAIN | PIN, if one is set | | the last signature given, again, for a terminal that never heard it |
 | `30` | LOAD_PROOF | an owner; a PIN set, and verified or `ALLOW_LOAD` given in this tap; a card record; a time | 81 bytes | `6982` with no verified PIN and no grant (the gate comes first); then `6A90` with no owner; `6A92` with no time; `6A94` for a piece whose nonce is already in a slot, spent or not (checked last, before anything is written) |
 | `31` | CLEAR_SPENT | the PIN, if one is set, or `ALLOW_LOAD` given in this tap | | |
 | `32` | SET_CARD | no owner: PIN set and verified, nothing unspent. Owner: the owner's proof, nothing unspent | unit (1), refund key (33), time key (65), mint length (1), mint; with an owner, proof length (1) and the proof first | `6A8D` if anything is unspent; `6A80` for a time key not beginning `04`, or a bad refund key; `6700` for a bad length |
@@ -313,7 +315,7 @@ the command's own row says; "refused" means `6A91` unless another word is given.
 | `SET_TIME` | open: the time key's signature (any state, locked or blocked) | same |
 | `GET_NONCE` | `6A90` | open (it only gives a number) |
 | `VERIFY_PIN` | as ever | as ever |
-| `SPEND_PROOF` | the PIN, if one is set (such a card holds nothing) | the PIN, up to the day's limit |
+| `SPEND_ALL_BEGIN`, `SPEND_ALL_SIGN`, `SPEND_ALL_AGAIN` | the PIN, if one is set (such a card holds nothing) | the PIN, up to the limits |
 | `LOAD_PROOF` | refused `6A90` | PIN verified, or the `ALLOW_LOAD` grant in this tap; needs a time |
 | `CLEAR_SPENT` | the PIN, if one is set | the PIN, or the grant |
 | `SET_PIN` (`41`) | open while nothing is unspent (sets or replaces, unblocks) | refused, empty or not: the owner uses `CHANGE_PIN` |

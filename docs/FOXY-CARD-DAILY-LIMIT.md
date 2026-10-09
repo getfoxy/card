@@ -432,6 +432,100 @@ the owner's grant (`ALLOW_LOAD`), so the owner's phone reads it with no PIN. It
 says when a card was used and for how much, which a stranger's reader is not
 told (`6982`). A card with no PIN yet has an empty log, and answers anyone.
 
+## 6c. One signature for a payment
+
+Up to format 3 the card signed for each piece it paid with, most of a second
+apiece on the chip, and each signature was over that piece's secret and nothing
+else (NUT-11's `SIG_INPUTS`). A payment of six pieces was six signatures and
+about five seconds of holding the card still; and a signature for a piece was
+good for any swap at all, so whoever held the signed pieces decided where the
+money went.
+
+Format 4 signs **once**, over the whole swap (NUT-11's `SIG_ALL`):
+
+    secret_0 C_0 ... secret_n C_n  amount_0 B_0 ... amount_m B_m
+
+as text with nothing between the parts: each piece's secret as the card builds
+it, its `C` in lowercase hex, and for each output of the swap its amount in
+decimal and its blinded message `B_` in lowercase hex. The card signs SHA-256
+of that (BIP-340), and the signature is the witness of the first piece; the
+others carry none. That is the message as NUT-11 now reads and as CDK and
+Nutshell both check it: the same swaps were put to both, and they agree on
+every one (one signature for the whole is taken; a signature for each piece, a
+signature over other outputs, a piece that was not signed for, and pieces
+whose tags differ are all refused).
+
+**The secret.** A slot is the same 81 bytes. The text the card builds for it
+ends with the flag as its last tag, which is where a wallet's library puts it:
+
+    ["P2PK",{"nonce":"<64 hex>","data":"<card key>","tags":[["sigflag","SIG_ALL"]]}]
+    ["P2PK",{"nonce":"<64 hex>","data":"<card key>","tags":[["locktime","<date>"],["refund","<refund key>"],["sigflag","SIG_ALL"]]}]
+
+So a card of format 4 can sign for no piece locked without the flag, and a
+piece locked with it is not one a format 3 card can sign for. A card is one or
+the other for all it holds; the format byte says which.
+
+**The commands.** A payment is three, in this order and with nothing between
+them:
+
+1. `SPEND_ALL_BEGIN` (`22`): the places it is made of, a byte each, in the order
+   the mint will be shown them. The PIN first, as for any spending. One to
+   thirty-two places (`6700` for none, `6A96` for more); each below 64
+   (`6A83`), unspent (`6A88` for an empty place, `6985` for a spent one), named
+   once (`6A80`), and of the same date as the first (`6A80`): a mint takes one
+   signature only for pieces whose secrets agree in everything but the nonce.
+   The limits of sections 6 and 6a are held to what the places are worth
+   **together** (`6A92` with a limit and no time, `6A8F` over the day, `6A95`
+   over the tap, each refusal written to the log of 6b). The card hashes each
+   place's secret and `C` itself, from the slot: the terminal names places and
+   never supplies a secret. Answers what they are worth, 4 bytes.
+2. `SPEND_ALL_OUTPUTS` (`23`): the swap's outputs, 37 bytes each (amount 4, `B_`
+   33), as many to a command as fit and as many commands as it takes. Each is
+   hashed as its amount in decimal and its `B_` in hex. `6985` with no payment
+   begun; `6700` for a length that is not a multiple of 37, which also drops
+   the payment.
+3. `SPEND_ALL_SIGN` (`24`): `6985` with no payment begun. The PIN and the
+   limits again; then the signature is made, and in **one transaction** every
+   place is marked spent, the day's and the tap's counts are charged, the note
+   that the card has paid is set (8.2), the log gains the payment, and the
+   signature is kept. `6A96` if the transaction cannot hold it, with nothing
+   changed. Only then is the signature answered, 64 bytes.
+
+Anything else sent between `BEGIN` and `SIGN` drops the payment, and `SIGN`
+then answers `6985`: another command, another `BEGIN`, a `SELECT`, the card
+leaving the field. Nothing can be read or changed under a payment that is
+being hashed.
+
+`SPEND_ALL_AGAIN` (`25`), under the PIN, answers the last signature the card
+gave (`6A88` if it has given none). A card that is taken away as it answers
+`SIGN` has burned the pieces, and the terminal never heard the signature: asked
+again at its next tap, it gives it. The signature is over a swap only the
+terminal that set it out can make, so giving it twice gives nobody anything
+they did not have. It is kept until the next `SIGN` replaces it.
+
+`SPEND_PROOF` (`20`) is gone: `6D00`. There is no command by which this card
+signs for a piece alone.
+
+**What it buys.** One signature whatever the number of pieces, so a payment
+made of many small pieces costs the card no more than one made of one large
+one, and a terminal can ask for pieces that come to exactly the price instead
+of over-paying and writing change back at a second tap. And the signature
+names where the money goes: signed pieces taken from a terminal, or seen on
+the air, are worth nothing to anyone who cannot make those very outputs.
+
+**What it does not.** The terminal chooses the outputs, and the card cannot
+tell whose they are. A terminal built to cheat still takes what it asks the
+card to sign for, up to the limits, exactly as before; the limits and the log
+are what bound and show that, and they are held to the sum. And a signature
+that binds its outputs is good only while the mint will still make that swap:
+if the mint retires the keyset the outputs are on, or raises its fee, between
+the signature and the swap, the pieces cannot be swapped by the card's
+signature at all (a card with a refund key: its owner's phone takes them back
+after their date, as section 6 of `FOXY-CARD-SPEC.md` has it).
+
+Not yet measured on the chip: how long `BEGIN` takes for thirty-two places
+(it is a few kilobytes of SHA-256) beside the one signature.
+
 ## 7. The owner
 
 ### 7.1 The key
@@ -539,7 +633,11 @@ or changed from `FOXY-CARD-SPEC.md` 5.2 and the allowance draft.
 | `16` | **GET_CARD** | | | format, record set, unit, limit (4), refund key (33), time key (65), mint length, mint |
 | `17` | **GET_PIECES** | | P1 = the first slot to report | one page: the first slot the page does not cover (1), then for each slot in the range that is not empty a tag (1) and, for an unspent slot, its 81 bytes (8.1). `6A83` for a P1 of 64 or more |
 | `18` | **GET_LOG** | the PIN verified in this tap, or the owner's grant; nothing on a card with no PIN yet | | the card's own log (6b): 16 bytes of counts, then up to eight taps of 12 bytes, newest first. `6982` to anyone else |
-| `20` | **SPEND_PROOF** | PIN, if one is set; a time, if a limit is set | P1 = the slot | the 64-byte signature; `6A8F` over the day; `6A92` with no time. **Not** opened by `ALLOW_LOAD`, nor by the tap after a payment. Notes, in permanent memory, that the card has paid: the next tap may load with no PIN (8.2) `6A95` over the limit on one tap (6a). |
+| `20` | ~~SPEND_PROOF~~ | | | gone with format 4 (6c): `6D00`. Up to format 3: P1 = the slot, the 64-byte signature over that piece's secret alone |
+| `22` | **SPEND_ALL_BEGIN** | PIN, if one is set; a time, if a limit is set | the places, a byte each, 1 to 32 | what they are worth (4). `6700` none; `6A96` more than 32; `6A83`, `6A88`, `6985` for a place out of range, empty, spent; `6A80` named twice, or of another date than the first; `6A92`, `6A8F`, `6A95` as the limits have it, on the sum (6c) |
+| `23` | **SPEND_ALL_OUTPUTS** | a payment begun, and nothing sent since but these | 37 bytes for each output: amount (4), blinded message (33) | `6985` with no payment begun; `6700` for a length not a multiple of 37, and the payment is dropped |
+| `24` | **SPEND_ALL_SIGN** | a payment begun; PIN; the limits again | | the one 64-byte signature over every piece and every output; every place burned, the counts charged and the log written in the same transaction. `6985` with no payment begun; `6A96` if the transaction cannot hold it. **Not** opened by `ALLOW_LOAD`, nor by the tap after a payment. Notes, in permanent memory, that the card has paid: the next tap may load with no PIN (8.2) |
+| `25` | **SPEND_ALL_AGAIN** | PIN, if one is set | | the last signature `24` gave, again; `6A88` if none |
 | `30` | **LOAD_PROOF** | an owner; a PIN set, and verified or `ALLOW_LOAD` given in this tap or this tap being the one after a payment (8.2); a card record; a time | 81 bytes | `6982` with no verified PIN and no grant (the gate comes first); then `6A90` with no owner; `6A92` with no time; `6A94` for a piece whose nonce is already in a slot, spent or not (checked last, after the length and the piece itself, and before anything is written) |
 | `31` | **CLEAR_SPENT** | the PIN, if one is set, or `ALLOW_LOAD` given in this tap, or the tap after a payment | | |
 | `32` | **SET_CARD** | no owner: PIN set and verified, nothing unspent. Owner: the owner's proof, nothing unspent | unit (1), refund key (33), time key (65), mint length (1), mint; with an owner, proof length (1) and the proof first | `6A8D` if anything is unspent; `6A80` for a time key not beginning `04`, or a bad refund key; `6700` for a bad length |
@@ -554,9 +652,11 @@ or changed from `FOXY-CARD-SPEC.md` 5.2 and the allowance draft.
 | `45` | **ALLOW_LOAD** | the owner's proof, over `FoxyCard/load` and no value | proof length (1), proof | for the rest of this tap: `LOAD_PROOF` and `CLEAR_SPENT` need no verified PIN. `6A90`, `6A91`; `6986` locked |
 | `50` | LOCK_CARD | PIN set and verified; the owner's proof | P2 = `DE`; proof length (1), proof | as the draft |
 
-`21` (`SIGN_ARBITRARY`) stays unassigned. The applet's version becomes 1.1 and
-`FORMAT` 3; a phone that knows only format 2 refuses the card, as it does now
-for anything but its own.
+`21` (`SIGN_ARBITRARY`) stays unassigned. The applet's version became 1.1 and
+`FORMAT` 3 with this design; a phone that knows only format 2 refuses the card,
+as it does for anything but its own. With one signature for a payment (6c) the
+version is 1.4 and `FORMAT` 4: a phone that knows only format 3 refuses such a
+card, and a phone that knows both pays with either.
 
 **Every command in every state: the rule of section 3 worked through.** "Open"
 means nothing is needed beyond what the command's own row says; "refused" means
@@ -568,7 +668,8 @@ means nothing is needed beyond what the command's own row says; "refused" means
 | `SET_TIME` | open: the time key's signature (any state, locked or blocked) | same |
 | `GET_NONCE` | `6A90` | open (it only gives a number) |
 | `VERIFY_PIN` | as ever | as ever |
-| `SPEND_PROOF` | the PIN, if one is set (such a card holds nothing) | the PIN, up to the day's limit |
+| `SPEND_ALL_BEGIN`, `SPEND_ALL_SIGN`, `SPEND_ALL_AGAIN` | the PIN, if one is set (such a card holds nothing) | the PIN, up to the limits |
+| `SPEND_ALL_OUTPUTS` | open to a payment begun; `6985` otherwise | same |
 | `LOAD_PROOF` | **refused `6A90`** | PIN verified, or the `ALLOW_LOAD` grant in this tap, or this tap being the one after a payment (8.2); needs a time |
 | `CLEAR_SPENT` | the PIN, if one is set | the PIN, or either grant |
 | `SET_PIN` (`41`) | **open while nothing is unspent** (sets or replaces, unblocks) | **refused**, empty or not: the owner uses `CHANGE_PIN` |
