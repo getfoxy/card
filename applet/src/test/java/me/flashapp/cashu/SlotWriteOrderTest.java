@@ -341,6 +341,30 @@ class SlotWriteOrderTest {
     }
 
     @Test
+    @DisplayName("the same at a place above 63: a LOAD_PROOF torn before its commit at place 100 leaves it empty, which no read sees, and the next load takes it whole")
+    void aTornLoadAbove63LeavesTheSlotEmpty() throws Exception {
+        freshCard();
+        for (int i = 0; i < 100; i++) {
+            assertEquals(CashuAppletTest.SW_OK, load(CashuAppletTest.buildProof(CashuAppletTest.KEYSET, 1 + i, i + 10)).getSW());
+        }
+        long before = balance();
+        System.arraycopy(CashuAppletTest.PROOF_1, 0, storage, 100 * 82 + 1, 81);
+        assertEquals(0, statuses()[100] & 0xFF);
+        assertEquals(before, balance(), "the torn bytes are not counted");
+        assertEquals(CashuAppletTest.SW_SLOT_EMPTY, proofAt(100).getSW());
+        assertEquals(CashuAppletTest.SW_SLOT_EMPTY, spend(100).getSW());
+        assertEquals(100, proofCount());
+        ResponseAPDU loaded = load(CashuAppletTest.PROOF_2);
+        assertEquals(CashuAppletTest.SW_OK, loaded.getSW());
+        assertEquals(100, loaded.getData()[0] & 0xFF, "the torn place is the first empty one, and is reused");
+        assertArrayEquals(CashuAppletTest.PROOF_2, Arrays.copyOfRange(proofAt(100).getData(), 1, 82), "nothing of the torn load survives");
+        assertEquals(before + 500, balance());
+        ResponseAPDU paid = spend(100);
+        assertEquals(CashuAppletTest.SW_OK, paid.getSW());
+        assertEquals(64, paid.getData().length);
+    }
+
+    @Test
     @DisplayName("a LOAD_PROOF torn after the text kept beside the place was written leaves an empty place with another piece's text beside it, and so does junk there: the next load writes its own over it, and a payment hashes the piece that is there")
     void aTornLoadLeavesItsTextBehindAndTheNextLoadWritesOverIt() throws Exception {
         for (int junk = 0; junk < 3; junk++) {

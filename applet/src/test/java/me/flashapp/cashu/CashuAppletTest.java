@@ -102,7 +102,7 @@ class CashuAppletTest {
     static final int SW_INS_NOT_SUPPORTED   = 0x6D00;
     static final int SW_CLA_NOT_SUPPORTED   = 0x6E00;
 
-    static final int MAX_PROOFS = 64;
+    static final int MAX_PROOFS = 128;
     static final int SLOT = 82;
     static final int MINT_MAX = 80;
 
@@ -178,6 +178,14 @@ class CashuAppletTest {
     static final class ExposedRuntime extends SimulatorRuntime {
         Applet appletAt(AID aid) {
             return getApplet(aid);
+        }
+        /**
+         * A transaction already in progress when the applet begins its own. jCardSim's transactions have no buffer to fill and
+         * no rollback, but beginTransaction while one is in progress throws the TransactionException a card whose commit buffer is
+         * full throws, and that is the path the applet's burn has to answer 6A96.
+         */
+        void leaveATransactionOpen() {
+            transactionDepth = 1;
         }
     }
 
@@ -514,7 +522,7 @@ class CashuAppletTest {
         // what a phone sends: iOS chooses by the name in the app's Info.plist, and Foxy by the same ten bytes
         ResponseAPDU whole = transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_HEX), 256));
         assertEquals(SW_OK, whole.getSW());
-        assertArrayEquals(new byte[] { 0x01, 0x06 }, whole.getData(), "the same answer either way: version 1.6");
+        assertArrayEquals(new byte[] { 0x01, 0x07 }, whole.getData(), "the same answer either way: version 1.7");
         assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)), "and its instructions follow");
     }
 
@@ -523,21 +531,21 @@ class CashuAppletTest {
     void testSelect() {
         ResponseAPDU resp = transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR)));
         assertEquals(SW_OK, resp.getSW());
-        assertArrayEquals(new byte[] { 0x01, 0x06 }, resp.getData(), "version 1.6: the same card, made quicker to hold");
+        assertArrayEquals(new byte[] { 0x01, 0x07 }, resp.getData(), "version 1.7: the same card with twice the places");
         assertNotEquals(SW_OK, sw(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(UPSTREAM_AID))),
             "an upstream reader must not find this applet under upstream's AID: the wire is not the same");
     }
 
     @Test
-    @DisplayName("GET_INFO on a new card: 30 bytes: version 1.6, 64 empty slots, no PIN, three tries, format 4, capabilities 1F, no record, no limit, no owner, no time, no change due")
+    @DisplayName("GET_INFO on a new card: 30 bytes: version 1.7, 128 empty slots, no PIN, three tries, format 4, capabilities 3F, no record, no limit, no owner, no time, no change due")
     void testInfoFresh() {
         byte[] d = info();
         assertEquals(30, d.length);
-        assertEquals(1, d[0]); assertEquals(6, d[1]);
+        assertEquals(1, d[0]); assertEquals(7, d[1]);
         assertEquals(MAX_PROOFS, d[2] & 0xFF);
         assertEquals(0, d[3]); assertEquals(0, d[4]);
         assertEquals(MAX_PROOFS, d[5] & 0xFF);
-        assertEquals(0x1F, d[6], "secp256k1, Schnorr, PIN, the limit on one payment waited for and not refused, and the 1.6 forms: several pieces to a LOAD_PROOF and GET_PIECES' two short listings (it was 0F, and 07 before)");
+        assertEquals(0x3F, d[6], "secp256k1, Schnorr, PIN, the limit on one payment waited for and not refused, the 1.6 forms (several pieces to a LOAD_PROOF, GET_PIECES by name), and more than sixty-four places with the short listing (it was 1F, 0F and 07 before)");
         assertEquals(0, d[7], "no PIN");
         assertEquals(4, d[8], "format");
         assertEquals(3, d[9], "tries");
@@ -689,14 +697,15 @@ class CashuAppletTest {
     }
 
     @Test
-    @DisplayName("Sixty-four pieces fit, and the sixty-fifth is refused")
+    @DisplayName("A hundred and twenty-eight pieces fit, and the hundred and twenty-ninth is refused with no space (6A84); GET_SLOT_STATUS says 128 places, GET_BALANCE sums them all, and place 128 is not a place (6A83)")
     void testFull() {
         ready();
         for (int i = 0; i < MAX_PROOFS; i++) assertEquals(SW_OK, load(buildProof(KEYSET, 1, i)).getSW(), "slot " + i);
-        assertEquals(SW_NO_SPACE, load(buildProof(KEYSET, 1, 99)).getSW());
+        assertEquals(SW_NO_SPACE, load(buildProof(KEYSET, 1, 999)).getSW());
         assertEquals(MAX_PROOFS, balance());
         assertEquals(MAX_PROOFS, transmit(new CommandAPDU(CLA, INS_GET_SLOT_STATUS, 0, 0, 256)).getData().length);
         assertEquals(SW_SLOT_OUT_OF_RANGE, sw(new CommandAPDU(CLA, INS_GET_PROOF, MAX_PROOFS, 0, 256)));
+        assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_GET_PROOF, MAX_PROOFS - 1, 0, 256)), "127 is the last place");
     }
 
     // =========================================================================
@@ -705,22 +714,24 @@ class CashuAppletTest {
 
     private ResponseAPDU pieces(int from) { return transmit(new CommandAPDU(CLA, INS_GET_PIECES, from, 0, 256)); }
 
-    /** One page as the phone reads it: the next slot to ask for, then the entries as { slot, state, the piece or null }. */
+    /**
+     * One page of the whole listing as the phone reads it: the next slot to ask for, then the entries as
+     * { slot, state, the piece or null, the tag byte }. A tag is the place's number (0 to 127) with 0x80 set where the place
+     * is spent; an unspent place is followed by its 81 bytes.
+     */
     private static final class Page {
         final int next, length;
         final java.util.List<Object[]> entries = new java.util.ArrayList<>();
-        Page(byte[] d) { this(d, 81); }
-        /** `unspentLen` is what an unspent place carries after its tag: 81 whole, 16 in the brief listing. */
-        Page(byte[] d, int unspentLen) {
+        Page(byte[] d) {
             length = d.length;
             next = d[0] & 0xFF;
             int at = 1;
             while (at < d.length) {
                 int tag = d[at++] & 0xFF;
-                int state = tag >> 6, slot = tag & 0x3F;
+                int state = (tag & 0x80) != 0 ? 2 : 1, slot = tag & 0x7F;
                 byte[] piece = null;
-                if (state == 1) { piece = Arrays.copyOfRange(d, at, at + unspentLen); at += unspentLen; }
-                entries.add(new Object[] { slot, state, piece });
+                if (state == 1) { piece = Arrays.copyOfRange(d, at, at + 81); at += 81; }
+                entries.add(new Object[] { slot, state, piece, tag });
             }
             assertEquals(d.length, at, "the answer is made of whole entries");
         }
@@ -732,8 +743,9 @@ class CashuAppletTest {
         ready();
         ResponseAPDU r = pieces(0);
         assertEquals(SW_OK, r.getSW());
-        assertArrayEquals(new byte[] { 64 }, r.getData());
+        assertArrayEquals(new byte[] { (byte) 0x80 }, r.getData(), "next is 128: the end");
         assertEquals(SW_SLOT_OUT_OF_RANGE, pieces(MAX_PROOFS).getSW());
+        assertEquals(SW_SLOT_OUT_OF_RANGE, pieces(MAX_PROOFS + 1).getSW());
         assertEquals(SW_SLOT_OUT_OF_RANGE, pieces(255).getSW());
     }
 
@@ -747,7 +759,7 @@ class CashuAppletTest {
         assertEquals(SW_OK, r.getSW());
         Page page = new Page(r.getData());
         assertEquals(1 + 3 * 82, page.length);
-        assertEquals(64, page.next);
+        assertEquals(128, page.next);
         assertEquals(3, page.entries.size());
         for (int i = 0; i < 3; i++) {
             assertEquals(i, page.entries.get(i)[0]);
@@ -766,7 +778,7 @@ class CashuAppletTest {
         assertEquals(SW_OK, spend(2).getSW());
         assertEquals(SW_OK, spend(4).getSW());
         Page all = new Page(pieces(0).getData());
-        assertEquals(64, all.next);
+        assertEquals(128, all.next);
         assertEquals(6, all.entries.size());
         int[] states = { 1, 2, 2, 1, 2, 1 };
         for (int i = 0; i < 6; i++) {
@@ -781,7 +793,7 @@ class CashuAppletTest {
         assertEquals(3, mid.entries.get(0)[0]);
         Page empty = new Page(pieces(20).getData());
         assertEquals(0, empty.entries.size());
-        assertEquals(64, empty.next);
+        assertEquals(128, empty.next);
         // a freed place is not listed
         assertEquals(SW_OK, clearSpent());
         Page freed = new Page(pieces(0).getData());
@@ -814,7 +826,7 @@ class CashuAppletTest {
             pages++;
         }
         assertEquals(MAX_PROOFS, seen);
-        assertEquals(22, pages, "sixty-four pieces are twenty-two answers, not sixty-four");
+        assertEquals(43, pages, "a hundred and twenty-eight pieces are forty-three answers, not a hundred and twenty-eight");
     }
 
     @Test
@@ -828,7 +840,7 @@ class CashuAppletTest {
         assertEquals(11, one.next);
         assertEquals(11, one.entries.size());
         Page two = new Page(pieces(one.next).getData());
-        assertEquals(64, two.next);
+        assertEquals(128, two.next);
         assertEquals(1, two.entries.size());
         assertEquals(11, two.entries.get(0)[0]);
         // one spent tag more would be 256: with slot 11 spent too, its tag is left for the next page
@@ -1068,38 +1080,40 @@ class CashuAppletTest {
         assertTrue(signedForAll(both.getData(), new byte[][] { asSlot(pieces[place]), asSlot(pieces[place + 1]) }, Arrays.copyOfRange(outputs, 14, 24), REFUND), "ten outputs after two pieces");
     }
 
-    // ---- the short listings (GET_PIECES, P2 = 1 and 2) -----------------------------------
+    // ---- the listings and the places named (GET_PIECES, P2 = 0, 3 and 2) -----------------------------------
 
-    private ResponseAPDU briefPieces(int from) { return transmit(new CommandAPDU(CLA, INS_GET_PIECES, from, 1, 256)); }
+    /** A second keyset, and a third that differs from the first in its last byte only. */
+    static final String KEYSET_B = "00ab12cd34ef5678";
+    static final String KEYSET_A2 = "0059534ce0bfa19b";
+
+    private ResponseAPDU shortPieces(int from) { return transmit(new CommandAPDU(CLA, INS_GET_PIECES, from, 3, 256)); }
     private ResponseAPDU somePieces(byte[] places) { return transmit(new CommandAPDU(CLA, INS_GET_PIECES, 0, 2, places, 256)); }
 
     /** Every place as the card holds it: null where it is empty, and its slot as GET_PROOF gives it where it is not. */
     private byte[][] allSlots() {
         byte[] status = transmit(new CommandAPDU(CLA, INS_GET_SLOT_STATUS, 0, 0, 256)).getData();
+        assertEquals(MAX_PROOFS, status.length);
         byte[][] s = new byte[MAX_PROOFS][];
         for (int i = 0; i < MAX_PROOFS; i++) s[i] = status[i] == 0 ? null : slot(i);
         return s;
     }
 
     /**
-     * The listing a card is to give from P1 = `from`, worked out from the slots by the rule alone and not by asking the
-     * card: next (1), then for each place that is not empty its tag, (state << 6) | place, and for an unspent one its 81 bytes
-     * (whole form) or its keyset, amount and date, 16 (brief form). A page is at most 255 bytes, and holds places while the
-     * next entry still fits; an empty place costs nothing.
+     * The whole listing a card is to give from P1 = `from`, worked out from the slots by the rule alone and not by asking the
+     * card: next (1), then for each place that is not empty its tag, the place's number with 0x80 set where it is spent, and
+     * for an unspent one its 81 bytes. A page is at most 255 bytes, and holds places while the next entry still fits; an
+     * empty place costs nothing.
      */
-    private static byte[] listingFrom(byte[][] slots, int from, boolean brief) {
+    private static byte[] listingFrom(byte[][] slots, int from) {
         java.io.ByteArrayOutputStream body = new java.io.ByteArrayOutputStream();
         int length = 1, next = from;
         while (next < MAX_PROOFS) {
             int state = slots[next] == null ? 0 : slots[next][0];
-            int cost = state == 1 ? (brief ? 17 : 82) : state == 2 ? 1 : 0;
+            int cost = state == 1 ? 82 : state == 2 ? 1 : 0;
             if (length + cost > 255) break;
             if (state != 0) {
-                body.write((state << 6) | next);
-                if (state == 1) {
-                    byte[] s = slots[next];
-                    if (brief) { body.write(s, 1, 12); body.write(s, 78, 4); } else body.write(s, 1, 81);
-                }
+                body.write(state == 2 ? (0x80 | next) : next);
+                if (state == 1) body.write(slots[next], 1, 81);
             }
             length += cost;
             next++;
@@ -1107,10 +1121,129 @@ class CashuAppletTest {
         return concat(new byte[] { (byte) next }, body.toByteArray());
     }
 
+    /** A piece's keyset and date as the short listing names them: 8 and 4 bytes. */
+    private static byte[] keysetAndDate(String keysetHex, long date) { return concat(hexToBytes(keysetHex), u32(date)); }
+
+    /**
+     * One entry of the short listing, written out by hand from the rule: the place (with 0x80 where its keyset and date follow),
+     * those twelve bytes where `named` is given, and the size, or 0xFF and the amount where the amount is no power of two.
+     */
+    private static byte[] shortEntry(int place, byte[] named, long amount) {
+        boolean power = amount != 0 && (amount & (amount - 1)) == 0;
+        return concat(new byte[] { (byte) (place | (named != null ? 0x80 : 0)) }, named != null ? named : new byte[0],
+            power ? new byte[] { (byte) Long.numberOfTrailingZeros(amount) } : concat(new byte[] { (byte) 0xFF }, u32(amount)));
+    }
+
+    /**
+     * The short listing a card is to give from P1 = `from`, worked out from the slots by the rule alone: next, then for each
+     * UNSPENT place in order its entry, naming the keyset and date where they are not those of the entry before it in this
+     * answer (the first always names them); an answer is at most 255 bytes.
+     */
+    private static byte[] shortListingFrom(byte[][] slots, int from) {
+        java.io.ByteArrayOutputStream body = new java.io.ByteArrayOutputStream();
+        int length = 1, next = from;
+        byte[] previous = null;
+        while (next < MAX_PROOFS) {
+            if (slots[next] != null && slots[next][0] == 1) {
+                byte[] s = slots[next];
+                byte[] kd = concat(Arrays.copyOfRange(s, 1, 9), Arrays.copyOfRange(s, 78, 82));
+                boolean named = previous == null || !Arrays.equals(kd, previous);
+                byte[] entry = shortEntry(next, named ? kd : null, readUint32(s, 9));
+                if (length + entry.length > 255) break;
+                body.write(entry, 0, entry.length);
+                length += entry.length;
+                previous = kd;
+            }
+            next++;
+        }
+        return concat(new byte[] { (byte) next }, body.toByteArray());
+    }
+
+    /** One entry of a short listing as a reader decodes it: the place, whether it named its keyset and date, and what it is worth. */
+    private static final class ShortEntry {
+        int place;
+        boolean named;
+        byte[] keyset, date;
+        long amount;
+        boolean power;
+    }
+
+    /** One answer of the short listing as a reader decodes it. The first entry must name its keyset and date; the rest carry the one before. */
+    private static final class ShortAnswer {
+        int next, length;
+        final java.util.List<ShortEntry> entries = new java.util.ArrayList<>();
+    }
+
+    private static ShortAnswer decodeShort(byte[] d) {
+        ShortAnswer a = new ShortAnswer();
+        a.length = d.length;
+        a.next = d[0] & 0xFF;
+        int at = 1;
+        byte[] keyset = null, date = null;
+        while (at < d.length) {
+            ShortEntry e = new ShortEntry();
+            int b = d[at++] & 0xFF;
+            e.place = b & 0x7F;
+            e.named = (b & 0x80) != 0;
+            if (e.named) {
+                keyset = Arrays.copyOfRange(d, at, at + 8);
+                date = Arrays.copyOfRange(d, at + 8, at + 12);
+                at += 12;
+            }
+            assertNotNull(keyset, "the first entry of an answer names its keyset and date");
+            e.keyset = keyset;
+            e.date = date;
+            int size = d[at++] & 0xFF;
+            if (size == 0xFF) {
+                e.amount = readUint32(d, at);
+                at += 4;
+            } else {
+                assertTrue(size <= 31, "a size is a power of two from 0 to 31: " + size);
+                e.amount = 1L << size;
+                e.power = true;
+            }
+            a.entries.add(e);
+        }
+        assertEquals(d.length, at, "the answer is made of whole entries");
+        return a;
+    }
+
+    /** The short listing read from place 0 to its end, as a phone reads it: every entry in order, and how many answers it took. */
+    private java.util.List<ShortEntry> readShortListing(int[] answersOut) {
+        java.util.List<ShortEntry> all = new java.util.ArrayList<>();
+        int from = 0, answers = 0;
+        while (from < MAX_PROOFS) {
+            ResponseAPDU r = shortPieces(from);
+            assertEquals(SW_OK, r.getSW(), "from " + from);
+            assertTrue(r.getData().length <= 255, "an answer is at most 255 bytes: " + r.getData().length);
+            ShortAnswer a = decodeShort(r.getData());
+            assertTrue(a.next > from, "every answer moves on");
+            if (!a.entries.isEmpty()) assertTrue(a.entries.get(0).named, "and begins with the twelve bytes");
+            all.addAll(a.entries);
+            from = a.next;
+            answers++;
+        }
+        if (answersOut != null) answersOut[0] = answers;
+        return all;
+    }
+
+    /** `n` pieces loaded three to a command, from place 0 on: piece i is `make(i)`. */
+    private byte[][] loadMany(int n, java.util.function.IntFunction<byte[]> make) {
+        byte[][] sent = new byte[n][];
+        for (int i = 0; i < n; i++) sent[i] = make.apply(i);
+        for (int at = 0; at < n; at += 3) {
+            byte[][] group = Arrays.copyOfRange(sent, at, Math.min(n, at + 3));
+            ResponseAPDU r = loadBatch(group);
+            assertEquals(SW_OK, r.getSW(), "load from " + at);
+            assertEquals(group.length, r.getData().length);
+        }
+        return sent;
+    }
+
     /**
      * A card with empty, unspent and spent places: forty pieces (a few of them dated) loaded three to a command, ten of them
      * paid and freed, which leaves holes, two new ones put into the first two holes, and seven more paid and left spent.
-     * Places 4, 9, 10, 17, 18, 19, 20, 33 and 40 to 63 are empty; 0, 5, 6, 12, 25, 26, 38 are spent; the rest are unspent.
+     * Places 4, 9, 10, 17, 18, 19, 20, 33 and 40 to 127 are empty; 0, 5, 6, 12, 25, 26, 38 are spent; the rest are unspent.
      */
     private void mixedCard() {
         ready();
@@ -1129,140 +1262,434 @@ class CashuAppletTest {
         for (int s : new int[] { 0, 5, 6, 12, 25, 26, 38 }) assertEquals(SW_OK, spend(s).getSW(), "paid " + s);
     }
 
+    /**
+     * A card with places on both sides of 64: a hundred and twenty pieces of two keysets, now and then dated, mostly powers of
+     * two and now and then not, loaded three to a command; eight paid and freed (holes below and above 64), three new ones put
+     * into the first holes, and six more paid and left spent. Places 65, 66, 100, 101, 119 and 120 to 127 are empty; 0, 63, 67,
+     * 99, 110 and 118 are spent; the rest (109 places) are unspent.
+     */
+    private void bigMixedCard() {
+        ready();
+        loadMany(120, i -> buildProof((i / 7) % 2 == 0 ? KEYSET : KEYSET_B, i % 5 == 3 ? 100 + i : 1L << (i % 12), i + 1, i % 17 == 5 ? 1900000000L : 0));
+        for (int h : new int[] { 2, 3, 64, 65, 66, 100, 101, 119 }) assertEquals(SW_OK, spend(h).getSW(), "paid " + h);
+        assertEquals(SW_OK, clearSpent());
+        ResponseAPDU filled = loadBatch(buildProof(KEYSET, 4096, 131), buildProof(KEYSET_B, 777, 132, 1900000000L), buildProof(KEYSET_B, 2, 133));
+        assertArrayEquals(new byte[] { 2, 3, 64 }, filled.getData());
+        for (int s : new int[] { 0, 63, 67, 99, 110, 118 }) assertEquals(SW_OK, spend(s).getSW(), "paid " + s);
+        byte[] d = info();
+        assertEquals(109, d[3] & 0xFF);
+        assertEquals(6, d[4] & 0xFF);
+        assertEquals(13, d[5] & 0xFF);
+    }
+
     @Test
-    @DisplayName("GET_PIECES P2 = 1, the brief listing: from every starting place, on a card of empty, unspent and spent places, each page is what the rule gives from the slots, in the whole form and the brief; the tags and the chain of next are the whole form's places, and an unspent entry is 16 bytes: its keyset, amount and date")
-    void testBriefListing() {
-        mixedCard();
+    @DisplayName("GET_PIECES P2 = 0 and P2 = 3: from every starting place, on a card of empty, unspent and spent places on both sides of 64, each answer is what the rule gives from the slots, by a model built here from GET_PROOF; no PIN is asked for")
+    void testTheListingsAreWhatTheRuleGives() {
+        bigMixedCard();
         reselect();     // a new tap: the PIN is not verified, and neither listing asks for it
         byte[][] slots = allSlots();
         for (int from = 0; from < MAX_PROOFS; from++) {
-            for (int form = 0; form <= 1; form++) {
-                ResponseAPDU r = form == 0 ? pieces(from) : briefPieces(from);
-                assertEquals(SW_OK, r.getSW(), "from " + from);
-                assertArrayEquals(listingFrom(slots, from, form == 1), r.getData(), (form == 1 ? "brief" : "whole") + " page from place " + from);
-            }
+            ResponseAPDU whole = pieces(from);
+            assertEquals(SW_OK, whole.getSW(), "from " + from);
+            assertArrayEquals(listingFrom(slots, from), whole.getData(), "whole page from place " + from);
+            ResponseAPDU shortAnswer = shortPieces(from);
+            assertEquals(SW_OK, shortAnswer.getSW(), "from " + from);
+            assertArrayEquals(shortListingFrom(slots, from), shortAnswer.getData(), "short page from place " + from);
         }
-        // walked to the end, the two forms list the same places in the same states, once each
-        java.util.List<Object[]> whole = new java.util.ArrayList<>(), brief = new java.util.ArrayList<>();
-        int wholePages = 0, briefPages = 0;
-        for (int from = 0; from < MAX_PROOFS; wholePages++) {
-            Page page = new Page(pieces(from).getData());
-            assertTrue(page.next > from, "every whole answer moves on");
-            whole.addAll(page.entries);
-            from = page.next;
+        // walked to the end, the short listing names every unspent place once, in order, with what it is worth
+        int[] answers = new int[1];
+        java.util.List<ShortEntry> entries = readShortListing(answers);
+        int k = 0;
+        for (int i = 0; i < MAX_PROOFS; i++) {
+            if (slots[i] == null || slots[i][0] != 1) continue;
+            ShortEntry e = entries.get(k++);
+            assertEquals(i, e.place);
+            assertArrayEquals(Arrays.copyOfRange(slots[i], 1, 9), e.keyset, "place " + i + ": its keyset");
+            assertArrayEquals(Arrays.copyOfRange(slots[i], 78, 82), e.date, "place " + i + ": its date");
+            assertEquals(readUint32(slots[i], 9), e.amount, "place " + i + ": its worth");
         }
-        for (int from = 0; from < MAX_PROOFS; briefPages++) {
-            Page page = new Page(briefPieces(from).getData(), 16);
-            assertTrue(page.next > from, "every brief answer moves on");
-            brief.addAll(page.entries);
-            from = page.next;
-        }
-        assertEquals(whole.size(), brief.size(), "the same places listed");
-        int unspent = 0, spent = 0;
-        for (int i = 0; i < whole.size(); i++) {
-            assertEquals(whole.get(i)[0], brief.get(i)[0], "the same place " + i);
-            assertEquals(whole.get(i)[1], brief.get(i)[1], "in the same state, the same tag");
-            int place = (int) brief.get(i)[0];
-            if ((int) brief.get(i)[1] == 1) {
-                unspent++;
-                byte[] w = (byte[]) whole.get(i)[2], b = (byte[]) brief.get(i)[2];
-                assertEquals(16, b.length);
-                assertArrayEquals(Arrays.copyOfRange(slots[place], 1, 9), Arrays.copyOfRange(b, 0, 8), "place " + place + ": its keyset");
-                assertArrayEquals(Arrays.copyOfRange(slots[place], 9, 13), Arrays.copyOfRange(b, 8, 12), "place " + place + ": its amount");
-                assertArrayEquals(Arrays.copyOfRange(slots[place], 78, 82), Arrays.copyOfRange(b, 12, 16), "place " + place + ": its date");
-                assertArrayEquals(Arrays.copyOfRange(w, 0, 12), Arrays.copyOfRange(b, 0, 12), "the whole form's keyset and amount");
-                assertArrayEquals(Arrays.copyOfRange(w, 77, 81), Arrays.copyOfRange(b, 12, 16), "and its date");
-            } else {
-                spent++;
-                assertNull(brief.get(i)[2], "a spent place is its tag alone, as in the whole form");
-            }
-        }
-        assertEquals(25, unspent);
-        assertEquals(7, spent);
-        assertTrue(briefPages < wholePages, "the brief form is fewer answers: " + briefPages + " against " + wholePages);
+        assertEquals(109, k);
+        assertEquals(k, entries.size());
+        assertTrue(answers[0] < 43, "the short listing is far fewer answers than the whole form's: " + answers[0]);
     }
 
     @Test
-    @DisplayName("GET_PIECES P2 = 1 puts 14 unspent places on a page (1 + 14 * 17 = 239) and starts the 15th on the next, skipping the empty places between; spent tags fill it to 255 and not a byte over; place 64 is 6A83; an empty card is one byte")
-    void testBriefPageEdge() {
+    @DisplayName("The short listing of one keyset and one date is two bytes a piece after the first: next, then the first entry with 0x80 on its place, its keyset, its date and its size, and then the place and the size of each piece")
+    void testTheShortListingIsTwoBytesAPieceAfterTheFirst() {
         ready();
-        assertArrayEquals(new byte[] { 64 }, briefPieces(0).getData(), "an empty card: nothing more to ask for");
-        assertEquals(SW_SLOT_OUT_OF_RANGE, briefPieces(MAX_PROOFS).getSW());
-        assertEquals(SW_SLOT_OUT_OF_RANGE, briefPieces(255).getSW());
-        for (int at = 0; at < 15; at += 3) {
-            assertEquals(SW_OK, loadBatch(buildProof(KEYSET, 1 + at, at + 1), buildProof(KEYSET, 2 + at, at + 2), buildProof(KEYSET, 3 + at, at + 3)).getSW());
-        }
-        Page one = new Page(briefPieces(0).getData(), 16);
-        assertEquals(239, one.length, "1 + 14 * 17");
-        assertEquals(14, one.next);
-        assertEquals(14, one.entries.size());
-        Page two = new Page(briefPieces(14).getData(), 16);
-        assertEquals(18, two.length);
-        assertEquals(64, two.next);
-        assertEquals(14, two.entries.get(0)[0], "the 15th starts the next page");
-        // 14 unspent, an empty place, and a 15th: the empty place costs nothing and goes on the first page
-        assertEquals(SW_OK, load(buildProof(KEYSET, 20, 40)).getSW());          // place 15
-        assertEquals(SW_OK, spend(14).getSW());
-        assertEquals(SW_OK, clearSpent());                                       // place 14 is empty
-        Page gap = new Page(briefPieces(0).getData(), 16);
-        assertEquals(239, gap.length);
-        assertEquals(15, gap.next, "next is the first place not covered: the empty place went with the page");
-        Page rest = new Page(briefPieces(gap.next).getData(), 16);
-        assertEquals(1, rest.entries.size());
-        assertEquals(15, rest.entries.get(0)[0]);
+        long[] amounts = { 1, 2, 4, 8, 1024 };
+        for (int i = 0; i < amounts.length; i++) assertEquals(SW_OK, load(buildProof(KEYSET, amounts[i], i + 1)).getSW());
+        byte[] expected = concat(new byte[] { (byte) 0x80 },
+            new byte[] { (byte) 0x80 }, hexToBytes(KEYSET), new byte[4], new byte[] { 0 },
+            new byte[] { 1, 1 }, new byte[] { 2, 2 }, new byte[] { 3, 3 }, new byte[] { 4, 10 });
+        ResponseAPDU r = shortPieces(0);
+        assertEquals(SW_OK, r.getSW());
+        assertArrayEquals(expected, r.getData());
+        assertEquals(1 + 14 + 4 * 2, r.getData().length, "14 for the first, 2 for each of the four after it");
+    }
 
-        // spent tags cost a byte each: 14 unspent and 16 spent make 255 exactly, and a 17th spent tag is for the next page
+    @Test
+    @DisplayName("A second keyset or a second date in the middle of an answer brings the twelve bytes back, for that entry only: compared with the entry before it and with none other, whole (a keyset or a date that differs in its last byte counts)")
+    void testASecondKeysetOrDateBringsTheTwelveBytesBack() {
+        ready();
+        long d1 = 1900000000L;
+        Object[][] pieces = {
+            // keyset, date, amount
+            { KEYSET, 0L, 1L },        // 0: named (the first)
+            { KEYSET, 0L, 2L },        // 1: as the one before
+            { KEYSET_B, 0L, 4L },      // 2: another keyset: named
+            { KEYSET_B, 0L, 8L },      // 3: as the one before
+            { KEYSET_B, d1, 8L },      // 4: another date: named
+            { KEYSET_B, d1, 16L },     // 5: as the one before
+            { KEYSET, 0L, 1L },        // 6: back to the first keyset and no date: named again, since the entry before is not it
+            { KEYSET_A2, 0L, 1L },     // 7: a keyset that differs in its last byte: named
+            { KEYSET_A2, 1L, 1L },     // 8: a date that differs in its last byte: named
+            { KEYSET_A2, 1L, 32L },    // 9: as the one before
+        };
+        for (int i = 0; i < pieces.length; i++) assertEquals(SW_OK, load(buildProof((String) pieces[i][0], (Long) pieces[i][2], i + 1, (Long) pieces[i][1])).getSW());
+        byte[] expected = concat(new byte[] { (byte) 0x80 },
+            shortEntry(0, keysetAndDate(KEYSET, 0), 1), shortEntry(1, null, 2),
+            shortEntry(2, keysetAndDate(KEYSET_B, 0), 4), shortEntry(3, null, 8),
+            shortEntry(4, keysetAndDate(KEYSET_B, d1), 8), shortEntry(5, null, 16),
+            shortEntry(6, keysetAndDate(KEYSET, 0), 1),
+            shortEntry(7, keysetAndDate(KEYSET_A2, 0), 1),
+            shortEntry(8, keysetAndDate(KEYSET_A2, 1), 1), shortEntry(9, null, 32));
+        assertArrayEquals(expected, shortPieces(0).getData());
+        // the explicit bytes of two of them, for a reader to check its decoder against: place 2 and place 3
+        byte[] two = shortEntry(2, keysetAndDate(KEYSET_B, 0), 4);
+        assertEquals(1 + 12 + 1, two.length);
+        assertEquals((byte) 0x82, two[0]);
+        assertEquals(2, two[13]);
+    }
+
+    @Test
+    @DisplayName("A new answer always starts with the twelve bytes, though the piece has the keyset and date of the one before it in the last answer, or of the place before the first one asked for")
+    void testANewAnswerAlwaysStartsWithTheTwelveBytes() {
+        ready();
+        for (int i = 0; i < 6; i++) assertEquals(SW_OK, load(buildProof(KEYSET, 1L << i, i + 1)).getSW());
+        // from place 0, from the middle of a run of one keyset, and from an empty place after the pieces
+        ResponseAPDU middle = shortPieces(3);
+        assertArrayEquals(concat(new byte[] { (byte) 0x80 }, shortEntry(3, keysetAndDate(KEYSET, 0), 8), shortEntry(4, null, 16), shortEntry(5, null, 32)), middle.getData(),
+            "from place 3: the first entry of the answer names them, though place 2 is the same");
+        ResponseAPDU last = shortPieces(5);
+        assertArrayEquals(concat(new byte[] { (byte) 0x80 }, shortEntry(5, keysetAndDate(KEYSET, 0), 32)), last.getData());
+        // a full answer ends before a piece, and the next begins with it, named
         simulator = freshCard();
         ready();
-        for (int at = 0; at < 32; at += 3) {
-            byte[][] group = new byte[Math.min(3, 32 - at)][];
-            for (int j = 0; j < group.length; j++) group[j] = buildProof(KEYSET, 1 + at + j, at + j + 1);
-            assertEquals(SW_OK, loadBatch(group).getSW());
-        }
-        int[] sixteen = new int[16];
-        for (int i = 0; i < 16; i++) sixteen[i] = 14 + i;
-        assertEquals(SW_OK, spendAll(sixteen, new byte[0][]).getSW());
-        Page full = new Page(briefPieces(0).getData(), 16);
-        assertEquals(255, full.length, "14 unspent and 16 spent tags");
-        assertEquals(30, full.next, "and the unspent place 30 is for the next page");
-        assertEquals(30, full.entries.size());
-        assertEquals(SW_OK, spend(30).getSW());
-        Page over = new Page(briefPieces(0).getData(), 16);
-        assertEquals(255, over.length, "a 17th spent tag would be 256");
-        assertEquals(30, over.next, "so it starts the next page");
-        Page tail = new Page(briefPieces(over.next).getData(), 16);
-        assertEquals(2, tail.entries.size());
-        assertEquals(30, tail.entries.get(0)[0]);
-        assertEquals(2, tail.entries.get(0)[1], "a spent tag");
-        assertEquals(31, tail.entries.get(1)[0]);
-        assertEquals(1, tail.entries.get(1)[1]);
+        loadMany(128, i -> buildProof(KEYSET, 1L << (i % 32), i + 1));
+        ShortAnswer first = decodeShort(shortPieces(0).getData());
+        ShortAnswer second = decodeShort(shortPieces(first.next).getData());
+        assertTrue(first.entries.get(0).named);
+        assertFalse(first.entries.get(1).named);
+        assertTrue(second.entries.get(0).named, "the second answer begins with the twelve bytes, though its first piece is the one the last answer ended with");
+        assertFalse(second.entries.get(1).named);
     }
 
     @Test
-    @DisplayName("GET_PIECES P2 = 1 changes nothing and asks for no PIN, on a locked or blocked card as well, and says the same twice")
-    void testBriefListingReadOnly() {
+    @DisplayName("An amount that is not a power of two gives 0xFF and the amount in four bytes, big-endian, in place of a size: 3, 1000, 0x01000001 and the rest; a power of two among them still gives its size; a named entry carries the amount too")
+    void testAnAmountThatIsNoPowerOfTwoGivesFFAndFourBytes() {
+        ready();
+        long[] amounts = { 3, 1000, 0x01000001L, 5, 2, 6, 7, 0x80000001L, 4294967295L, 0x00FF0000L, 0x00010100L, 0x03000000L, 8, 12, 4294967294L, 2147483648L };
+        for (int i = 0; i < amounts.length; i++) assertEquals(SW_OK, load(buildProof(KEYSET, amounts[i], i + 1)).getSW());
+        java.io.ByteArrayOutputStream expected = new java.io.ByteArrayOutputStream();
+        expected.write(0x80);
+        for (int i = 0; i < amounts.length; i++) {
+            byte[] e = shortEntry(i, i == 0 ? keysetAndDate(KEYSET, 0) : null, amounts[i]);
+            expected.write(e, 0, e.length);
+        }
+        ResponseAPDU r = shortPieces(0);
+        assertArrayEquals(expected.toByteArray(), r.getData());
+        // by hand: place 0 (3): 80 | keyset | date | FF 00 00 00 03, and place 1 (1000): 01 FF 00 00 03 E8
+        byte[] d = r.getData();
+        assertEquals((byte) 0x80, d[1]);
+        assertEquals((byte) 0xFF, d[1 + 1 + 12]);
+        assertArrayEquals(new byte[] { 0, 0, 0, 3 }, Arrays.copyOfRange(d, 15, 19));
+        assertArrayEquals(new byte[] { 1, (byte) 0xFF, 0, 0, 3, (byte) 0xE8 }, Arrays.copyOfRange(d, 19, 25));
+        assertArrayEquals(new byte[] { 2, (byte) 0xFF, 1, 0, 0, 1 }, Arrays.copyOfRange(d, 25, 31), "0x01000001");
+        assertArrayEquals(new byte[] { 3, (byte) 0xFF, 0, 0, 0, 5 }, Arrays.copyOfRange(d, 31, 37));
+        assertArrayEquals(new byte[] { 4, 1 }, Arrays.copyOfRange(d, 37, 39), "2 is a power of two: place 4, size 1");
+    }
+
+    @Test
+    @DisplayName("Every power of two from 1 to 2^31 gives its size, 0 to 31, and its neighbours (one less, one more) give 0xFF and their amounts")
+    void testEveryPowerOfTwoGivesItsSize() {
+        ready();
+        for (int k = 0; k < 32; k++) assertEquals(SW_OK, load(buildProof(KEYSET, 1L << k, k + 1)).getSW(), "2^" + k);
+        byte[] d = shortPieces(0).getData();
+        assertEquals(128, d[0] & 0xFF);
+        assertEquals(1 + 14 + 31 * 2, d.length);
+        assertEquals(0, d[14], "1 is size 0");
+        for (int k = 1; k < 32; k++) {
+            assertEquals(k, d[15 + 2 * (k - 1)] & 0xFF, "place number of 2^" + k);
+            assertEquals(k, d[16 + 2 * (k - 1)] & 0xFF, "size of 2^" + k);
+        }
+        assertEquals(31, d[d.length - 1], "2^31 is size 31");
+        // the neighbours: none is a power of two, and each says what it is worth
+        simulator = freshCard();
+        ready();
+        java.util.List<Long> amounts = new java.util.ArrayList<>();
+        for (int k = 2; k < 32; k++) { amounts.add((1L << k) - 1); amounts.add(1L << k); amounts.add((1L << k) + 1); }
+        loadMany(amounts.size(), i -> buildProof(KEYSET, amounts.get(i), i + 1));
+        java.util.List<ShortEntry> entries = readShortListing(null);
+        assertEquals(amounts.size(), entries.size());
+        for (int i = 0; i < amounts.size(); i++) {
+            ShortEntry e = entries.get(i);
+            assertEquals(i, e.place);
+            assertEquals((long) amounts.get(i), e.amount, "place " + i);
+            assertEquals(i % 3 == 1, e.power, "place " + i + " (" + amounts.get(i) + ") is " + (i % 3 == 1 ? "" : "not ") + "a power of two");
+        }
+    }
+
+    @Test
+    @DisplayName("Spent and empty places have no entry in the short listing, and a spent place between two of one keyset does not bring the twelve bytes back, nor does the keyset it had")
+    void testTheShortListingSkipsSpentAndEmpty() {
+        ready();
+        String[] keysets = { KEYSET, KEYSET, KEYSET_B, KEYSET, KEYSET, KEYSET, KEYSET, KEYSET };
+        for (int i = 0; i < keysets.length; i++) assertEquals(SW_OK, load(buildProof(keysets[i], 1L << i, i + 1)).getSW());
+        assertEquals(SW_OK, spend(2).getSW(), "the piece of the other keyset, between two of the first");
+        assertEquals(SW_OK, spend(5).getSW());
+        byte[] expected = concat(new byte[] { (byte) 0x80 },
+            shortEntry(0, keysetAndDate(KEYSET, 0), 1), shortEntry(1, null, 2), shortEntry(3, null, 8), shortEntry(4, null, 16),
+            shortEntry(6, null, 64), shortEntry(7, null, 128));
+        assertArrayEquals(expected, shortPieces(0).getData(), "places 2 and 5 are spent, 8 and on are empty: none is listed");
+        // freed, they are empty, and still not listed
+        assertEquals(SW_OK, clearSpent());
+        assertArrayEquals(expected, shortPieces(0).getData());
+        // listing from a spent place begins at the next piece, named
+        assertArrayEquals(concat(new byte[] { (byte) 0x80 }, shortEntry(3, keysetAndDate(KEYSET, 0), 8), shortEntry(4, null, 16), shortEntry(6, null, 64), shortEntry(7, null, 128)),
+            shortPieces(2).getData());
+    }
+
+    @Test
+    @DisplayName("An empty card answers the single byte 0x80 (next: 128, nothing more to ask for); so does a start past the last piece; P1 of 128 or more is 6A83")
+    void testAnEmptyCardAnswersTheSingleByte80() {
+        ready();
+        assertArrayEquals(new byte[] { (byte) 0x80 }, shortPieces(0).getData());
+        assertArrayEquals(new byte[] { (byte) 0x80 }, shortPieces(127).getData());
+        assertEquals(SW_OK, load(buildProof(KEYSET, 5, 1)).getSW());
+        assertArrayEquals(new byte[] { (byte) 0x80 }, shortPieces(1).getData(), "after the only piece");
+        for (int p1 : new int[] { 128, 129, 200, 255 }) {
+            ResponseAPDU r = shortPieces(p1);
+            assertEquals(SW_SLOT_OUT_OF_RANGE, r.getSW(), "P1 = " + p1);
+            assertEquals(0, r.getData().length);
+        }
+    }
+
+    @Test
+    @DisplayName("A full card of one keyset and one date and powers of two takes exactly two answers: 121 pieces (255 bytes) and then 7, which together name every place once, in order")
+    void testAFullCardOfPowersOfTwoTakesTwoAnswers() {
+        ready();
+        loadMany(128, i -> buildProof(KEYSET, 1L << (i % 32), i + 1));
+        ResponseAPDU a = shortPieces(0);
+        assertEquals(SW_OK, a.getSW());
+        assertEquals(255, a.getData().length, "1 + 14 + 120 * 2");
+        ShortAnswer first = decodeShort(a.getData());
+        assertEquals(121, first.entries.size());
+        assertEquals(121, first.next);
+        ResponseAPDU b = shortPieces(first.next);
+        assertEquals(SW_OK, b.getSW());
+        ShortAnswer second = decodeShort(b.getData());
+        assertEquals(7, second.entries.size());
+        assertEquals(128, second.next);
+        assertEquals(1 + 14 + 6 * 2, b.getData().length);
+        int expected = 0;
+        for (ShortEntry e : first.entries) { assertEquals(expected, e.place); assertEquals(1L << (expected % 32), e.amount); expected++; }
+        for (ShortEntry e : second.entries) { assertEquals(expected, e.place); assertEquals(1L << (expected % 32), e.amount); expected++; }
+        assertEquals(128, expected, "every place once, in order");
+        int[] answers = new int[1];
+        readShortListing(answers);
+        assertEquals(2, answers[0]);
+    }
+
+    @Test
+    @DisplayName("A full card of amounts that are no power of two, with the keyset changing at every place, pages correctly: every answer is at most 255 bytes and moves on, 14 pieces of 18 bytes to an answer, ten answers, every place once and as it is")
+    void testAFullCardOfNonPowersWithAlternatingKeysetsPages() {
+        ready();
+        byte[][] sent = loadMany(128, i -> buildProof(i % 2 == 0 ? KEYSET : KEYSET_B, 1000 + 7L * i, i + 1, i % 3 == 0 ? 1900000000L : 0));
+        int from = 0, answers = 0, seen = 0;
+        while (from < MAX_PROOFS) {
+            ResponseAPDU r = shortPieces(from);
+            assertEquals(SW_OK, r.getSW());
+            assertTrue(r.getData().length <= 255, "at most 255 bytes: " + r.getData().length);
+            ShortAnswer a = decodeShort(r.getData());
+            assertTrue(a.next > from, "moves on");
+            assertEquals(a.next < MAX_PROOFS ? 1 + 14 * 18 : r.getData().length, r.getData().length, "14 entries of 18 bytes to an answer, but the last");
+            for (ShortEntry e : a.entries) {
+                assertEquals(seen, e.place, "every place once, in order");
+                assertTrue(e.named, "the keyset changes at every place: every entry names them");
+                assertArrayEquals(Arrays.copyOfRange(sent[seen], 0, 8), e.keyset);
+                assertArrayEquals(Arrays.copyOfRange(sent[seen], 77, 81), e.date);
+                assertEquals(1000 + 7L * seen, e.amount);
+                assertFalse(e.power);
+                seen++;
+            }
+            from = a.next;
+            answers++;
+        }
+        assertEquals(128, seen);
+        assertEquals(10, answers, "128 pieces at 14 to an answer");
+    }
+
+    @Test
+    @DisplayName("The short listing asks for no PIN, changes nothing (not the slots, the log, the record or the PIN's state), says the same twice, and a locked card still gives it")
+    void testTheShortListingNeedsNoPinAndChangesNothing() throws Exception {
         mixedCard();
         byte[] infoBefore = info();
-        byte[] first = briefPieces(0).getData();
-        assertArrayEquals(first, briefPieces(0).getData(), "asking twice says the same");
+        byte[] first = shortPieces(0).getData();
+        assertArrayEquals(first, shortPieces(0).getData(), "asking twice says the same");
         assertArrayEquals(infoBefore, info());
         reselect();
-        assertEquals(SW_OK, briefPieces(0).getSW(), "no PIN verified in this tap");
-        assertArrayEquals(first, briefPieces(0).getData());
+        byte[] storage = field("proofStorage").clone(), record = field("cardRecord").clone(), cardLog = field("cardLog").clone();
+        assertEquals(SW_OK, shortPieces(0).getSW(), "no PIN verified in this tap");
+        assertEquals(SW_OK, shortPieces(77).getSW());
+        assertArrayEquals(first, shortPieces(0).getData());
+        assertArrayEquals(storage, field("proofStorage"));
+        assertArrayEquals(record, field("cardRecord"));
+        assertArrayEquals(cardLog, field("cardLog"));
         assertEquals(SW_OK, verify(TEST_PIN));
         assertEquals(SW_OK, lock());
-        assertArrayEquals(first, briefPieces(0).getData(), "a locked card still tells what it holds");
+        assertArrayEquals(first, shortPieces(0).getData(), "a locked card still tells what it holds");
     }
 
     @Test
-    @DisplayName("GET_PIECES P2 = 2: one, two or three places, in any order and repeated, each answered as GET_PROOF gives it (status, then 81 bytes), whatever its state; 6700 for none and for four; 6A83 for place 64")
+    @DisplayName("The short listing is gathered in the APDU buffer and sent when the buffer has no room for another entry of the most it can be (18 bytes), and once at the end for what is left: the flush is before each entry is written, the place in the buffer starts again at 0 after it, and the final send is there")
+    void testTheShortListingGathersAndFlushes() throws Exception {
+        String code = appletCode();
+        String shortBody = body(code, "private void processGetShort(", "private boolean shortNamed(");
+        assertEquals(128, CashuApplet.MAX_PROOFS);
+        assertEquals(255, CashuApplet.PAGE_MAX);
+        assertEquals(18, CashuApplet.SHORT_MOST, "place, keyset (8), date (4), 0xFF, amount (4)");
+        int room = shortBody.indexOf("short room = (short) buf.length;");
+        int flush = shortBody.indexOf("if ((short)(at + SHORT_MOST) > room) {");
+        int send = shortBody.indexOf("apdu.sendBytes((short) 0, at);", flush);
+        int reset = shortBody.indexOf("at = (short) 0;", send);
+        int firstWrite = shortBody.indexOf("buf[at++]");
+        int last = shortBody.lastIndexOf("if (at > 0) apdu.sendBytes((short) 0, at);");
+        assertTrue(room > 0 && room < flush && flush < send && send < reset && reset < firstWrite && firstWrite < last, "room, then before each entry the flush that sends and starts again at 0, then the entries, then the last send");
+        assertEquals(2, count(shortBody, "apdu.sendBytes("), "one in the loop and one at the end: an entry is not sent by itself");
+        assertTrue(shortBody.indexOf("apdu.setOutgoingLength(length)") < room, "the length of the answer is set before anything is sent");
+        // the length is worked out the way the entries are written: the same test for naming and for a size, and the page is held to PAGE_MAX
+        assertTrue(shortBody.contains("if ((short)(length + cost) > PAGE_MAX) break;"));
+        assertTrue(shortBody.contains("if (shortNamed(base, prev)) cost += (short) 12;") && shortBody.contains("if (sizeOf((short)(base + PROOF_AMOUNT_OFFSET)) < 0) cost += (short) 4;"));
+        assertTrue(shortBody.contains("(byte)(i | (short) 0x80)"), "0x80 on a place whose keyset and date follow");
+    }
+
+    @Test
+    @DisplayName("GET_PIECES P2 = 1, the brief listing of the sixty-four-place card, is gone: refused (6A86) like any form the card does not have")
+    void testTheBriefListingIsGone() {
+        ready();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 5, 1)).getSW());
+        for (int p1 : new int[] { 0, 1, 63, 64, 127 }) {
+            ResponseAPDU r = transmit(new CommandAPDU(CLA, INS_GET_PIECES, p1, 1, 256));
+            assertEquals(SW_INCORRECT_P1P2, r.getSW(), "P1 = " + p1);
+            assertEquals(0, r.getData().length);
+        }
+    }
+
+    @Test
+    @DisplayName("The whole listing names places above 63: a plain tag for an unspent place (0x40 for 64, 0x7E for 126), a spent place's number with 0x80 set (0xC6 for 70, 0xE4 for 100, 0xFF for 127), next is 128 at the end, and a full card pages in forty-three answers")
+    void testTheWholeListingNamesPlacesAbove63() {
+        ready();
+        byte[][] sent = loadMany(128, i -> buildProof(KEYSET, 1 + i, i + 1));
+        for (int p : new int[] { 3, 70, 100, 127 }) assertEquals(SW_OK, spend(p).getSW(), "paid " + p);
+        reselect();
+        // from 63: places 63, 64 and 65 are unspent, with their numbers for tags
+        Page from63 = new Page(pieces(63).getData());
+        assertEquals(63, from63.entries.get(0)[0]);
+        assertEquals(0x3F, from63.entries.get(0)[3]);
+        assertEquals(0x40, from63.entries.get(1)[3], "place 64: its number");
+        assertEquals(0x41, from63.entries.get(2)[3]);
+        assertEquals(1 + 3 * 82, from63.length);
+        assertEquals(66, from63.next);
+        assertArrayEquals(Arrays.copyOfRange(asSlot(sent[64]), 1, 82), (byte[]) from63.entries.get(1)[2], "and the piece of place 64");
+        // walked from 0 to the end
+        java.util.Map<Integer, Integer> tags = new java.util.HashMap<>();
+        int from = 0, answers = 0;
+        while (from < MAX_PROOFS) {
+            Page page = new Page(pieces(from).getData());
+            assertTrue(page.next > from);
+            assertTrue(page.length <= 255);
+            for (Object[] e : page.entries) tags.put((Integer) e[0], (Integer) e[3]);
+            from = page.next;
+            answers++;
+        }
+        assertEquals(128, tags.size(), "every place once");
+        assertEquals(0x83, (int) tags.get(3), "a spent place below 64: its number and 0x80");
+        assertEquals(0xC6, (int) tags.get(70));
+        assertEquals(0xE4, (int) tags.get(100));
+        assertEquals(0xFF, (int) tags.get(127));
+        assertEquals(0x7E, (int) tags.get(126), "an unspent place: its number and nothing more");
+        assertEquals(0x40, (int) tags.get(64));
+        // the last page ends at 128, and a page may start on a spent place at the end
+        Page last = new Page(pieces(127).getData());
+        assertEquals(128, last.next);
+        assertEquals(2, last.length);
+        assertEquals(1, last.entries.size());
+        assertEquals(0xFF, last.entries.get(0)[3]);
+        assertEquals(2, last.entries.get(0)[1]);
+        // the answers are as the rule says, from every page's start to the end
+        byte[][] slots = allSlots();
+        int count = 0;
+        for (int f = 0; f < MAX_PROOFS; ) {
+            byte[] expected = listingFrom(slots, f);
+            assertArrayEquals(expected, pieces(f).getData());
+            f = expected[0] & 0xFF;
+            count++;
+        }
+        assertEquals(answers, count);
+    }
+
+    @Test
+    @DisplayName("GET_PROOF names places 64 to 127 and answers them as it does the others; place 128 is not a place (6A83)")
+    void testGetProofNamesPlacesAbove63() {
+        ready();
+        byte[][] sent = loadMany(128, i -> buildProof(KEYSET, 3 + i, i + 1, i % 9 == 0 ? 1900000000L : 0));
+        for (int p : new int[] { 63, 64, 65, 100, 126, 127 }) {
+            ResponseAPDU r = transmit(new CommandAPDU(CLA, INS_GET_PROOF, p, 0, 256));
+            assertEquals(SW_OK, r.getSW(), "place " + p);
+            assertArrayEquals(asSlot(sent[p]), r.getData(), "place " + p);
+        }
+        assertEquals(SW_OK, spend(100).getSW());
+        assertEquals(2, slot(100)[0], "a spent place above 63 reads as spent");
+        assertEquals(SW_SLOT_OUT_OF_RANGE, sw(new CommandAPDU(CLA, INS_GET_PROOF, 128, 0, 256)));
+        assertEquals(SW_SLOT_OUT_OF_RANGE, sw(new CommandAPDU(CLA, INS_GET_PROOF, 255, 0, 256)));
+    }
+
+    @Test
+    @DisplayName("GET_PIECES P2 = 2 names places above 63, with repeats and in any order, answered as GET_PROOF gives them; place 128 among them is 6A83 and nothing is answered")
+    void testSomePiecesAbove63() throws Exception {
+        bigMixedCard();
+        reselect();
+        byte[] storage = field("proofStorage");
+        int[][] asked = { { 64 }, { 65 }, { 127 }, { 100 }, { 63 }, { 67 }, { 99 }, { 70, 64, 63 }, { 127, 127, 100 }, { 65, 67, 70 }, { 110, 111, 112 } };
+        for (int[] places : asked) {
+            byte[] request = new byte[places.length];
+            for (int i = 0; i < places.length; i++) request[i] = (byte) places[i];
+            ResponseAPDU r = somePieces(request);
+            String what = "places " + Arrays.toString(places);
+            assertEquals(SW_OK, r.getSW(), what);
+            assertEquals(82 * places.length, r.getData().length, what);
+            for (int i = 0; i < places.length; i++) {
+                byte[] got = Arrays.copyOfRange(r.getData(), 82 * i, 82 * i + 82);
+                assertArrayEquals(Arrays.copyOfRange(storage, places[i] * 82, places[i] * 82 + 82), got, what + ": place " + places[i]);
+                if (placeStatus(places[i]) != 0) assertArrayEquals(slot(places[i]), got, what + ": place " + places[i] + " as GET_PROOF gives it");
+            }
+        }
+        assertEquals(SW_SLOT_OUT_OF_RANGE, somePieces(new byte[] { (byte) 128 }).getSW());
+        assertEquals(SW_SLOT_OUT_OF_RANGE, somePieces(new byte[] { 1, 127, (byte) 128 }).getSW());
+        assertEquals(0, somePieces(new byte[] { 1, (byte) 128, 2 }).getData().length, "and none of the others is answered");
+        assertEquals(SW_OK, somePieces(new byte[] { 127 }).getSW(), "127 is the last place");
+    }
+
+    @Test
+    @DisplayName("GET_PIECES P2 = 2: one, two or three places, in any order and repeated, each answered as GET_PROOF gives it (status, then 81 bytes), whatever its state; 6700 for none and for four; 6A83 for place 128")
     void testSomePieces() throws Exception {
         mixedCard();
         reselect();
         byte[] storage = field("proofStorage");
         // 1 unspent; 0 spent; 4 empty after being freed; 50 never used; 3 dated and unspent (loaded into a hole)
         int[][] asked = { { 1 }, { 0 }, { 4 }, { 50 }, { 3 }, { 63 }, { 1, 0 }, { 0, 1 }, { 4, 3 }, { 1, 0, 4 }, { 4, 0, 1 }, { 3, 50, 0 },
-                          { 1, 1 }, { 0, 0, 0 }, { 3, 1, 3 }, { 7, 7, 7 }, { 12, 12 }, { 63, 0, 63 } };
+                          { 1, 1 }, { 0, 0, 0 }, { 3, 1, 3 }, { 7, 7, 7 }, { 12, 12 }, { 63, 0, 63 }, { 64 }, { 127 }, { 127, 64, 0 } };
         for (int[] places : asked) {
             byte[] request = new byte[places.length];
             for (int i = 0; i < places.length; i++) request[i] = (byte) places[i];
@@ -1287,14 +1714,488 @@ class CashuAppletTest {
         assertEquals(SW_WRONG_LENGTH, somePieces(new byte[40]).getSW(), "forty");
         assertEquals(0, somePieces(new byte[] { 0, 1, 2, 3 }).getData().length, "and nothing is answered with a refusal");
         // a place that is not one
-        assertEquals(SW_SLOT_OUT_OF_RANGE, somePieces(new byte[] { 64 }).getSW());
-        assertEquals(SW_SLOT_OUT_OF_RANGE, somePieces(new byte[] { 0, 64 }).getSW(), "anywhere among them");
+        assertEquals(SW_SLOT_OUT_OF_RANGE, somePieces(new byte[] { (byte) 128 }).getSW());
+        assertEquals(SW_SLOT_OUT_OF_RANGE, somePieces(new byte[] { 0, (byte) 128 }).getSW(), "anywhere among them");
         assertEquals(SW_SLOT_OUT_OF_RANGE, somePieces(new byte[] { 1, 2, (byte) 255 }).getSW());
-        assertEquals(0, somePieces(new byte[] { 1, 64, 2 }).getData().length, "and none of the others is answered");
+        assertEquals(0, somePieces(new byte[] { 1, (byte) 128, 2 }).getData().length, "and none of the others is answered");
         // it asks for no PIN and changes nothing
         byte[] before = storage.clone();
         assertEquals(SW_OK, somePieces(new byte[] { 1, 2, 3 }).getSW());
         assertArrayEquals(before, field("proofStorage"));
+    }
+
+    // ---- places 64 to 127 in every command that names a place ------------------------------
+
+    @Test
+    @DisplayName("A payment made of places above 63 signs and burns them: places 64, 100 and 127 with one below 64, into an output, signed over their own text, each burned and no other; a place 128 anywhere in the list is 6A83 and burns nothing")
+    void testAPaymentOfPlacesAbove63SignsAndBurnsThem() throws Exception {
+        ready();
+        byte[][] sent = loadMany(128, i -> buildProof(KEYSET, 1 + i, i + 1));
+        byte[][] outputs = { output(300, blinded(7)) };
+        int[] places = { 127, 64, 100, 3 };
+        byte[][] named = new byte[places.length][];
+        long worth = 0;
+        for (int i = 0; i < places.length; i++) { named[i] = asSlot(sent[places[i]]); worth += 1 + places[i]; }
+        ResponseAPDU r = spendAll(places, outputs);
+        assertEquals(SW_OK, r.getSW());
+        assertTrue(signedForAll(r.getData(), named, outputs, REFUND), "signed over the text of those pieces, in the order named");
+        for (int p = 0; p < MAX_PROOFS; p++) {
+            boolean burned = p == 127 || p == 64 || p == 100 || p == 3;
+            assertEquals(burned ? 2 : 1, slot(p)[0], "place " + p);
+        }
+        assertEquals(128 * 129 / 2 - worth, balance());
+        // a place that is not one, among places that are
+        assertEquals(SW_SLOT_OUT_OF_RANGE, sw(beginCommand(5, 128)), "place 128");
+        assertEquals(SW_SLOT_OUT_OF_RANGE, sw(beginCommand(128)));
+        assertEquals(SW_SLOT_OUT_OF_RANGE, sw(beginCommand(66, 255, 67)));
+        assertEquals(SW_CONDITIONS_NOT_SATIS, sw(SIGN_ALL), "and no payment is begun by any of them");
+        assertEquals(1, slot(5)[0]);
+        // a spent place above 63 is spent, and an empty one is empty
+        assertEquals(SW_CONDITIONS_NOT_SATIS, sw(beginCommand(100)), "spent");
+        // the receipts and the log count the pieces: four
+        assertArrayEquals(new long[] { T0, worth, 4, 0, 0 }, logTap(0));
+    }
+
+    @Test
+    @DisplayName("CLEAR_SPENT frees spent places above 63 as it does the others, and says how many; the places are then empty, and the next pieces go to the first empty places in order, 70, 100 and 127 among them")
+    void testClearSpentFreesPlacesAbove63() {
+        ready();
+        loadMany(128, i -> buildProof(KEYSET, 1 + i, i + 1));
+        for (int p : new int[] { 70, 100, 127, 5 }) assertEquals(SW_OK, spend(p).getSW(), "paid " + p);
+        ResponseAPDU cleared = transmit(new CommandAPDU(CLA, INS_CLEAR_SPENT, 0, 0, 1));
+        assertEquals(SW_OK, cleared.getSW());
+        assertEquals(4, cleared.getData()[0], "four places freed: 5, 70, 100 and 127");
+        assertEquals(0, transmit(new CommandAPDU(CLA, INS_CLEAR_SPENT, 0, 0, 1)).getData()[0], "and a second finds none");
+        byte[] status = transmit(new CommandAPDU(CLA, INS_GET_SLOT_STATUS, 0, 0, 256)).getData();
+        for (int p : new int[] { 70, 100, 127, 5 }) assertEquals(0, status[p], "place " + p + " is empty");
+        assertEquals(124, info()[3] & 0xFF);
+        assertEquals(0, info()[4] & 0xFF);
+        assertEquals(4, info()[5] & 0xFF);
+        ResponseAPDU put = loadBatch(buildProof(KEYSET, 9, 501), buildProof(KEYSET, 9, 502), buildProof(KEYSET, 9, 503));
+        assertArrayEquals(new byte[] { 5, 70, 100 }, put.getData(), "the first empty places, in order");
+        assertArrayEquals(new byte[] { 127 }, load(buildProof(KEYSET, 9, 504)).getData());
+        assertEquals(SW_NO_SPACE, load(buildProof(KEYSET, 9, 505)).getSW());
+        // the count freed is a byte: all hundred and twenty-eight at once is 0x80, read as unsigned
+        simulator = freshCard();
+        ready();
+        loadMany(128, i -> buildProof(KEYSET, 1 + i, i + 1));
+        for (int at = 0; at < 128; at += 32) {
+            int[] group = new int[32];
+            for (int j = 0; j < 32; j++) group[j] = at + j;
+            assertEquals(SW_OK, spendAll(group, new byte[0][]).getSW(), "places " + at + " to " + (at + 31));
+        }
+        ResponseAPDU all = transmit(new CommandAPDU(CLA, INS_CLEAR_SPENT, 0, 0, 1));
+        assertEquals(SW_OK, all.getSW());
+        assertEquals(128, all.getData()[0] & 0xFF, "128 freed at once");
+    }
+
+    @Test
+    @DisplayName("GET_INFO counts to 128 in each of its three counts, as unsigned bytes: 128 unspent is 0x80, 128 spent is 0x80, 128 empty is 0x80, and a mixed card's three add up to 128")
+    void testTheInfoCountsGoTo128() {
+        assertEquals(128, info()[5] & 0xFF, "128 empty");
+        assertEquals((byte) 0x80, info()[5]);
+        ready();
+        loadMany(128, i -> buildProof(KEYSET, 1 + i, i + 1));
+        byte[] d = info();
+        assertEquals(128, d[2] & 0xFF, "places");
+        assertEquals(128, d[3] & 0xFF, "128 unspent");
+        assertEquals(0, d[4]);
+        assertEquals(0, d[5]);
+        assertEquals((byte) 0x80, d[3]);
+        // 8 paid and freed, 20 paid and left: 100 unspent, 20 spent, 8 empty
+        int[] eight = new int[8], twenty = new int[20];
+        for (int i = 0; i < 8; i++) eight[i] = 100 + i;
+        for (int i = 0; i < 20; i++) twenty[i] = 8 + i;
+        assertEquals(SW_OK, spendAll(eight, new byte[0][]).getSW());
+        assertEquals(SW_OK, clearSpent());
+        assertEquals(SW_OK, spendAll(twenty, new byte[0][]).getSW());
+        d = info();
+        assertEquals(100, d[3] & 0xFF);
+        assertEquals(20, d[4] & 0xFF);
+        assertEquals(8, d[5] & 0xFF);
+        assertEquals(128, (d[3] & 0xFF) + (d[4] & 0xFF) + (d[5] & 0xFF));
+        assertEquals(128 - 8, transmit(new CommandAPDU(CLA, INS_GET_PROOF_COUNT, 0, 0, 1)).getData()[0] & 0xFF, "GET_PROOF_COUNT counts every place that is not empty");
+        byte[] status = transmit(new CommandAPDU(CLA, INS_GET_SLOT_STATUS, 0, 0, 256)).getData();
+        assertEquals(128, status.length, "GET_SLOT_STATUS gives 128 bytes");
+        for (int p = 0; p < 128; p++) assertEquals(p >= 100 && p < 108 ? 0 : p >= 8 && p < 28 ? 2 : 1, status[p], "place " + p);
+        // all spent
+        simulator = freshCard();
+        ready();
+        loadMany(128, i -> buildProof(KEYSET, 1 + i, i + 1));
+        for (int at = 0; at < 128; at += 32) {
+            int[] group = new int[32];
+            for (int j = 0; j < 32; j++) group[j] = at + j;
+            assertEquals(SW_OK, spendAll(group, new byte[0][]).getSW());
+        }
+        d = info();
+        assertEquals(0, d[3]);
+        assertEquals(128, d[4] & 0xFF, "128 spent");
+        assertEquals(0, d[5]);
+        assertEquals(128, transmit(new CommandAPDU(CLA, INS_GET_PROOF_COUNT, 0, 0, 1)).getData()[0] & 0xFF);
+        assertEquals(0, balance());
+        assertEquals(SW_OK, clearSpent());
+        d = info();
+        assertEquals(128, d[5] & 0xFF, "and 128 empty again");
+        assertEquals(0, d[3]);
+        assertEquals(0, d[4]);
+    }
+
+    @Test
+    @DisplayName("GET_BALANCE sums all hundred and twenty-eight pieces, those above 63 included (1 + 2 + ... + 128 = 8256, and with large ones a total past a short); the places above 63 count when unspent and not when spent")
+    void testTheBalanceSums128Pieces() {
+        ready();
+        loadMany(128, i -> buildProof(KEYSET, 1 + i, i + 1));
+        assertEquals(8256, balance());
+        assertEquals(SW_OK, spend(127).getSW());
+        assertEquals(8256 - 128, balance(), "a spent place above 63 is not counted");
+        simulator = freshCard();
+        ready();
+        loadMany(128, i -> buildProof(KEYSET, 33_000_000L + i, i + 1));
+        assertEquals(128 * 33_000_000L + 8128, balance(), "a total that needs more than three bytes");
+    }
+
+    @Test
+    @DisplayName("Places above 63 are looked at when a piece is loaded and when anything asks if the card is in use: a copy of a piece at place 100 is refused as on the card already (6A94), and a card whose only unspent piece is above 63 is in use (6A8D)")
+    void testPlacesAbove63AreLookedAt() {
+        ready();
+        loadMany(101, i -> buildProof(KEYSET, 1 + i, i + 1));
+        assertEquals(SW_PIECE_ON_CARD, load(buildProof(KEYSET, 5, 101)).getSW(), "the nonce of the piece at place 100, with another amount");
+        assertEquals(101, info()[3] & 0xFF, "and it was not stored");
+        // everything but the piece at place 100 is paid and freed: the card is in use
+        for (int at = 0; at < 100; at += 32) {
+            int n = Math.min(32, 100 - at);
+            int[] group = new int[n];
+            for (int j = 0; j < n; j++) group[j] = at + j;
+            assertEquals(SW_OK, spendAll(group, new byte[0][]).getSW());
+        }
+        assertEquals(SW_OK, clearSpent());
+        assertEquals(1, info()[3] & 0xFF, "one unspent piece, at place 100");
+        assertEquals(1, slot(100)[0]);
+        assertEquals(SW_CARD_IN_USE, ownerSetCard(MINT, REFUND, OTHER_SIGNER), "in use, though every place below 100 is empty");
+        assertEquals(SW_OK, spend(100).getSW());
+        assertEquals(SW_OK, clearSpent());
+        assertEquals(SW_OK, ownerSetCard(MINT, REFUND, OTHER_SIGNER), "and not in use when it is paid and freed");
+    }
+
+    // ---- a payment may name every place the card has -----------------------------------------
+
+    /** All the places 0 to n-1 of the card, in an order that is not the order they lie in: (5k + 3) mod 128, which is a permutation of the 128. */
+    private static int[] scrambled(int n) {
+        int[] places = new int[n];
+        for (int k = 0; k < n; k++) places[k] = (5 * k + 3) % 128;
+        return places;
+    }
+
+    @Test
+    @DisplayName("A payment of 33 places, of 64 and of all 128 on a full card each sign once, over the text of every place named in the order named and then the outputs; every place named is burned and no other; the balance, the counts, the log entry and a receipt are right; SPEND_ALL_AGAIN gives the signature again; and the pieces count, a byte, stops at 255")
+    void testAPaymentOfManyPlacesSignsOnce() throws Exception {
+        for (int n : new int[] { 33, 64, 128 }) {
+            String what = n + " places";
+            simulator = freshCard();
+            ready();
+            byte[][] sent = loadMany(128, i -> buildProof(KEYSET, 1 + i, i + 1));
+            int[] places = scrambled(n);
+            byte[][] named = new byte[n][];
+            boolean[] burned = new boolean[128];
+            long worth = 0;
+            for (int k = 0; k < n; k++) {
+                named[k] = asSlot(sent[places[k]]);
+                burned[places[k]] = true;
+                worth += 1 + places[k];
+            }
+            byte[][] outputs = { output(3, blinded(1)), output(5, blinded(2)) };
+            ResponseAPDU begun = transmit(beginCommand(places));
+            assertEquals(SW_OK, begun.getSW(), what);
+            assertEquals(worth, readUint32(begun.getData(), 0), what + ": BEGIN answers what the places are worth, together");
+            assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_SPEND_ALL_OUTPUTS, 0, 0, concat(outputs))), what);
+            ResponseAPDU r = transmit(SIGN_ALL);
+            assertEquals(SW_OK, r.getSW(), what);
+            assertEquals(64, r.getData().length, what + ": a signature, and no wait: there is no limit on a payment");
+            byte[] sig = r.getData();
+            assertTrue(signedForAll(sig, named, outputs, REFUND), what + ": signed over secret and C of every place named, in order, and then the outputs");
+            byte[][] swapped = named.clone();
+            swapped[0] = named[n - 1];
+            swapped[n - 1] = named[0];
+            assertFalse(signedForAll(sig, swapped, outputs, REFUND), what + ": in the order named");
+            assertFalse(signedForAll(sig, Arrays.copyOf(named, 32), outputs, REFUND), what + ": and not the first 32 alone");
+            assertEquals(SW_CONDITIONS_NOT_SATIS, sw(SIGN_ALL), what + ": one signature for one beginning");
+            // every place named is burned, and no other
+            byte[] status = transmit(new CommandAPDU(CLA, INS_GET_SLOT_STATUS, 0, 0, 256)).getData();
+            for (int p = 0; p < 128; p++) assertEquals(burned[p] ? 2 : 1, status[p], what + ": place " + p);
+            assertEquals(8256 - worth, balance(), what);
+            byte[] d = info();
+            assertEquals(128 - n, d[3] & 0xFF, what + ": unspent");
+            assertEquals(n, d[4] & 0xFF, what + ": spent");
+            assertEquals(0, d[5] & 0xFF, what + ": empty");
+            assertArrayEquals(new long[] { T0, worth, n, 0, 0 }, logTap(0), what + ": the log's entry: the sats and the number of pieces, a byte");
+            assertArrayEquals(new long[] { 128, 8256 }, logLoaded(0), what + ": beside what was put on");
+            assertEquals(SW_OK, allowLoad());
+            Held held = heldReceipts();
+            assertEquals(1, held.count, what + ": a receipt");
+            assertArrayEquals(receiptFor(T0, worth, named, outputs), held.receipts.get(0), what + ": of that payment");
+            assertEquals(SW_OK, verify(TEST_PIN));
+            ResponseAPDU again = transmit(new CommandAPDU(CLA, INS_SPEND_ALL_AGAIN, 0, 0, 64));
+            assertEquals(SW_OK, again.getSW(), what);
+            assertArrayEquals(sig, again.getData(), what + ": SPEND_ALL_AGAIN gives that signature again");
+            assertEquals(SW_OK, allowLoad());
+            assertEquals(1, heldReceipts().count, what + ": and that is not a payment");
+            if (n == 128) {
+                // a second payment of all 128 in the same tap: the pieces count stops at 255, the sats add up
+                assertEquals(SW_OK, clearSpent());
+                loadMany(128, i -> buildProof(KEYSET, 1 + i, i + 1));
+                ResponseAPDU second = spendAll(places, new byte[0][]);
+                assertEquals(SW_OK, second.getSW());
+                assertArrayEquals(new long[] { T0, 2 * worth, 255, 0, 0 }, logTap(0), "128 and 128 pieces in one tap are 255, the most a byte holds");
+                assertArrayEquals(new long[] { 255, 2 * 8256 }, logLoaded(0), "as the pieces put on");
+                assertEquals(2 * worth, logSats());
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("More than 128 bytes to SPEND_ALL_BEGIN is 6A96 whatever they say (before the places are looked at), burns nothing and begins no payment: 129, 130, 200 and 255 bytes; 128 are a payment")
+    void testMoreThan128PlacesIsTooMany() {
+        ready();
+        loadMany(128, i -> buildProof(KEYSET, 1 + i, i + 1));
+        for (int len : new int[] { 129, 130, 200, 255 }) {
+            byte[] places = new byte[len];
+            for (int k = 0; k < len; k++) places[k] = (byte) (k % 128);
+            // 255 bytes with an Le byte after them is more than jCardSim's buffer takes (it answers 6F00, as it does for GET_PIECES P2 = 2): no Le there
+            ResponseAPDU r = transmit(len == 255 ? new CommandAPDU(CLA, INS_SPEND_ALL_BEGIN, 0, 0, places) : new CommandAPDU(CLA, INS_SPEND_ALL_BEGIN, 0, 0, places, 4));
+            assertEquals(SW_TOO_MANY, r.getSW(), len + " bytes");
+            assertEquals(0, r.getData().length, len + " bytes");
+            assertEquals(SW_CONDITIONS_NOT_SATIS, sw(SIGN_ALL), len + " bytes: no payment is begun");
+            assertEquals(128, info()[3] & 0xFF, len + " bytes: nothing burned");
+            assertEquals(8256, balance());
+        }
+        // not even places that are not places: the count is looked at first
+        byte[] nonsense = new byte[129];
+        Arrays.fill(nonsense, (byte) 200);
+        assertEquals(SW_TOO_MANY, sw(new CommandAPDU(CLA, INS_SPEND_ALL_BEGIN, 0, 0, nonsense, 4)));
+        // 128 are a payment
+        int[] all = new int[128];
+        for (int i = 0; i < 128; i++) all[i] = i;
+        ResponseAPDU r = spendAll(all, new byte[0][]);
+        assertEquals(SW_OK, r.getSW());
+        assertEquals(0, balance());
+        assertEquals(128, info()[4] & 0xFF);
+    }
+
+    @Test
+    @DisplayName("The checks hold for every place named, however far down the list: a place named twice, a spent one, an empty one, one that is not a place (128), and one of another date, at the 41st or the 100th place of the list, each refused with its own word and nothing burned")
+    void testTheChecksHoldForEveryPlaceNamedUpTo128() {
+        ready();
+        // places 0 to 125 hold pieces; 125 is dated; 124 is paid; 126 and 127 are empty
+        loadMany(126, i -> buildProof(KEYSET, 1 + i, i + 1, i == 125 ? 1900000000L : 0));
+        assertEquals(SW_OK, spend(124).getSW());
+        assertEquals(125, info()[3] & 0xFF);
+        Object[][] cases = {
+            { "a place named twice", 5, SW_WRONG_DATA },
+            { "a spent place", 124, SW_CONDITIONS_NOT_SATIS },
+            { "an empty place", 126, SW_SLOT_EMPTY },
+            { "a place that is not one", 128, SW_SLOT_OUT_OF_RANGE },
+            { "a piece of another date", 125, SW_WRONG_DATA },
+        };
+        for (int at : new int[] { 40, 99 }) {
+            for (Object[] c : cases) {
+                int[] named = new int[100];
+                for (int i = 0; i < 100; i++) named[i] = i;
+                named[at] = (Integer) c[1];
+                assertEquals((int) (Integer) c[2], sw(beginCommand(named)), c[0] + " at the " + (at + 1) + "th of a hundred");
+                assertEquals(SW_CONDITIONS_NOT_SATIS, sw(SIGN_ALL), c[0] + ": no payment is begun");
+                assertEquals(125, info()[3] & 0xFF, c[0] + ": nothing burned");
+            }
+        }
+        // and a hundred good ones are a payment
+        int[] good = new int[100];
+        for (int i = 0; i < 100; i++) good[i] = i;
+        assertEquals(SW_OK, spendAll(good, new byte[0][]).getSW());
+        assertEquals(25, info()[3] & 0xFF);
+    }
+
+    @Test
+    @DisplayName("A payment of 128 pieces that is over the limit on one payment waits as its sum says (1280 under 100: 12 limits past the first, 48 answers of 00 01) and burns nothing until the last SPEND_ALL_SIGN, which gives the one signature and burns all 128 at once")
+    void testAPaymentOf128PlacesWaitsAsItsSumSays() throws Exception {
+        readyWithLimit(0);
+        assertEquals(SW_OK, setLimits(0, 100));
+        byte[][] sent = loadMany(128, i -> buildProof(KEYSET, 10, i + 1));
+        newTap();
+        int[] all = new int[128];
+        byte[][] named = new byte[128][];
+        for (int i = 0; i < 128; i++) { all[i] = i; named[i] = asSlot(sent[i]); }
+        byte[] storage = field("proofStorage").clone();
+        ResponseAPDU begun = transmit(beginCommand(all));
+        assertEquals(SW_OK, begun.getSW());
+        assertEquals(1280, readUint32(begun.getData(), 0));
+        for (int k = 1; k <= 48; k++) {
+            assertNotYet(transmit(SIGN_ALL), "wait " + k + " of 48");
+            assertArrayEquals(storage, field("proofStorage"), "nothing burned in wait " + k);
+        }
+        ResponseAPDU sig = transmit(SIGN_ALL);
+        assertEquals(SW_OK, sig.getSW());
+        assertEquals(64, sig.getData().length, "the one signature, after the 48th");
+        assertTrue(signedForAll(sig.getData(), named, new byte[0][], REFUND));
+        for (int p = 0; p < 128; p++) assertEquals(2, slot(p)[0], "place " + p + " is burned by the last SIGN");
+        assertArrayEquals(new long[] { T0, 1280, 128, 0, 2 }, logTap(0), "128 pieces, 1280 sats, and the flag that it was waited for");
+        // a limit lower or higher: the wait is as the sum says
+        for (long[] c : new long[][] { { 1280, 0 }, { 1279, 4 }, { 640, 4 }, { 639, 8 }, { 10, 4 * 127 } }) {
+            assertEquals((int) c[1], payWaitsOf128(c[0]), "1280 under a limit of " + c[0]);
+        }
+    }
+
+    @Test
+    @DisplayName("A payment's wait is its own sum's and nothing left over from the one before it in the same tap: two payments of 64 places of 10 under a limit on one payment of 500 are each 640, one limit past the first, 4 answers of 00 01 each")
+    void testAPaymentWaitsForItsOwnSumNotForTheOneBefore() throws Exception {
+        readyWithLimit(0);
+        assertEquals(SW_OK, setLimits(0, 500));
+        loadMany(128, i -> buildProof(KEYSET, 10, i + 1));
+        newTap();
+        int[] firstHalf = new int[64], secondHalf = new int[64];
+        for (int i = 0; i < 64; i++) { firstHalf[i] = i; secondHalf[i] = 64 + i; }
+        ResponseAPDU a = spendAll(firstHalf, new byte[0][]);
+        assertEquals(SW_OK, a.getSW());
+        assertEquals(64, a.getData().length, "the first payment's one signature");
+        assertEquals(4, waitsTaken(), "640 under 500: one limit past the first, 4 signatures' worth of waiting");
+        ResponseAPDU b = spendAll(secondHalf, new byte[0][]);
+        assertEquals(SW_OK, b.getSW());
+        assertEquals(64, b.getData().length, "the second payment's one signature");
+        assertEquals(4, waitsTaken(), "the second is waited for by its own sum, as the first was, in the same tap");
+        assertEquals(0, balance());
+        // and a small one after a large one is not made to wait for the large one's count of places
+        simulator = freshCard();
+        readyWithLimit(0);
+        assertEquals(SW_OK, setLimits(0, 500));
+        loadMany(128, i -> buildProof(KEYSET, 10, i + 1));
+        newTap();
+        int[] big = new int[100];
+        for (int i = 0; i < 100; i++) big[i] = i;
+        assertEquals(SW_OK, spendAll(big, new byte[0][]).getSW());
+        assertEquals(4, waitsTaken(), "1000 under 500: one limit past the first");
+        assertEquals(SW_OK, spendAll(new int[] { 100, 101 }, new byte[0][]).getSW());
+        assertEquals(0, waitsTaken(), "20 sats is under the limit: no waiting");
+    }
+
+    /** A full card of 128 pieces of 10, under a limit on one payment of `limit`, paid all at once: how many waits. */
+    private int payWaitsOf128(long limit) throws Exception {
+        simulator = freshCard();
+        readyWithLimit(0);
+        assertEquals(SW_OK, setLimits(0, limit));
+        loadMany(128, i -> buildProof(KEYSET, 10, i + 1));
+        newTap();
+        int[] all = new int[128];
+        for (int i = 0; i < 128; i++) all[i] = i;
+        ResponseAPDU r = spendAll(all, new byte[0][]);
+        assertEquals(SW_OK, r.getSW());
+        assertEquals(64, r.getData().length);
+        assertEquals(0, balance());
+        return waitsTaken();
+    }
+
+    @Test
+    @DisplayName("The day's limit is charged the whole sum of the places named: 128 pieces of 10 are 1280, refused (6A8F, nothing burned) under a day of 1000, the first hundred are exactly 1000 and go, one more is refused, and a day of 1280 takes all 128 and counts 1280")
+    void testTheDaysLimitIsChargedTheWholeSumOfManyPlaces() {
+        readyWithLimit(1000);
+        loadMany(128, i -> buildProof(KEYSET, 10, i + 1));
+        newTap();
+        int[] all = new int[128], hundred = new int[100];
+        for (int i = 0; i < 128; i++) all[i] = i;
+        for (int i = 0; i < 100; i++) hundred[i] = i;
+        assertEquals(SW_OVER_LIMIT, sw(beginCommand(all)), "1280 is over a day of 1000");
+        assertEquals(SW_CONDITIONS_NOT_SATIS, sw(SIGN_ALL));
+        assertEquals(128, info()[3] & 0xFF, "nothing burned");
+        assertEquals(1, logRefused(), "written down once, for the one payment");
+        assertEquals(SW_OK, spendAll(hundred, new byte[0][]).getSW(), "100 pieces are 1000, the limit exactly");
+        assertEquals(1000, spentToday(), "charged the whole sum");
+        assertEquals(SW_OVER_LIMIT, sw(beginCommand(100)), "and one piece more is over");
+        assertEquals(28, info()[3] & 0xFF);
+        // a day of 1280 takes all 128
+        simulator = freshCard();
+        readyWithLimit(1280);
+        loadMany(128, i -> buildProof(KEYSET, 10, i + 1));
+        newTap();
+        ResponseAPDU r = spendAll(all, new byte[0][]);
+        assertEquals(SW_OK, r.getSW());
+        assertEquals(1280, spentToday());
+        assertEquals(0, balance());
+    }
+
+    @Test
+    @DisplayName("A payment of 128 places with the card pulled before SPEND_ALL_SIGN burns nothing: the SIGN that follows is 6985, every place is still unspent, the log, the receipts and the last signature are as they were; and the payment begun again goes through")
+    void testAPaymentOf128PlacesWithTheCardPulledBurnsNothing() throws Exception {
+        ready();
+        loadMany(128, i -> buildProof(KEYSET, 1 + i, i + 1));
+        int[] all = new int[128];
+        for (int i = 0; i < 128; i++) all[i] = i;
+        byte[] storage = field("proofStorage").clone(), receipts = field("cardReceipts").clone(), cardLog = field("cardLog").clone(), lastSig = field("lastSig").clone();
+        assertEquals(SW_OK, sw(beginCommand(all)));
+        assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_SPEND_ALL_OUTPUTS, 0, 0, output(9, blinded(3)))));
+        simulator.reset();
+        reselect();
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_CONDITIONS_NOT_SATIS, sw(SIGN_ALL), "the payment went with the power");
+        assertArrayEquals(storage, field("proofStorage"));
+        assertArrayEquals(receipts, field("cardReceipts"));
+        assertArrayEquals(cardLog, field("cardLog"));
+        assertArrayEquals(lastSig, field("lastSig"));
+        assertEquals(8256, balance());
+        // begun again, it is a payment
+        ResponseAPDU r = spendAll(all, new byte[][] { output(9, blinded(3)) });
+        assertEquals(SW_OK, r.getSW());
+        assertEquals(0, balance());
+    }
+
+    @Test
+    @DisplayName("A transaction that cannot be begun at the burn (jCardSim can leave one in progress; a card whose commit buffer is full throws the same TransactionException) is 6A96, nothing burned, no signature sent and no receipt, the card still works, and the payment begun again is a payment")
+    void testAFailedBurnIs6A96AndBurnsNothing() throws Exception {
+        ready();
+        loadMany(128, i -> buildProof(KEYSET, 1 + i, i + 1));
+        int[] all = new int[128];
+        for (int i = 0; i < 128; i++) all[i] = i;
+        byte[] storage = field("proofStorage").clone(), receipts = field("cardReceipts").clone(), cardLog = field("cardLog").clone(), lastSig = field("lastSig").clone();
+        assertEquals(SW_OK, sw(beginCommand(all)));
+        runtime.leaveATransactionOpen();        // the applet's own beginTransaction at the burn now throws TransactionException
+        ResponseAPDU r = transmit(SIGN_ALL);
+        assertEquals(SW_TOO_MANY, r.getSW(), "the terminal names fewer");
+        assertEquals(0, r.getData().length, "and no signature leaves the card");
+        assertEquals(0, runtime.getTransactionDepth(), "the card is out of the transaction it was left in");
+        assertArrayEquals(storage, field("proofStorage"), "nothing burned");
+        assertArrayEquals(receipts, field("cardReceipts"), "no receipt");
+        assertArrayEquals(cardLog, field("cardLog"), "nothing in the log");
+        assertArrayEquals(lastSig, field("lastSig"), "no signature kept");
+        assertEquals(SW_CONDITIONS_NOT_SATIS, sw(SIGN_ALL), "the payment is over");
+        assertEquals(8256, balance());
+        // fewer, and then all of them, once the card can
+        ResponseAPDU again = spendAll(all, new byte[0][]);
+        assertEquals(SW_OK, again.getSW());
+        assertEquals(0, balance());
+    }
+
+    @Test
+    @DisplayName("The burn is one transaction of every place named, whatever their number: ALL_MOST is MAX_PROOFS (128) and allSlots is that long; the count is looked at before the places are copied; the answer to a transaction that cannot be had is 6A96 after an abort, and the signature is sent after it")
+    void testTheBurnIsOneTransactionOfEveryPlaceNamed() throws Exception {
+        assertEquals(128, CashuApplet.ALL_MOST);
+        assertEquals(CashuApplet.MAX_PROOFS, CashuApplet.ALL_MOST);
+        String code = appletCode();
+        assertTrue(code.contains("allSlots        = JCSystem.makeTransientByteArray(ALL_MOST, JCSystem.CLEAR_ON_DESELECT)"), "RAM for every place the card has");
+        String begin = body(code, "private void processSpendAllBegin(", "private void processSpendAllOutputs(");
+        assertTrue(begin.indexOf("if (n > ALL_MOST) ISOException.throwIt(SW_TOO_MANY);") > 0
+            && begin.indexOf("if (n > ALL_MOST) ISOException.throwIt(SW_TOO_MANY);") < begin.indexOf("arrayCopyNonAtomic(buf, ISO7816.OFFSET_CDATA, allSlots"),
+            "more than that is refused before the places are copied");
+        assertTrue(begin.contains("allState[1] = (byte) n;"));
+        String sign = body(code, "private void processSpendAllSign(", "private void processSpendAllAgain(");
+        assertTrue(sign.contains("short n = (short)(allState[1] & 0xFF);"), "128 is read as 128, and not as a negative byte");
+        assertEquals(2, count(sign, "beginTransaction"), "the burn's and the receipt's");
+        int tryAt = sign.indexOf("try {");
+        int begins = sign.indexOf("JCSystem.beginTransaction();", tryAt);
+        int loop = sign.indexOf("for (short i = 0; i < n; i++) {", begins);
+        int commit = sign.indexOf("JCSystem.commitTransaction();", loop);
+        int caught = sign.indexOf("} catch (TransactionException e) {", commit);
+        int abort = sign.indexOf("JCSystem.abortTransaction();", caught);
+        int refused = sign.indexOf("ISOException.throwIt(SW_TOO_MANY);", abort);
+        int answer = sign.lastIndexOf("apdu.setOutgoingAndSend((short) 0, sigLen);");
+        assertTrue(tryAt > 0 && tryAt < begins && begins < loop && loop < commit && commit < caught && caught < abort && abort < refused && refused < answer,
+            "every place is burned in the one transaction, and a transaction that fails is aborted and refused, before the signature is answered");
+        assertFalse(sign.substring(caught, refused).contains("setOutgoingAndSend"), "and nothing is answered in between");
     }
 
     @Test
@@ -1444,44 +2345,40 @@ class CashuAppletTest {
     }
 
     @Test
-    @DisplayName("A card with room for only one or two of three stores those and answers their places (9000); the rest, sent alone, is 6A84; a full card answers 6A84 whatever it is sent")
+    @DisplayName("A card with room for only one or two of three stores those and answers their places (9000); the rest, sent alone, is 6A84; a full card of 128 answers 6A84 whatever it is sent")
     void testABatchOnACardThatIsNearlyFull() {
         ready();
-        for (int at = 0; at < 61; at += 3) {
-            byte[][] group = new byte[Math.min(3, 61 - at)][];
-            for (int j = 0; j < group.length; j++) group[j] = buildProof(KEYSET, 1 + at + j, at + j + 1);
-            assertEquals(SW_OK, loadBatch(group).getSW());
-        }
-        assertEquals(61, info()[3]);
+        loadMany(125, i -> buildProof(KEYSET, 1 + i, i + 1));
+        assertEquals(125, info()[3] & 0xFF);
         // room for three
-        ResponseAPDU three = loadBatch(buildProof(KEYSET, 1, 101), buildProof(KEYSET, 1, 102), buildProof(KEYSET, 1, 103));
-        assertArrayEquals(new byte[] { 61, 62, 63 }, three.getData(), "exactly full");
-        assertEquals(64, info()[3]);
+        ResponseAPDU three = loadBatch(buildProof(KEYSET, 1, 1001), buildProof(KEYSET, 1, 1002), buildProof(KEYSET, 1, 1003));
+        assertArrayEquals(new byte[] { 125, 126, 127 }, three.getData(), "exactly full");
+        assertEquals(128, info()[3] & 0xFF);
         // a full card says so whatever it is sent: a batch, one piece, and data that is not a piece at all
-        assertEquals(SW_NO_SPACE, loadBatch(buildProof(KEYSET, 1, 104), buildProof(KEYSET, 1, 105), buildProof(KEYSET, 1, 106)).getSW());
-        assertEquals(SW_NO_SPACE, load(buildProof(KEYSET, 1, 107)).getSW());
+        assertEquals(SW_NO_SPACE, loadBatch(buildProof(KEYSET, 1, 1004), buildProof(KEYSET, 1, 1005), buildProof(KEYSET, 1, 1006)).getSW());
+        assertEquals(SW_NO_SPACE, load(buildProof(KEYSET, 1, 1007)).getSW());
         assertEquals(SW_NO_SPACE, loadRaw(new byte[80]).getSW(), "before the data is looked at");
         assertEquals(SW_NO_SPACE, loadRaw(new byte[0]).getSW(), "even none");
 
         // room for two of three
         simulator = freshCard();
         ready();
-        for (int i = 0; i < 62; i++) assertEquals(SW_OK, load(buildProof(KEYSET, 1, i + 1)).getSW());
-        byte[] x = buildProof(KEYSET, 1, 201), y = buildProof(KEYSET, 2, 202), z = buildProof(KEYSET, 4, 203);
+        loadMany(126, i -> buildProof(KEYSET, 1 + i, i + 1));
+        byte[] x = buildProof(KEYSET, 1, 2001), y = buildProof(KEYSET, 2, 2002), z = buildProof(KEYSET, 4, 2003);
         ResponseAPDU two = loadBatch(x, y, z);
         assertEquals(SW_OK, two.getSW());
-        assertArrayEquals(new byte[] { 62, 63 }, two.getData(), "two of three");
-        assertEquals(64, info()[3]);
+        assertArrayEquals(new byte[] { 126, 127 }, two.getData(), "two of three");
+        assertEquals(128, info()[3] & 0xFF);
         assertEquals(SW_NO_SPACE, load(z).getSW(), "the third, alone, hears why");
 
         // room for one of three
         simulator = freshCard();
         ready();
-        for (int i = 0; i < 63; i++) assertEquals(SW_OK, load(buildProof(KEYSET, 1, i + 1)).getSW());
+        loadMany(127, i -> buildProof(KEYSET, 1 + i, i + 1));
         ResponseAPDU one = loadBatch(x, y, z);
         assertEquals(SW_OK, one.getSW());
-        assertArrayEquals(new byte[] { 63 }, one.getData(), "one of three");
-        assertArrayEquals(asSlot(x), slot(63));
+        assertArrayEquals(new byte[] { 127 }, one.getData(), "one of three");
+        assertArrayEquals(asSlot(x), slot(127));
         assertEquals(SW_NO_SPACE, load(y).getSW());
         // the refusal of a later piece for want of room is a piece's, not the command's: with a place freed, they go on
         assertEquals(SW_OK, spend(0).getSW());
@@ -1783,7 +2680,7 @@ class CashuAppletTest {
         seen.add(bytesOf(transmit(new CommandAPDU(CLA, INS_GET_CARD, 0, 0, 256))));
         seen.add(bytesOf(transmit(new CommandAPDU(CLA, INS_GET_SLOT_STATUS, 0, 0, 256))));
         seen.add(bytesOf(transmit(new CommandAPDU(CLA, INS_GET_PIECES, 0, 0, 256))));
-        seen.add(bytesOf(transmit(new CommandAPDU(CLA, INS_GET_PIECES, 0, 1, 256))));
+        seen.add(bytesOf(transmit(new CommandAPDU(CLA, INS_GET_PIECES, 0, 3, 256))));
         seen.add(bytesOf(transmit(new CommandAPDU(CLA, INS_GET_PIECES, 0, 2, new byte[] { 0, 1, 2 }, 256))));
         seen.add(bytesOf(transmit(new CommandAPDU(CLA, INS_GET_PROOF, 1, 0, 256))));
         seen.add(bytesOf(transmit(new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4))));
@@ -1805,7 +2702,7 @@ class CashuAppletTest {
         int[] a = new int[1], b = new int[1];
         java.util.List<byte[]> seenA = whatATerminalSees(100, a);
         java.util.List<byte[]> seenB = whatATerminalSees(150, b);
-        String[] names = { "GET_INFO", "GET_INFO P1=1", "GET_CARD", "GET_SLOT_STATUS", "GET_PIECES", "GET_PIECES brief", "GET_PIECES some", "GET_PROOF", "GET_BALANCE",
+        String[] names = { "GET_INFO", "GET_INFO P1=1", "GET_CARD", "GET_SLOT_STATUS", "GET_PIECES", "GET_PIECES short", "GET_PIECES some", "GET_PROOF", "GET_BALANCE",
                            "GET_PROOF_COUNT", "GET_LOG", "GET_LOG receipts (refused under the PIN)", "SPEND_ALL_BEGIN's answer", "the first SPEND_ALL_SIGN's answer" };
         assertEquals(names.length, seenA.size());
         for (int i = 0; i < names.length; i++) {
@@ -2019,18 +2916,18 @@ class CashuAppletTest {
     }
 
     @Test
-    @DisplayName("GET_PIECES with a P2 other than 0, 1 or 2 is refused (the applet's word is 6A86, ISO7816.SW_INCORRECT_P1P2) and not answered as the whole listing; 0, 1 and 2 are as they were")
+    @DisplayName("GET_PIECES with a P2 other than 0, 2 or 3 is refused (the applet's word is 6A86, ISO7816.SW_INCORRECT_P1P2) and not answered as the whole listing: 1, the brief listing of the sixty-four-place card, among them; 0, 2 and 3 are answered")
     void testGetPiecesRefusesAFormItDoesNotHave() {
         ready();
         assertEquals(SW_OK, load(buildProof(KEYSET, 5, 1)).getSW());
-        for (int p2 : new int[] { 3, 4, 5, 0x10, 0x7f, 0x80, 0xff }) {
+        for (int p2 : new int[] { 1, 4, 5, 0x10, 0x7f, 0x80, 0xff }) {
             ResponseAPDU r = transmit(new CommandAPDU(CLA, INS_GET_PIECES, 0, p2, 256));
             assertEquals(SW_INCORRECT_P1P2, r.getSW(), "P2 = " + p2);
             assertEquals(0, r.getData().length);
             assertEquals(SW_INCORRECT_P1P2, transmit(new CommandAPDU(CLA, INS_GET_PIECES, 0, p2, new byte[] { 0 }, 256)).getSW(), "P2 = " + p2 + " with data");
         }
         assertEquals(SW_OK, pieces(0).getSW());
-        assertEquals(SW_OK, briefPieces(0).getSW());
+        assertEquals(SW_OK, shortPieces(0).getSW());
         assertEquals(SW_OK, somePieces(new byte[] { 0 }).getSW());
     }
 
@@ -4542,13 +5439,13 @@ class CashuAppletTest {
     }
 
     @Test
-    @DisplayName("GET_INFO: byte 1 is 6 and byte 6 is 1F, and bytes 34..41 asked for with P1 = 1 are zero, as is the record behind them, however the limit on a payment has been used; nothing ever answers 6A95")
+    @DisplayName("GET_INFO: byte 1 is 7 and byte 6 is 3F, and bytes 34..41 asked for with P1 = 1 are zero, as is the record behind them, however the limit on a payment has been used; nothing ever answers 6A95")
     void testTheCardRemembersNothingOfThePaymentLimit() throws Exception {
         readyWithLimit(0);
         byte[] more = infoTap();
         assertEquals(1, more[0]);
-        assertEquals(6, more[1], "version 1.6");
-        assertEquals(0x1F, more[6], "capabilities 1F: the limit on one payment is waited for, not refused, and the 1.6 forms are there");
+        assertEquals(7, more[1], "version 1.7");
+        assertEquals(0x3F, more[6], "capabilities 3F: the limit on one payment is waited for, not refused, the 1.6 forms are there, and so are 128 places with the short listing");
         assertEquals(SW_OK, setLimits(1000, 100));
         assertEquals(100, paymentLimit());
         assertNothingRemembered("a limit set");
@@ -4768,26 +5665,33 @@ class CashuAppletTest {
     @DisplayName("What a payment may name: each place once, holding an unspent piece, all of one date, no more than thirty-two; a refusal burns nothing")
     void testWhatAPaymentMayName() {
         ready();
-        for (int i = 0; i < 34; i++) assertEquals(SW_OK, load(buildProof(KEYSET, 1, i + 1, i == 33 ? 1900000000L : 0)).getSW());
+        for (int i = 0; i < 35; i++) assertEquals(SW_OK, load(buildProof(KEYSET, 1, i + 1, i == 33 ? 1900000000L : 0)).getSW());
         assertEquals(SW_OK, spend(5).getSW());
         assertEquals(0x6700, sw(new CommandAPDU(CLA, INS_SPEND_ALL_BEGIN, 0, 0, 4)), "none");
         assertEquals(0x6A80, sw(beginCommand(0, 1, 0)), "a place named twice");
         assertEquals(0x6985, sw(beginCommand(0, 5)), "a spent one");
         assertEquals(SW_SLOT_EMPTY, sw(beginCommand(0, 40)), "an empty one");
-        assertEquals(SW_SLOT_OUT_OF_RANGE, sw(beginCommand(0, 64)), "one that is not a place");
+        assertEquals(SW_SLOT_OUT_OF_RANGE, sw(beginCommand(0, 128)), "one that is not a place: 64 is one now");
         assertEquals(0x6A80, sw(beginCommand(0, 33)), "pieces of two dates: their lock conditions differ, and a mint takes no one signature for them");
+        // thirty-three places, one of them the dated one: refused for the date, as two places would be
         int[] many = new int[33];
         for (int i = 0; i < 33; i++) many[i] = i < 5 ? i : i + 1;
-        assertEquals(SW_TOO_MANY, sw(beginCommand(many)), "thirty-three");
-        assertEquals(33, balance(), "none of which burned anything");
+        assertEquals(0x6A80, sw(beginCommand(many)), "thirty-three places, the last of another date");
+        // more than every place the card has is too many, however few of them are good
+        byte[] hundred29 = new byte[129];
+        for (int i = 0; i < 129; i++) hundred29[i] = (byte) (i % 35);
+        assertEquals(SW_TOO_MANY, sw(new CommandAPDU(CLA, INS_SPEND_ALL_BEGIN, 0, 0, hundred29, 4)), "129 places");
+        assertEquals(34, balance(), "none of which burned anything");
         assertEquals(0x6985, sw(SIGN_ALL), "or left a payment begun");
-        // thirty-two is a payment
-        int[] most = Arrays.copyOf(many, 32);
-        ResponseAPDU r = spendAll(most, new byte[0][]);
+        // thirty-three places of one date is a payment now: places 0 to 4, 6 to 32 and 34
+        int[] thirtyThree = new int[33];
+        for (int i = 0; i < 32; i++) thirtyThree[i] = i < 5 ? i : i + 1;
+        thirtyThree[32] = 34;
+        ResponseAPDU r = spendAll(thirtyThree, new byte[0][]);
         assertEquals(SW_OK, r.getSW());
         assertEquals(64, r.getData().length);
-        assertEquals(1, balance(), "thirty-two burned at once");
-        assertEquals(32 + 1, logTap(0)[2], "and the log has them, with the one before");
+        assertEquals(1, balance(), "thirty-three burned at once, and the dated piece is left");
+        assertEquals(33 + 1, logTap(0)[2], "and the log has them, with the one before");
     }
 
     @Test
@@ -5777,11 +6681,11 @@ class CashuAppletTest {
         say(out, "every slot's state", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_SLOT_STATUS, 0, 0, 256));
         say(out, "every piece and every slot's state: the first page", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PIECES, 0, 0, 256));
         say(out, "and the second, from where the first stopped", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PIECES, 3, 0, 256));
-        say(out, "and from a slot there is not", "exact", SW_SLOT_OUT_OF_RANGE, new CommandAPDU(CLA, INS_GET_PIECES, 64, 0, 256));
+        say(out, "and from a slot there is not: 128", "exact", SW_SLOT_OUT_OF_RANGE, new CommandAPDU(CLA, INS_GET_PIECES, 128, 0, 256));
         say(out, "slot 0", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PROOF, 0, 0, 256));
         say(out, "slot 1", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PROOF, 1, 0, 256));
         say(out, "an empty slot", "exact", SW_SLOT_EMPTY, new CommandAPDU(CLA, INS_GET_PROOF, 9, 0, 256));
-        say(out, "a slot there is not", "exact", SW_SLOT_OUT_OF_RANGE, new CommandAPDU(CLA, INS_GET_PROOF, 64, 0, 256));
+        say(out, "a slot there is not: 128", "exact", SW_SLOT_OUT_OF_RANGE, new CommandAPDU(CLA, INS_GET_PROOF, 128, 0, 256));
         say(out, "the balance", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4));
         say(out, "how many slots are in use", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PROOF_COUNT, 0, 0, 1));
         saySpend(out, "2000 is over the limit by itself", SW_OVER_LIMIT, 3);
@@ -6003,16 +6907,49 @@ class CashuAppletTest {
         say(out, "a batch whose first piece is refused is refused with that word, and stores nothing", "exact", SW_WRONG_DATA,
             new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, concat(notAPoint, buildProof(KEYSET, 2, 54)), 3));
         say(out, "a batch of 82 bytes is not pieces", "exact", SW_WRONG_LENGTH, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, new byte[82], 3));
-        say(out, "the brief listing: a tag, then the keyset, the amount and the date of each unspent place", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PIECES, 0, 1, 256));
-        say(out, "the brief listing from the second place", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PIECES, 1, 1, 256));
-        say(out, "the brief listing from a place there is not", "exact", SW_SLOT_OUT_OF_RANGE, new CommandAPDU(CLA, INS_GET_PIECES, 64, 1, 256));
+        say(out, "the short listing: the first entry names its keyset and date, the rest are a place and a size", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PIECES, 0, 3, 256));
+        say(out, "the short listing from the second place: it begins with the twelve bytes again", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PIECES, 1, 3, 256));
+        say(out, "the short listing from a place there is not", "exact", SW_SLOT_OUT_OF_RANGE, new CommandAPDU(CLA, INS_GET_PIECES, 128, 3, 256));
         say(out, "two places, whole, in the order asked: the second and the first", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PIECES, 0, 2, new byte[] { 1, 0 }, 256));
         say(out, "four places are too many", "exact", SW_WRONG_LENGTH, new CommandAPDU(CLA, INS_GET_PIECES, 0, 2, new byte[] { 0, 1, 2, 3 }, 256));
-        say(out, "a place there is not", "exact", SW_SLOT_OUT_OF_RANGE, new CommandAPDU(CLA, INS_GET_PIECES, 0, 2, new byte[] { 0, 64 }, 256));
+        say(out, "a place there is not", "exact", SW_SLOT_OUT_OF_RANGE, new CommandAPDU(CLA, INS_GET_PIECES, 0, 2, new byte[] { 0, (byte) 128 }, 256));
         sayPay(out, "pay the undated pieces together", SW_OK, 0, 0, 2, 3);
         saySpend(out, "and the dated one alone", SW_OK, 1);
         say(out, "CLEAR_SPENT: the card is empty again", "exact", SW_OK, clear);
-        say(out, "and the brief listing is one byte", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PIECES, 0, 1, 256));
+        say(out, "and the short listing is one byte: 128, nothing more to ask for", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PIECES, 0, 3, 256));
+
+        /* version 1.7: a hundred and twenty-eight places, and the short listing. Sixty-six pieces are put on (three to a command), so that
+         * places 64 and 65 are used; one of them is paid, which makes a spent tag above 63; the listings are read; and everything is paid and
+         * freed again at the end, so that the card is empty for what follows. Piece i is worth 2^(i mod 8), except piece 20, worth 1000
+         * (no power of two); piece 10 is of another keyset, and piece 30 has a date, so that the short listing names them. */
+        byte[][] deep = new byte[66][];
+        for (int i = 0; i < 66; i++) deep[i] = buildProof(i == 10 ? KEYSET_B : KEYSET, i == 20 ? 1000 : 1L << (i % 8), 200 + i, i == 30 ? 1900000000L : 0);
+        for (int at = 0; at < 66; at += 3) {
+            say(out, "three pieces put on, places " + at + " to " + (at + 2), "exact", SW_OK, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, concat(deep[at], deep[at + 1], deep[at + 2]), 3));
+        }
+        say(out, "the info: 66 unspent, none spent, 62 empty, of 128 places", "exact", SW_OK, info);
+        say(out, "the whole listing from place 63: a tag is the place's number, and 0x80 where it is spent; places 63, 64 and 65, and the end is 128", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PIECES, 63, 0, 256));
+        saySpend(out, "a piece above 63 is paid", SW_OK, 65);
+        say(out, "the whole listing from place 63 again: 65 is a spent tag, 0xC1", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PIECES, 63, 0, 256));
+        say(out, "the short listing from the first place: one answer; places 10, 11, 30 and 31 name a keyset and date, place 20 gives 0xFF and its amount, 65 is spent and not listed", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PIECES, 0, 3, 256));
+        say(out, "the short listing from place 64: it begins with the twelve bytes", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PIECES, 64, 3, 256));
+        say(out, "the short listing from a place past the pieces: the single byte 128", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PIECES, 66, 3, 256));
+        say(out, "the short listing from place 128: there is none", "exact", SW_SLOT_OUT_OF_RANGE, new CommandAPDU(CLA, INS_GET_PIECES, 128, 3, 256));
+        say(out, "the brief listing of the sixty-four-place card is gone", "exact", SW_INCORRECT_P1P2, new CommandAPDU(CLA, INS_GET_PIECES, 0, 1, 256));
+        say(out, "two places by name above 63: 127, which is empty, and 64", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PIECES, 0, 2, new byte[] { 127, 64 }, 256));
+        say(out, "GET_PROOF for place 64", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PROOF, 64, 0, 256));
+        say(out, "GET_PROOF for place 128: there is none", "exact", SW_SLOT_OUT_OF_RANGE, new CommandAPDU(CLA, INS_GET_PROOF, 128, 0, 256));
+        say(out, "a payment may name 128: it is no place", "exact", SW_SLOT_OUT_OF_RANGE, beginCommand(1, 128));
+        sayPay(out, "the dated piece alone", SW_OK, 0, 30);
+        say(out, "129 places named are too many: a payment may name every place the card has, 128, and no more", "exact", SW_TOO_MANY, new CommandAPDU(CLA, INS_SPEND_ALL_BEGIN, 0, 0, new byte[129], 4));
+        int[] sixtyFour = new int[64];
+        for (int i = 0; i < 30; i++) sixtyFour[i] = i;
+        for (int i = 30; i < 64; i++) sixtyFour[i] = i + 1;
+        sayPayWith(out, "sixty-four places in one payment (0 to 29 and 31 to 64, both sides of 63) into two outputs", 0, sixtyFour,
+            new byte[][] { output(70, blinded(81)), output(30, blinded(82)) }, 2);
+        say(out, "the info: 66 spent", "exact", SW_OK, info);
+        say(out, "CLEAR_SPENT: all sixty-six freed at once", "exact", SW_OK, clear);
+        say(out, "and the whole listing is one byte, 128", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PIECES, 0, 0, 256));
 
         /* the limit on one payment is the holder's to read, the log counts what is put on, and the card keeps a receipt of every
          * payment (version 1.6). The card is empty and the PIN is in force. What is done here is undone at its end: the limit is set
@@ -6022,7 +6959,7 @@ class CashuAppletTest {
         say(out, "the info asked for the limit on one payment, under the PIN alone: zeros, as on a card with none", "exact", SW_OK, infoTap);
         say(out, "the receipts are not for the PIN", "exact", SW_SECURITY_NOT_SATIS, receiptsAsked);
         say(out, "a form of GET_LOG there is not", "exact", SW_INCORRECT_P1P2, new CommandAPDU(CLA, INS_GET_LOG, 2, 0, 256));
-        say(out, "a form of GET_PIECES there is not", "exact", SW_INCORRECT_P1P2, new CommandAPDU(CLA, INS_GET_PIECES, 0, 3, 256));
+        say(out, "a form of GET_PIECES there is not", "exact", SW_INCORRECT_P1P2, new CommandAPDU(CLA, INS_GET_PIECES, 0, 4, 256));
         owner(out, "the owner's grant, for this tap", SW_OK, L_LOAD, OWNER, new byte[0], p -> allowLoadCommand(p));
         say(out, "the info with the grant: the limit on one payment", "exact", SW_OK, infoTap);
         say(out, "the receipts with the grant, asked for from 16 back, which is past what the ring holds: the count of every payment ever, alone", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_LOG, 1, 16, 256));

@@ -539,8 +539,9 @@ the other for all it holds; the format byte says which.
 them:
 
 1. `SPEND_ALL_BEGIN` (`22`): the places it is made of, a byte each, in the order
-   the mint will be shown them. The PIN first, as for any spending. One to
-   thirty-two places (`6700` for none, `6A96` for more); each below 64
+   the mint will be shown them. The PIN first, as for any spending. One place
+   or more, as many as the card has (`6700` for none, `6A96` for more; before
+   1.7 it was thirty-two at the most); each a place the card has
    (`6A83`), unspent (`6A88` for an empty place, `6985` for a spent one), named
    once (`6A80`), and of the same date as the first (`6A80`): a mint takes one
    signature only for pieces whose secrets agree in everything but the nonce.
@@ -597,7 +598,10 @@ signature at all (a card with a refund key: its owner's phone takes them back
 after their date, as section 6 of `FOXY-CARD-SPEC.md` has it).
 
 Not yet measured on the chip: how long `BEGIN` takes for thirty-two places
-(it is a few kilobytes of SHA-256) beside the one signature.
+or more (it is a few kilobytes of SHA-256) beside the one signature; nor
+whether the chip's transaction holds the burn of a payment that names all 128.
+Where it does not, `SIGN` answers `6A96` with nothing burned and no signature
+given, and the payment is taken in two parts.
 
 ## 6d. Time on the card
 
@@ -633,6 +637,36 @@ a piece and most of how long it takes.
 Loading is a little slower for a piece than it was (it now writes the hex)
 and quicker in all (a third of the commands). Loading is done by a card's
 holder at home; paying is done at a till.
+
+**Version 1.7: 128 places, and a shorter listing.** A price typed in dollars
+is an odd number of sats, so every payment needs small pieces of its own, and
+a card that is to pay several prices in a row exactly has to hold several of
+every small size: eight each of the eleven sizes from 1 to 1,024 are
+eighty-eight pieces. Sixty-four places did not hold that and the rest of a
+card's money, so there are 128. Three things follow, and nothing the card
+signs or stores for a piece is different:
+
+- **A place's number is seven bits.** The tag of `GET_PIECES` was
+  `(state << 6) | place`; it is now the place, with `0x80` where the place is
+  spent. `next` ends at 128.
+- **The short listing** (`GET_PIECES`, P2 = 3) takes the place of the brief
+  one (P2 = 1, which this card refuses with `6A86`: its tags could not name
+  these places). A till reads what a card holds at every payment, and a deep
+  drawer is a hundred pieces. For each unspent place: the place (1), with
+  `0x80` where its keyset (8) and date (4) follow, which they do in the first
+  entry of every answer and wherever they are not those of the entry before;
+  then the power of two it is worth (1), or `FF` and its amount (4) where it
+  is worth some other amount. Spent and empty places are not listed
+  (`GET_INFO` counts them). A card whose pieces are of one keyset and one date
+  and are powers of two is two bytes a piece after the first: all 128 places
+  in two answers. The answer is gathered and sent at once, where the brief
+  listing sent each entry by itself, which was most of what it took.
+- **A payment may name every place the card has**, where it was thirty-two: a
+  deep drawer holds its money in small pieces, and a payment of most of a
+  small card is many of them. The burn is still one transaction.
+
+Bit 5 of the capabilities byte says a card has more than sixty-four places,
+seven-bit tags and the short listing; `GET_INFO`'s count of places is 128.
 
 ## 7. The owner
 
@@ -739,7 +773,7 @@ or changed from `FOXY-CARD-SPEC.md` 5.2 and the allowance draft.
 | `11` `12` `13` `14` | GET_BALANCE, GET_PROOF_COUNT, GET_PROOF, GET_SLOT_STATUS | | | as before |
 | `15` | AUTH | | 16 random bytes | 16 of the card's own and a signature |
 | `16` | **GET_CARD** | | | format, record set, unit, limit (4), refund key (33), time key (65), mint length, mint |
-| `17` | **GET_PIECES** | | P1 = the first slot to report | one page: the first slot the page does not cover (1), then for each slot in the range that is not empty a tag (1) and, for an unspent slot, its 81 bytes (8.1). `6A83` for a P1 of 64 or more With **P2 = 1**, the brief listing: the same pages and tags, and for an unspent slot 16 bytes in place of 81 (keyset 8, amount 4, date 4), so fourteen to a page. With **P2 = 2** and one to three slot numbers as data: each of those slots whole (status and its 81 bytes), in the order asked; `6700` for none or more than three (8.1) |
+| `17` | **GET_PIECES** | | P1 = the first slot to report | one page: the first slot the page does not cover (1), then for each slot in the range that is not empty a tag (1) and, for an unspent slot, its 81 bytes (8.1). `6A83` for a P1 of 128 or more. With **P2 = 2** and one to three slot numbers as data: each of those slots whole (status and its 81 bytes), in the order asked; `6700` for none or more than three (8.1). With **P2 = 3**, the short listing: for each unspent slot its number (with `0x80` where its keyset and date follow), then the power of two it is worth or `FF` and its amount (6d). Any other P2 is `6A86` (P2 = 1 was the brief listing of a card of sixty-four places, 1.6) |
 | `18` | **GET_LOG** | the PIN verified in this tap, or the owner's grant; nothing on a card with no PIN yet. **P1 = 1 (receipts): the owner's grant only** | P2 with P1 = 1: how many receipts back from the newest to begin | the card's own log (6b): 16 bytes of counts, then up to eight taps of 16 bytes, newest first. With P1 = 1: the count of payments (4), then up to three receipts of 73 bytes, newest first. `6982` to anyone else; `6A86` for another P1 |
 | `20` | ~~SPEND_PROOF~~ | | | gone with format 4 (6c): `6D00`. Up to format 3: P1 = the slot, the 64-byte signature over that piece's secret alone |
 | `22` | **SPEND_ALL_BEGIN** | PIN, if one is set; a time, if a limit is set | the places, a byte each, 1 to 32 | what they are worth (4). `6700` none; `6A96` more than 32; `6A83`, `6A88`, `6985` for a place out of range, empty, spent; `6A80` named twice, or of another date than the first; `6A92`, `6A8F` as the day's limit has it, on the sum (6c) |
@@ -767,7 +801,8 @@ version is 1.4 and `FORMAT` 4: a phone that knows only format 3 refuses such a
 card, and a phone that knows both pays with either. With the limit on one
 payment a wait and not a window (6a) the version is 1.5, the format is still
 4, and bit 3 of the capabilities byte says so. 1.6 is the same card made
-quicker to hold (6d), and bit 4 says so.
+quicker to hold (6d), and bit 4 says so. 1.7 is the same card with 128 places
+(6d, 8.1), and bit 5 says so.
 
 **Every command in every state: the rule of section 3 worked through.** "Open"
 means nothing is needed beyond what the command's own row says; "refused" means
@@ -819,14 +854,17 @@ A tap used to read a card with one command for each of its states and one
 for each piece on it, at a tenth of a second or so a command. `GET_PIECES`
 (`17`) says what both of those say, in pages.
 
-**The answer.** P1 is the first slot to report (0 to 63; `6A83` above that);
-P2 and the data are not used. No PIN: it says what `GET_SLOT_STATUS` and
-`GET_PROOF` say, which need none. The answer is
+**The answer.** P1 is the first slot to report (0 to 127; `6A83` above that);
+P2 is 0 and the data is not used (P2 = 2 and P2 = 3 are its other forms, 6d).
+No PIN: it says what `GET_SLOT_STATUS` and `GET_PROOF` say, which need none.
+The answer is
 
-    next (1)     the first slot this page does not cover; 64 means the card has
+    next (1)     the first slot this page does not cover; 128 means the card has
                  no more to say, and anything else is the P1 to ask for next
     then, for each slot from P1 up to next that is not empty, in order:
-      tag (1)    (state << 6) | slot, state 1 for unspent and 2 for spent
+      tag (1)    the slot, and 0x80 where it is spent (a card of sixty-four
+                 places, before 1.7: (state << 6) | slot, state 1 for unspent
+                 and 2 for spent, and next ends at 64)
       piece (81) only for an unspent slot: keyset (8), amount (4), nonce (32),
                  C (33), date (4), which is what `GET_PROOF` gives after its
                  status byte
@@ -836,10 +874,11 @@ alone: its bytes stay on the card until `CLEAR_SPENT` frees the place, and
 nothing that reads a card wants them. A page is at most 255 bytes, so three
 unspent pieces (1 + 3 x 82 = 247) make a page, and spent slots, which cost a
 byte, fill what is left of it. At least one entry always fits, so every answer
-moves on. A card of sixty-four unspent pieces is twenty-two pages; a card with
-six is two.
+moves on. A card of 128 unspent pieces is forty-three pages; a card with
+six is two. (A till that only wants to choose pieces reads the short listing,
+6d, which is one answer for a hundred pieces.)
 
-**Why pages, and not extended length.** 64 slots of 82 bytes are 5,248 bytes,
+**Why pages, and not extended length.** 128 slots of 82 bytes are 10,496 bytes,
 which a short APDU (256) does not hold. An extended-length answer would hold it,
 and was not chosen: the card's support for extended APDUs was not measured, the
 simulator's is not the card's, and every extra thing the reader and the phone
@@ -1002,6 +1041,22 @@ phone says it belongs to another phone's words.
   most of a second, so the pieces are what a withdrawal is made of: one cut
   short keeps what the card signed, in the phone, and the next tap takes the
   rest.
+- A card of 128 places (1.7) is cut deep instead: eight of each size from 1 to
+  1,024, smallest first as far as the money goes, and the rest of the amount
+  in powers of two. Eight prices in a row are then paid exactly, whatever they
+  are, up to 2,047 sats each: one tap, one signature and no change. What the
+  card holds counts towards each size, so a top-up and the change of a payment
+  fill what has been spent from (change in thirty-two pieces at the most, so
+  that the tap that writes it stays short). Where no set of pieces makes a
+  price exactly, the drawer is short of something small, and the set that
+  overpays least would bring back a sat or two; so a till takes the cheapest
+  set that brings back 256 sats or more, whose change fills the small sizes
+  again. That set may be over a limit on one payment that the till is not
+  told: the card then answers its first `SIGN` with "not yet", having signed
+  nothing, and the till pays with the cheapest set after all. Nobody is made
+  to wait for change. A payment is thirty-two pieces or fewer wherever such a
+  set pays (with a larger piece and change, if need be), and more only where
+  nothing that few does.
 - A till with no route may take a card on trust, as plain ecash is taken: the
   HIGH RISK question is put to the person first, in front of the amount, and the
   owner's answer decides. Only an exact set of pieces is taken (a till with no route
@@ -1160,10 +1215,20 @@ labels for `SET_OWNER`, `SET_CARD` and the load grant, the clock's one way back
 - jCardSim, GET_PIECES: an empty card is one byte; up to three unspent pieces are one
   page, each the bytes `GET_PROOF` gives after its status byte; a spent slot is a tag
   alone and an empty one is left out; a page from the middle, and from an empty slot; a
-  full card is twenty-two pages, each within 255 bytes and each moving on; a page fills to
+  full card is forty-three pages, each within 255 bytes and each moving on; a page fills to
   255 bytes and not a byte over (three pieces and eight spent tags, then the next piece
   starts a page); it asks for no PIN and changes nothing; a slot there is not is `6A83`.
   The transcript has it, and the phone's model of the card is held to it.
+- jCardSim, 128 places (1.7): the short listing is two bytes a piece after the first
+  where keyset and date are shared, names them again where either differs and at the
+  start of every answer, gives `FF` and four bytes for an amount that is no power of
+  two and the size for every power from 1 to 2^31, skips spent and empty places, and
+  takes two answers for a full card; the whole listing names places above 63 and marks
+  a spent one by its high bit; every command that names a place takes 64 to 127 and
+  refuses 128; a payment of 33, of 64 and of all 128 places signs once, burns exactly
+  those, waits as its sum says, and is charged to the day whole; 129 is `6A96`; a burn
+  that fails is `6A96` with nothing burned. Each was broken on purpose in a copy of the
+  applet, one change at a time (74 changes), and every change was caught by a test.
 - The source-reading test: spent today and the slot's status change between one
   `beginTransaction` and its commit, with the signing after.
 - Vectors in `spec/vectors/`: a signed time and its key; an owner key and a proof

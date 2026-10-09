@@ -238,8 +238,8 @@ A slot, 82 bytes (upstream's 78 and a date):
 | C | 33 | |
 | date | 4 | the locktime of this piece, 0 for none |
 
-64 slots to begin with (5,248 bytes), more if the J3R180's memory allows once
-measured. Phase 3 adds 97 bytes a slot for the DLEQ.
+128 slots (10,496 bytes, and 130 more a slot for the text a payment hashes);
+64 before software 1.7. Phase 3 adds 97 bytes a slot for the DLEQ.
 
 The text of a piece's secret, which is what the card signs the hash of, is
 the text Foxy's Cashu library writes for a piece locked to one key:

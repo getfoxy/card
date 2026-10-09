@@ -103,13 +103,17 @@ public class CashuApplet extends Applet {
     // FORMAT is what a reader checks before it reads a slot: 3 for this design
     // (2 was the allowance draft and the first limit).
     static final byte VERSION_MAJOR = (byte) 0x01;
+    // 1.7 is the same card with twice the places (128), so that it can hold a deep drawer of small
+    // pieces; a place's number is seven bits where it was six, so GET_PIECES' tags changed, and the
+    // short listing is a shorter one (see `processGetPieces`). Nothing it signs or stores for a piece
+    // is different.
     // 1.6 is the same card made quicker to hold (see `slotHex`, GET_PIECES' two short forms, and several
     // pieces to one LOAD_PROOF): nothing it signs, refuses or stores for a piece is different.
     // 1.3 was a limit on one tap, a window of ten seconds that refused. 1.5 makes it the limit on one
     // payment, which asks no clock and is waited for (docs/FOXY-CARD-DAILY-LIMIT.md, section 6a).
     // 1.4 is one signature for a whole payment (NUT-11 SIG_ALL): format 4, in
     // which every piece's secret carries the flag and SPEND_PROOF is gone.
-    static final byte VERSION_MINOR = (byte) 0x06;
+    static final byte VERSION_MINOR = (byte) 0x07;
     static final byte FORMAT        = (byte) 0x04;
 
     // -------------------------------------------------------------------------
@@ -173,15 +177,18 @@ public class CashuApplet extends Applet {
     static final byte STATUS_UNSPENT = (byte) 0x01;
     static final byte STATUS_SPENT   = (byte) 0x02;
 
-    static final short MAX_PROOFS = (short) 64;
+    // 128: a place's number is a byte and seven bits of a GET_PIECES tag, and the
+    // two arrays that hold the places are 10,496 and 16,640 bytes, each under
+    // what one array may be.
+    static final short MAX_PROOFS = (short) 128;
 
     // GET_PIECES' answer is at most this many bytes: under what a short APDU
     // carries (256), and room for three unspent entries (1 + 3 * 82 = 247).
     static final short PAGE_MAX = (short) 255;
     /** A place's text for hashing, kept beside it: its nonce in hex (64) and its C in hex (66). See `slotHex`. */
     static final short HEX_LEN = (short) 130;
-    /** GET_PIECES, P2 = 1: what a place is worth and no more, for choosing: keyset (8), amount (4), date (4). */
-    static final short BRIEF_LEN = (short) 16;
+    /** GET_PIECES, P2 = 3: the most one entry of the short listing comes to: place, keyset (8), date (4), size, amount (4). */
+    static final short SHORT_MOST = (short) 18;
     /** The most pieces one LOAD_PROOF takes, and the most places GET_PIECES gives whole when asked for by name. */
     static final short BATCH_MOST = (short) 3;
 
@@ -233,7 +240,11 @@ public class CashuApplet extends Applet {
 
     // One signature for a payment: no more pieces than this in it, and an
     // output is its amount (4, big-endian) and its blinded message (33).
-    static final short ALL_MOST            = (short) 32;
+    // Every place the card has (it was thirty-two): a deep drawer holds its
+    // money in small pieces, and a payment of most of a small card is many of
+    // them. The burn is one transaction whatever their number; a card whose
+    // transaction cannot hold so many refuses at SIGN with 6A96, nothing burned.
+    static final short ALL_MOST            = MAX_PROOFS;
     static final short ALL_OUTPUT_LEN      = (short) 37;
 
     // -------------------------------------------------------------------------
@@ -891,8 +902,9 @@ public class CashuApplet extends Applet {
         //   bit1 = BIP-340 Schnorr signing (set — ENG-181 complete)
         //   bit2 = PIN supported (always set)
         // secp256k1 + Schnorr + PIN + the limit on one payment is waited for, not refused
-        // + GET_PIECES has its two short forms and LOAD_PROOF takes several pieces (bit 4)
-        buf[6] = (byte) 0x1F;
+        // + GET_PIECES names places whole and LOAD_PROOF takes several pieces (bit 4)
+        // + more than sixty-four places: seven-bit tags, and the short listing is P2 = 3 (bit 5)
+        buf[6] = (byte) 0x3F;
         buf[7] = pinState[0];
         // The fork's: the first eight bytes are upstream's, so a reader that
         // knows only those still reads them right.
@@ -1020,16 +1032,20 @@ public class CashuApplet extends Applet {
      * P1 is the first slot to report. The answer is
      *
      *   next (1)                  the first slot this answer does not cover;
-     *                             64 means there is nothing more to ask for
+     *                             128 means there is nothing more to ask for
      *   then, for each slot from P1 up to next that is not empty, in order:
-     *     tag (1)                 (state << 6) | slot index; state 1 is unspent, 2 is spent
+     *     tag (1)                 the slot's number, and 0x80 where it is spent
      *     the piece (81)          only for an unspent slot: what GET_PROOF gives
      *                             after its status byte (keyset, amount, nonce, C, date)
      *
      * A slot in that range with no entry is empty. A spent slot is listed by its
      * tag alone: its bytes stay on the card until CLEAR_SPENT frees the place, and
      * nothing that reads the card wants them. The phone asks again with P1 = next
-     * until next is 64.
+     * until next is 128.
+     *
+     * (A card of sixty-four places, 1.6 and before, has a tag of
+     * (state << 6) | slot, state 1 unspent and 2 spent, and ends at 64. GET_INFO
+     * says how many places a card has, and its capabilities which tags it gives.)
      *
      * An answer is at most PAGE_MAX bytes, which is under the 256 a short APDU
      * carries, so three unspent pieces (247 bytes) make a page and the card does
@@ -1040,26 +1056,25 @@ public class CashuApplet extends Applet {
      */
     private void processGetPieces(APDU apdu) {
         byte[] buf = apdu.getBuffer();
+        byte p2 = buf[ISO7816.OFFSET_P2];
         /* P2 = 2: the places named in the data, whole. A till that has chosen
-         * its pieces from the brief listing asks for those and no others. */
-        if (buf[ISO7816.OFFSET_P2] == (byte) 2) { processGetSome(apdu); return; }
-        // a form this card does not have is refused, and not answered with another
-        if (buf[ISO7816.OFFSET_P2] != (byte) 0 && buf[ISO7816.OFFSET_P2] != (byte) 1) ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
-        /* P2 = 1: the brief listing. The same pages and the same tags, and for
-         * an unspent place sixteen bytes in place of eighty-one: its keyset,
-         * its amount and its date, which is all that choosing pieces needs.
-         * Fourteen places to a page where the whole form has three. */
-        boolean brief = buf[ISO7816.OFFSET_P2] == (byte) 1;
+         * its pieces from the short listing asks for those and no others. */
+        if (p2 == (byte) 2) { processGetSome(apdu); return; }
+        // P2 = 3: the short listing, for choosing
+        if (p2 == (byte) 3) { processGetShort(apdu); return; }
+        /* A form this card does not have is refused, and not answered with
+         * another. P2 = 1 was the short listing of a card of sixty-four
+         * places: its tags cannot name these, and it is not kept. */
+        if (p2 != (byte) 0) ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
         short from = (short)(buf[ISO7816.OFFSET_P1] & 0xFF);
         if (from >= MAX_PROOFS) ISOException.throwIt(SW_SLOT_OUT_OF_RANGE);
 
         // what fits: slots from `from` while the next entry still leaves the answer within the page
         short length = 1;
         short next = from;
-        short whole = brief ? (short)(BRIEF_LEN + 1) : PROOF_SIZE;
         while (next < MAX_PROOFS) {
             byte status = proofStorage[(short)(next * PROOF_SIZE + PROOF_STATUS_OFFSET)];
-            short cost = (status == STATUS_UNSPENT) ? whole : (status == STATUS_SPENT) ? (short) 1 : (short) 0;
+            short cost = (status == STATUS_UNSPENT) ? PROOF_SIZE : (status == STATUS_SPENT) ? (short) 1 : (short) 0;
             if ((short)(length + cost) > PAGE_MAX) break;
             length += cost;
             next++;
@@ -1073,16 +1088,117 @@ public class CashuApplet extends Applet {
             short base = (short)(i * PROOF_SIZE);
             byte status = proofStorage[(short)(base + PROOF_STATUS_OFFSET)];
             if (status != STATUS_UNSPENT && status != STATUS_SPENT) continue;
-            buf[0] = (byte)((status << 6) | i);
+            buf[0] = (byte)(status == STATUS_SPENT ? (short)(i | (short) 0x80) : i);
             apdu.sendBytes((short) 0, (short) 1);
-            if (status == STATUS_UNSPENT && brief) {
-                // the keyset and the amount lie together in the slot; the date is at its end
-                apdu.sendBytesLong(proofStorage, (short)(base + PROOF_KEYSET_OFFSET), (short) 12);
-                apdu.sendBytesLong(proofStorage, (short)(base + PROOF_DATE_OFFSET), (short) 4);
-            } else if (status == STATUS_UNSPENT) {
+            if (status == STATUS_UNSPENT) {
                 apdu.sendBytesLong(proofStorage, (short)(base + PROOF_KEYSET_OFFSET), PROOF_DATA_LEN);
             }
         }
+    }
+
+    /**
+     * GET_PIECES with P2 = 3: the short listing. What every unspent place is
+     * worth and no more, which is all that choosing pieces needs, in as few
+     * bytes as say it: a card with a deep drawer holds a hundred pieces, and a
+     * till reads them at every payment.
+     *
+     * P1 is the first place to report. The answer is
+     *
+     *   next (1)                  as GET_PIECES: the first place not covered, 128 at the end
+     *   then, for each UNSPENT place from P1 up to next, in order:
+     *     place (1)               its number, and 0x80 where its keyset and date follow
+     *     keyset (8), date (4)    only with 0x80: where they are not those of the
+     *                             entry before it in this answer. The first entry
+     *                             of every answer has them.
+     *     size (1)                the power of two the piece is worth (0 for 1, 10
+     *                             for 1,024), or 0xFF where it is worth some other
+     *                             amount, which then follows
+     *     amount (4)              only after 0xFF
+     *
+     * A place with no entry is empty or spent, and this does not say which:
+     * GET_INFO counts both. A card whose pieces are of one keyset and one date
+     * and are powers of two, which is every card Foxy has loaded, is two bytes
+     * a piece after the first: all 128 places in two answers, where the whole
+     * form takes forty-three.
+     */
+    private void processGetShort(APDU apdu) {
+        byte[] buf = apdu.getBuffer();
+        short from = (short)(buf[ISO7816.OFFSET_P1] & 0xFF);
+        if (from >= MAX_PROOFS) ISOException.throwIt(SW_SLOT_OUT_OF_RANGE);
+
+        // what fits, as GET_PIECES: an entry is at most SHORT_MOST bytes, so one always does
+        short length = 1;
+        short next = from;
+        short prev = (short) -1;
+        while (next < MAX_PROOFS) {
+            short base = (short)(next * PROOF_SIZE);
+            if (proofStorage[(short)(base + PROOF_STATUS_OFFSET)] == STATUS_UNSPENT) {
+                short cost = (short) 2;
+                if (shortNamed(base, prev)) cost += (short) 12;
+                if (sizeOf((short)(base + PROOF_AMOUNT_OFFSET)) < 0) cost += (short) 4;
+                if ((short)(length + cost) > PAGE_MAX) break;
+                length += cost;
+                prev = base;
+            }
+            next++;
+        }
+
+        apdu.setOutgoing();
+        apdu.setOutgoingLength(length);
+        /* Gathered in the APDU buffer, and sent when it has no room for another
+         * entry: a send for each entry was most of what a listing took, and a
+         * buffer that holds a whole answer, as these cards' do, makes it one. */
+        short room = (short) buf.length;
+        buf[0] = (byte) next;
+        short at = (short) 1;
+        prev = (short) -1;
+        for (short i = from; i < next; i++) {
+            short base = (short)(i * PROOF_SIZE);
+            if (proofStorage[(short)(base + PROOF_STATUS_OFFSET)] != STATUS_UNSPENT) continue;
+            if ((short)(at + SHORT_MOST) > room) {
+                apdu.sendBytes((short) 0, at);
+                at = (short) 0;
+            }
+            if (shortNamed(base, prev)) {
+                buf[at++] = (byte)(i | (short) 0x80);
+                Util.arrayCopyNonAtomic(proofStorage, (short)(base + PROOF_KEYSET_OFFSET), buf, at, (short) 8);
+                Util.arrayCopyNonAtomic(proofStorage, (short)(base + PROOF_DATE_OFFSET), buf, (short)(at + 8), (short) 4);
+                at += (short) 12;
+            } else {
+                buf[at++] = (byte) i;
+            }
+            short size = sizeOf((short)(base + PROOF_AMOUNT_OFFSET));
+            if (size < 0) {
+                buf[at++] = (byte) 0xFF;
+                Util.arrayCopyNonAtomic(proofStorage, (short)(base + PROOF_AMOUNT_OFFSET), buf, at, (short) 4);
+                at += (short) 4;
+            } else {
+                buf[at++] = (byte) size;
+            }
+            prev = base;
+        }
+        if (at > 0) apdu.sendBytes((short) 0, at);
+    }
+
+    /** Whether the short listing says the keyset and date of the place at `base`: it does unless they are those of `prev`, the place listed before it in the same answer (-1: none). */
+    private boolean shortNamed(short base, short prev) {
+        if (prev < 0) return true;
+        return !sameBytes(proofStorage, (short)(base + PROOF_KEYSET_OFFSET), proofStorage, (short)(prev + PROOF_KEYSET_OFFSET), (short) 8)
+            || !sameBytes(proofStorage, (short)(base + PROOF_DATE_OFFSET), proofStorage, (short)(prev + PROOF_DATE_OFFSET), (short) 4);
+    }
+
+    /** The power of two the four bytes at `at` in the places are (0 to 31), or -1 where they are no power of two. */
+    private short sizeOf(short at) {
+        short found = (short) -1;
+        for (short k = 0; k < 4; k++) {
+            short b = (short)(proofStorage[(short)(at + k)] & 0xFF);
+            if (b == 0) continue;
+            if (found >= 0 || (short)(b & (short)(b - 1)) != 0) return (short) -1;
+            short bit = 0;
+            while (b > 1) { b = (short)(b >> 1); bit++; }
+            found = (short)((short)((short)(3 - k) * 8) + bit);
+        }
+        return found;
     }
 
     /**
@@ -1321,7 +1437,7 @@ public class CashuApplet extends Applet {
 
         /* The receipt, after the burn and by itself: what it says is true
          * only of a payment that was made, and it is kept out of the burn's
-         * own transaction, which has to hold thirty-two places. A card pulled
+         * own transaction, which has to hold every place named. A card pulled
          * away between the two has the payment in its log and no receipt. */
         short slot = (short)((cardReceipts[3] & 0x0F) * RECEIPT_LEN + RECEIPTS_HEAD);
         JCSystem.beginTransaction();

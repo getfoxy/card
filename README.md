@@ -17,8 +17,8 @@ What differs from upstream:
   limit or add funds with no PIN.
 - The card keeps a daily limit and a clock that only moves forward. The time it
   is told is interim and weak for now, and the documents say so.
-- A slot carries a date and a refund key; the card records its mint; 64 slots of
-  82 bytes.
+- A slot carries a date and a refund key; the card records its mint; 128 slots
+  of 82 bytes (64 before software 1.7).
 
 The applet has run on one real card, a J3R180. Read [`FORK.md`](FORK.md) first,
 and [`docs/FOXY-CARD-DAILY-LIMIT.md`](docs/FOXY-CARD-DAILY-LIMIT.md) for the daily
