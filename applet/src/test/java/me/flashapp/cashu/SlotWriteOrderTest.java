@@ -227,6 +227,10 @@ class SlotWriteOrderTest {
     private static final byte CLA = CashuAppletTest.CLA;
     private CardSimulator sim;
     private byte[] storage;
+    /** The text kept beside each place for a payment to hash (CashuApplet.slotHex), live. */
+    private byte[] hex;
+    /** The card's own log (cardLog) and its receipts (cardReceipts), live: what a tear before their write leaves is set by putting back what they were. */
+    private byte[] cardLog, cardReceipts;
 
     private void freshCard() throws Exception {
         ExposedRuntime runtime = new ExposedRuntime();
@@ -241,6 +245,26 @@ class SlotWriteOrderTest {
         java.lang.reflect.Field field = CashuApplet.class.getDeclaredField("proofStorage");
         field.setAccessible(true);
         storage = (byte[]) field.get(runtime.appletAt(aid));
+        java.lang.reflect.Field hexField = CashuApplet.class.getDeclaredField("slotHex");
+        hexField.setAccessible(true);
+        hex = (byte[]) hexField.get(runtime.appletAt(aid));
+        java.lang.reflect.Field logField = CashuApplet.class.getDeclaredField("cardLog");
+        logField.setAccessible(true);
+        cardLog = (byte[]) logField.get(runtime.appletAt(aid));
+        java.lang.reflect.Field receiptField = CashuApplet.class.getDeclaredField("cardReceipts");
+        receiptField.setAccessible(true);
+        cardReceipts = (byte[]) receiptField.get(runtime.appletAt(aid));
+    }
+
+    /** The card taken out of the field and put back: a new power-up, the applet selected, the PIN typed again. */
+    private void powerCycle() {
+        sim.reset();
+        assertEquals(CashuAppletTest.SW_OK, send(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, CashuAppletTest.hexToBytes(CashuAppletTest.AID_STR))).getSW());
+        assertEquals(CashuAppletTest.SW_OK, send(new CommandAPDU(CLA, CashuAppletTest.INS_VERIFY_PIN, 0, 0, CashuAppletTest.TEST_PIN)).getSW());
+    }
+
+    private ResponseAPDU log() {
+        return send(new CommandAPDU(CLA, CashuAppletTest.INS_GET_LOG, 0, 0, 256));
     }
 
     private ResponseAPDU send(CommandAPDU apdu) {
@@ -256,6 +280,14 @@ class SlotWriteOrderTest {
         ResponseAPDU begun = send(new CommandAPDU(CLA, CashuAppletTest.INS_SPEND_ALL_BEGIN, 0, 0, new byte[] { (byte) slot }, 4));
         if (begun.getSW() != CashuAppletTest.SW_OK) return begun;
         return send(new CommandAPDU(CLA, CashuAppletTest.INS_SPEND_ALL_SIGN, 0, 0, 64));
+    }
+
+    /** Whether `sig` is the card's for a payment of that one piece, which is what was sent to LOAD_PROOF, into no outputs. */
+    private boolean signedFor(byte[] sig, byte[] sentProof) throws Exception {
+        byte[] key = send(new CommandAPDU(CLA, CashuAppletTest.INS_GET_PUBKEY, 0, 0, 256)).getData();
+        byte[] message = CashuAppletTest.sha256(CashuAppletTest.allMessage(key, CashuAppletTest.REFUND,
+            new byte[][] { CashuAppletTest.asSlot(sentProof) }, new byte[0][]).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        return CashuAppletTest.schnorrVerify(CashuAppletTest.extractPubkeyX(key), message, sig);
     }
 
     private ResponseAPDU clearSpent() {
@@ -306,6 +338,108 @@ class SlotWriteOrderTest {
         assertArrayEquals(CashuAppletTest.PROOF_2, Arrays.copyOfRange(slot, 1, 82),
             "nothing of the torn load's bytes survives the next one");
         assertEquals(500, balance());
+    }
+
+    @Test
+    @DisplayName("a LOAD_PROOF torn after the text kept beside the place was written leaves an empty place with another piece's text beside it, and so does junk there: the next load writes its own over it, and a payment hashes the piece that is there")
+    void aTornLoadLeavesItsTextBehindAndTheNextLoadWritesOverIt() throws Exception {
+        for (int junk = 0; junk < 3; junk++) {
+            freshCard();
+            // What LOAD_PROOF leaves when the card goes after the nonce's and the C's text were written (they are written first)
+            // and before the slot's data was: the text of PROOF_1 beside place 0, which is still empty. Or junk, or text of another length.
+            byte[] text = (CashuAppletTest.toHex(java.util.Arrays.copyOfRange(CashuAppletTest.PROOF_1, 12, 44))
+                + CashuAppletTest.toHex(java.util.Arrays.copyOfRange(CashuAppletTest.PROOF_1, 44, 77))).getBytes(java.nio.charset.StandardCharsets.US_ASCII);
+            assertEquals(130, text.length);
+            if (junk == 0) System.arraycopy(text, 0, hex, 0, 130);
+            else if (junk == 1) java.util.Arrays.fill(hex, (byte) 'z');
+            else java.util.Arrays.fill(hex, 0, 65, (byte) 'a');
+            assertEquals(0, statuses()[0]);
+            assertEquals(0, balance());
+            assertEquals(CashuAppletTest.SW_SLOT_EMPTY, spend(0).getSW(), "an empty place is never paid with, whatever is beside it");
+
+            ResponseAPDU loaded = load(CashuAppletTest.PROOF_2);
+            assertEquals(CashuAppletTest.SW_OK, loaded.getSW());
+            assertEquals(0, loaded.getData()[0], "the empty place is reused");
+            String own = CashuAppletTest.toHex(java.util.Arrays.copyOfRange(CashuAppletTest.PROOF_2, 12, 44))
+                + CashuAppletTest.toHex(java.util.Arrays.copyOfRange(CashuAppletTest.PROOF_2, 44, 77));
+            assertEquals(own, new String(hex, 0, 130, java.nio.charset.StandardCharsets.US_ASCII), "the text beside the place is the piece's own, all of it");
+            ResponseAPDU paid = spend(0);
+            assertEquals(CashuAppletTest.SW_OK, paid.getSW());
+            assertTrue(signedFor(paid.getData(), CashuAppletTest.PROOF_2), "and a payment hashes it");
+            assertFalse(signedFor(paid.getData(), CashuAppletTest.PROOF_1), "and not what a torn load left");
+        }
+    }
+
+    @Test
+    @DisplayName("a LOAD_PROOF whose log write was lost (the card went after the pieces were stored and before the log's transaction) leaves the pieces good: unspent, counted, paid with; the log lacks the load, and the next command that writes it writes it right")
+    void aLoadWhoseLogWriteIsLostLeavesThePiecesGood() throws Exception {
+        freshCard();
+        byte[] logBefore = cardLog.clone();
+        ResponseAPDU batch = send(new CommandAPDU(CLA, CashuAppletTest.INS_LOAD_PROOF, 0, 0,
+            CashuAppletTest.concat(CashuAppletTest.PROOF_1, CashuAppletTest.PROOF_2), 3));
+        assertEquals(CashuAppletTest.SW_OK, batch.getSW());
+        assertArrayEquals(new byte[] { 0, 1 }, batch.getData());
+        assertEquals(1, cardLog[3], "the log has the load in it");
+        // the log's transaction never happened: the card is taken away, and the log is as it was
+        System.arraycopy(logBefore, 0, cardLog, 0, logBefore.length);
+        powerCycle();
+        assertEquals(1500, balance(), "the pieces are on the card");
+        assertEquals(1, statuses()[0]);
+        assertEquals(1, statuses()[1]);
+        assertArrayEquals(CashuAppletTest.PROOF_1, Arrays.copyOfRange(proofAt(0).getData(), 1, 82));
+        ResponseAPDU empty = log();
+        assertEquals(CashuAppletTest.SW_OK, empty.getSW());
+        assertArrayEquals(new byte[16], empty.getData(), "and the log says nothing of them: no tap, no entry");
+        // they are paid with, and the log is then written as a tap's, in the first entry
+        ResponseAPDU paid = spend(0);
+        assertEquals(CashuAppletTest.SW_OK, paid.getSW());
+        assertTrue(signedFor(paid.getData(), CashuAppletTest.PROOF_1));
+        byte[] d = log().getData();
+        assertEquals(32, d.length, "one tap");
+        assertEquals(1, CashuAppletTest.readUint32(d, 0));
+        assertEquals(1000, CashuAppletTest.readUint32(d, 20), "sats signed for");
+        assertEquals(0, d[27], "nothing put on in it: that load is not in the log");
+        assertEquals(500, balance());
+    }
+
+    @Test
+    @DisplayName("a payment whose receipt was lost (the card went after the burn and before the receipt's transaction) is in the log and has no receipt; its signature is still asked for again; the next payment's receipt is the first, and the ring goes on from its own count")
+    void aPaymentWhoseReceiptIsLostIsInTheLogAndHasNone() throws Exception {
+        freshCard();
+        assertEquals(CashuAppletTest.SW_OK, load(CashuAppletTest.PROOF_1).getSW());
+        assertEquals(CashuAppletTest.SW_OK, load(CashuAppletTest.PROOF_2).getSW());
+        byte[] receiptsBefore = cardReceipts.clone();
+        ResponseAPDU paid = spend(0);
+        assertEquals(CashuAppletTest.SW_OK, paid.getSW());
+        assertEquals(1, cardReceipts[3], "the receipt was written");
+        System.arraycopy(receiptsBefore, 0, cardReceipts, 0, receiptsBefore.length);
+        powerCycle();
+        assertEquals(1000, CashuAppletTest.readUint32(log().getData(), 4), "the payment is in the log");
+        assertEquals(500, balance(), "and burned");
+        ResponseAPDU again = send(new CommandAPDU(CLA, CashuAppletTest.INS_SPEND_ALL_AGAIN, 0, 0, 64));
+        assertEquals(CashuAppletTest.SW_OK, again.getSW());
+        assertArrayEquals(paid.getData(), again.getData(), "its signature can still be asked for");
+        // the owner reads the receipts: none
+        assertEquals(CashuAppletTest.SW_OK, allowLoad());
+        ResponseAPDU none = send(new CommandAPDU(CLA, CashuAppletTest.INS_GET_LOG, 1, 0, 256));
+        assertEquals(CashuAppletTest.SW_OK, none.getSW());
+        assertArrayEquals(new byte[4], none.getData(), "the payment has no receipt");
+        // the next payment has one, and it is the first
+        ResponseAPDU second = spend(1);
+        assertEquals(CashuAppletTest.SW_OK, second.getSW());
+        assertEquals(CashuAppletTest.SW_OK, allowLoad());
+        ResponseAPDU one = send(new CommandAPDU(CLA, CashuAppletTest.INS_GET_LOG, 1, 0, 256));
+        assertEquals(4 + 73, one.getData().length);
+        assertEquals(1, CashuAppletTest.readUint32(one.getData(), 0));
+        assertEquals(500, CashuAppletTest.readUint32(one.getData(), 4 + 4), "what its pieces were worth");
+        assertEquals(1500, CashuAppletTest.readUint32(log().getData(), 4), "and the log has both");
+    }
+
+    /** The owner's grant, in this tap. */
+    private int allowLoad() {
+        byte[] nonce = send(new CommandAPDU(CLA, CashuAppletTest.INS_GET_NONCE, 0, 0, 16)).getData();
+        byte[] proof = CashuAppletTest.ownerProof(CashuAppletTest.L_LOAD, CashuAppletTest.OWNER, nonce, new byte[0]);
+        return send(new CommandAPDU(CLA, CashuAppletTest.INS_ALLOW_LOAD, 0, 0, CashuAppletTest.ownerData(proof, new byte[0]))).getSW();
     }
 
     @Test

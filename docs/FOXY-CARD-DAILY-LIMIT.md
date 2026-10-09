@@ -348,9 +348,11 @@ whose duration is the chip's own, and that no terminal can shorten, is a
 signature: about three quarters of a second, measured, and very steady. So the
 card waits by signing, over 32 bytes of its own choosing, and throwing the
 signature away. One to a command: while waits remain, `SPEND_ALL_SIGN` does
-one, and answers `9000` with **two bytes**, how many are still to come, in
-place of the signature. The terminal sends `SPEND_ALL_SIGN` again. When none
-remain, the next one burns the pieces and answers the signature (6c). No
+one, and answers `9000` with **two bytes**, `00 01`, "not yet", in place of
+the signature. The terminal sends `SPEND_ALL_SIGN` again. When none remain,
+the next one burns the pieces and answers the signature (6c). The card does
+not say how many are to come: that would say how many limits the payment is
+over, and so what the limit is. No
 command is longer than one signature, which matters to a phone that gives up
 on a card that is silent for long.
 
@@ -379,11 +381,24 @@ overpay least.
 
 **Setting it.** `SET_LIMIT` with eight bytes of limit (the day's, then this
 one) sets both; four bytes set the day's and leave this one. It needs no time
-(the day's does, unless it is 0). `GET_INFO` with P1 = 1 answers it at bytes
-30 to 33; the eight bytes after it, which were the window and its count, are
-zeros. Bit 3 of `GET_INFO`'s capabilities byte says the card waits and does
-not refuse. The owner's phone lifts it to 0 with its proof to take money off
-its own card, and puts it back, as it does the day's.
+(the day's does, unless it is 0). Bit 3 of `GET_INFO`'s capabilities byte says
+the card waits and does not refuse. The owner's phone lifts it to 0 with its
+proof to take money off its own card, and puts it back, as it does the day's.
+
+**Who is told it.** The owner, and nobody else. `GET_INFO` with P1 = 1 answers
+it at bytes 30 to 33 only when the owner's grant (`ALLOW_LOAD`) has been given
+in this tap; to anyone else, the PIN verified or not, those bytes are zeros,
+which is also what a card with no such limit says. (The eight bytes after
+them, which were the window and its count, are zeros to everyone.) A terminal
+that was told the limit would ask for just under it, again and again, and
+never be made to wait.
+
+What that buys is time, once. A terminal that has the PIN can still find the
+limit by trying: a payment that is answered "not yet" is over it, one that is
+signed is not, and each try is a second of the card being held. A dozen tries
+close in on it. Nothing a card can do stops that short of charging for a
+payment given up in the wait, which would charge a holder for lifting the
+card, and lifting the card is the one thing a holder can do.
 
 ## 6b. The log
 
@@ -407,7 +422,7 @@ counts only go up, and stop at the top of four bytes.
 | refused | 4 | spends refused for being over a limit, ever |
 | runs | 4 | times a third spend was refused inside ten seconds of the clock (below) |
 | run start, run length | 4, 1 | the run of refusals in hand: the clock at its first, and how many |
-| the last eight taps | 8 × 12 | a ring; the tap numbered n is at (n − 1) mod 8. Each: the clock when it began (4), sats signed for in it (4), pieces signed (1), spends refused in it (1), flags (1; bit 0 is the mark), and a byte of nothing |
+| the last eight taps | 8 × 16 | a ring; the tap numbered n is at (n − 1) mod 8. Each: the clock when it began (4), sats signed for in it (4), pieces signed (1), spends refused in it (1), flags (1; bit 0 is the mark), and a byte of nothing |
 
 **A tap, here, is one time in a reader's field**: from the card being powered
 to its being taken away (a byte of RAM that is gone with the power, and not
@@ -444,6 +459,48 @@ at the most. For whoever the card is open to: the PIN verified in this tap, or
 the owner's grant (`ALLOW_LOAD`), so the owner's phone reads it with no PIN. It
 says when a card was used and for how much, which a stranger's reader is not
 told (`6982`). A card with no PIN yet has an empty log, and answers anyone.
+
+
+**What was put on, too.** A tap's entry is sixteen bytes since 1.6: after what
+was signed for in it (clock 4, sats 4, pieces 1, refusals 1, flags 1) come the
+pieces put on in it (1, stops at 255) and what they were worth (4).
+`LOAD_PROOF` writes it once for the command, after the pieces are stored. So
+"taps" counts every time in the field in which anything was signed for,
+refused or put on.
+
+**A clock moved twice in a tap** (flag bit 2). The card cannot know the time,
+only that it is not being told an earlier one. What it can see is being told
+again in one time in the field, a time more than two minutes past where the
+first telling left its clock: no phone's clock does that, and a terminal
+walking the clock forward to turn the day does exactly that, in one step or in
+many small ones. It is not refused, since the card cannot say which telling
+was the lie. It is written down, once for that time in the field: the fourth
+count goes up by one, and the tap's entry is marked, if it has one or when it
+gets one. A mark begins no entry of its own: telling the time needs no PIN,
+and an entry for each mark would let anybody near the card push its eight taps
+out of the ring. A terminal that cuts the field between two tellings is not
+seen by the card. The holder's phone, which knows the time, sees a card whose
+clock is ahead of its own, and says so.
+
+**Receipts** (`GET_LOG` with P1 = 1). For each payment the card signs, written
+after the burn: the clock (4), what the pieces were worth (4), SHA-256 of the
+message it signed (32), and the first output's blinded message as the terminal
+gave it (33; zeros for a payment with no outputs). The last sixteen, in a
+ring, after a count of every payment ever. Answered as the count (4) and up to
+three receipts newest first, P2 back from the newest.
+
+The log says what left the card and when. A receipt says where it went, as far
+as a card can know. Under SIG_ALL the message names every output of the one
+swap the mint took the signature for, and an output is made from its
+receiver's seed. Nobody can tell whose an output is by looking at it; anybody
+who is later shown a wallet's seed can make that wallet's outputs again and
+find this one among them, and the hash then pins the whole swap. It is what a
+holder has to show for a payment they did not mean to make: it does not say
+who took it, and it lets a wallet be shown to be the one, or not to be.
+
+By the owner's grant given in this tap and nothing else: not the PIN, which a
+till has. No command clears it. The card's ring is short, and a phone that
+wants more than sixteen keeps what it reads.
 
 ## 6c. One signature for a payment
 
@@ -541,6 +598,41 @@ after their date, as section 6 of `FOXY-CARD-SPEC.md` has it).
 
 Not yet measured on the chip: how long `BEGIN` takes for thirty-two places
 (it is a few kilobytes of SHA-256) beside the one signature.
+
+## 6d. Time on the card
+
+How long a card has to be held is most of what a person knows of it, and
+almost all of it is the card's own work: every command is a round trip of a
+few hundredths of a second, and anything the applet does byte by byte in
+bytecode is slow. Measured on the chip, through a phone: a signature is three
+quarters of a second and cannot be made less; taking in a payment's pieces
+(`SPEND_ALL_BEGIN`) was 79 ms a piece, two seconds for twenty-five; an output
+was 34 ms; a load was 60 ms a piece; and reading every piece, three to a
+command, was up to 0.7 s. Version 1.6 changes none of what the card does for
+a piece and most of how long it takes.
+
+- **The text of a piece is written once, at loading.** A payment's message is
+  each piece's secret and its C as text, and the two parts of that which
+  differ from piece to piece are its nonce and its C in hex. `LOAD_PROOF`
+  writes those beside the slot (`slotHex`, 130 bytes a place), before the
+  slot's data and its status byte, so a tear leaves the place empty as it
+  always did. `SPEND_ALL_BEGIN` then turns nothing to hex for a piece: it
+  builds the rest of the secret once (everything after the nonce is the same
+  for every piece of one payment: the card's key, and the one date and refund
+  key), and hands the hash four spans a piece.
+- **An output is one span to the hash**, its amount in decimal ending where
+  its `B_` in hex begins; an amount under 32,768 is divided as a short.
+- **A brief listing** (`GET_PIECES`, P2 = 1): what a till needs to choose
+  pieces is what each is worth, its date and its keyset, sixteen bytes, and
+  not its nonce and its C. Fourteen places to a command where the whole form
+  has three. The pieces it chooses it then asks for whole, by slot, three to
+  a command (P2 = 2), and checks each against what the listing said.
+- **Three pieces to one `LOAD_PROOF`.** Each is taken as one alone would be,
+  in order (the rule is in section 8).
+
+Loading is a little slower for a piece than it was (it now writes the hex)
+and quicker in all (a third of the commands). Loading is done by a card's
+holder at home; paying is done at a till.
 
 ## 7. The owner
 
@@ -642,19 +734,19 @@ or changed from `FOXY-CARD-SPEC.md` 5.2 and the allowance draft.
 
 | INS | Command | Needs | Data sent | Answers |
 |---|---|---|---|---|
-| `01` | **GET_INFO** | | | 30 bytes: the draft's 17 (version 2, slots, unspent, spent, empty, capabilities, PIN state, format, tries left, locked, record set, limit 4, has owner 1), then `now` (4), window start (4), spent today (4), then whether this tap may load with no PIN (1; 8.2) With **P1 = 1**, 42 bytes: those thirty, then the tap limit, the tap start and spent this tap, 4 each (6a). |
+| `01` | **GET_INFO** | | | 30 bytes: the draft's 17 (version 2, slots, unspent, spent, empty, capabilities, PIN state, format, tries left, locked, record set, limit 4, has owner 1), then `now` (4), window start (4), spent today (4), then whether this tap may load with no PIN (1; 8.2) With **P1 = 1**, 42 bytes: those thirty, then the tap limit, the tap start and spent this tap, 4 each (6a). The limit on one payment (bytes 30 to 33) is said only with the owner's grant given in this tap, and is zeros to anyone else (6a) |
 | `10` | GET_PUBKEY | | | the card's 33-byte compressed key |
 | `11` `12` `13` `14` | GET_BALANCE, GET_PROOF_COUNT, GET_PROOF, GET_SLOT_STATUS | | | as before |
 | `15` | AUTH | | 16 random bytes | 16 of the card's own and a signature |
 | `16` | **GET_CARD** | | | format, record set, unit, limit (4), refund key (33), time key (65), mint length, mint |
-| `17` | **GET_PIECES** | | P1 = the first slot to report | one page: the first slot the page does not cover (1), then for each slot in the range that is not empty a tag (1) and, for an unspent slot, its 81 bytes (8.1). `6A83` for a P1 of 64 or more |
-| `18` | **GET_LOG** | the PIN verified in this tap, or the owner's grant; nothing on a card with no PIN yet | | the card's own log (6b): 16 bytes of counts, then up to eight taps of 12 bytes, newest first. `6982` to anyone else |
+| `17` | **GET_PIECES** | | P1 = the first slot to report | one page: the first slot the page does not cover (1), then for each slot in the range that is not empty a tag (1) and, for an unspent slot, its 81 bytes (8.1). `6A83` for a P1 of 64 or more With **P2 = 1**, the brief listing: the same pages and tags, and for an unspent slot 16 bytes in place of 81 (keyset 8, amount 4, date 4), so fourteen to a page. With **P2 = 2** and one to three slot numbers as data: each of those slots whole (status and its 81 bytes), in the order asked; `6700` for none or more than three (8.1) |
+| `18` | **GET_LOG** | the PIN verified in this tap, or the owner's grant; nothing on a card with no PIN yet. **P1 = 1 (receipts): the owner's grant only** | P2 with P1 = 1: how many receipts back from the newest to begin | the card's own log (6b): 16 bytes of counts, then up to eight taps of 16 bytes, newest first. With P1 = 1: the count of payments (4), then up to three receipts of 73 bytes, newest first. `6982` to anyone else; `6A86` for another P1 |
 | `20` | ~~SPEND_PROOF~~ | | | gone with format 4 (6c): `6D00`. Up to format 3: P1 = the slot, the 64-byte signature over that piece's secret alone |
 | `22` | **SPEND_ALL_BEGIN** | PIN, if one is set; a time, if a limit is set | the places, a byte each, 1 to 32 | what they are worth (4). `6700` none; `6A96` more than 32; `6A83`, `6A88`, `6985` for a place out of range, empty, spent; `6A80` named twice, or of another date than the first; `6A92`, `6A8F` as the day's limit has it, on the sum (6c) |
 | `23` | **SPEND_ALL_OUTPUTS** | a payment begun, and nothing sent since but these | 37 bytes for each output: amount (4), blinded message (33) | `6985` with no payment begun; `6700` for a length not a multiple of 37, and the payment is dropped |
 | `24` | **SPEND_ALL_SIGN** | a payment begun; PIN; the day's limit again | | while the payment is over the limit on one payment: two bytes, the waits still to come, and nothing burned (6a); sent again. Then the one 64-byte signature over every piece and every output; every place burned, the counts charged and the log written in the same transaction. `6985` with no payment begun; `6A96` if the transaction cannot hold it. **Not** opened by `ALLOW_LOAD`, nor by the tap after a payment. Notes, in permanent memory, that the card has paid: the next tap may load with no PIN (8.2) |
 | `25` | **SPEND_ALL_AGAIN** | PIN, if one is set | | the last signature `24` gave, again; `6A88` if none |
-| `30` | **LOAD_PROOF** | an owner; a PIN set, and verified or `ALLOW_LOAD` given in this tap or this tap being the one after a payment (8.2); a card record; a time | 81 bytes | `6982` with no verified PIN and no grant (the gate comes first); then `6A90` with no owner; `6A92` with no time; `6A94` for a piece whose nonce is already in a slot, spent or not (checked last, after the length and the piece itself, and before anything is written) |
+| `30` | **LOAD_PROOF** | an owner; a PIN set, and verified or `ALLOW_LOAD` given in this tap or this tap being the one after a payment (8.2); a card record; a time | 81 bytes; or two or three pieces end to end, 162 or 243 | `6982` with no verified PIN and no grant (the gate comes first); then `6A90` with no owner; `6A92` with no time; `6A94` for a piece whose nonce is already in a slot, spent or not (checked last, after the length and the piece itself, and before anything is written) The answer is the slot of each piece stored, a byte each. Several pieces are taken in order, each as one alone would be: if the first cannot be stored the command is refused with its word; if a later one cannot, the ones before it stand and the answer is their slots only, and the terminal sends the rest again to hear why |
 | `31` | **CLEAR_SPENT** | the PIN, if one is set, or `ALLOW_LOAD` given in this tap, or the tap after a payment | | |
 | `32` | **SET_CARD** | no owner: PIN set and verified, nothing unspent. Owner: the owner's proof, nothing unspent | unit (1), refund key (33), time key (65), mint length (1), mint; with an owner, proof length (1) and the proof first | `6A8D` if anything is unspent; `6A80` for a time key not beginning `04`, or a bad refund key; `6700` for a bad length |
 | `33` | **SET_LIMIT, PIN form** | **a card with no owner**: PIN set and verified; nothing unspent; a time, unless the limit is 0 | limit (4) | `6A91` on a card with an owner (use `34`); `6A8D` if anything is unspent; `6A92` with no time Eight bytes set the limit on one tap as well (6a). |
@@ -674,7 +766,8 @@ as it does for anything but its own. With one signature for a payment (6c) the
 version is 1.4 and `FORMAT` 4: a phone that knows only format 3 refuses such a
 card, and a phone that knows both pays with either. With the limit on one
 payment a wait and not a window (6a) the version is 1.5, the format is still
-4, and bit 3 of the capabilities byte says so.
+4, and bit 3 of the capabilities byte says so. 1.6 is the same card made
+quicker to hold (6d), and bit 4 says so.
 
 **Every command in every state: the rule of section 3 worked through.** "Open"
 means nothing is needed beyond what the command's own row says; "refused" means

@@ -103,11 +103,13 @@ public class CashuApplet extends Applet {
     // FORMAT is what a reader checks before it reads a slot: 3 for this design
     // (2 was the allowance draft and the first limit).
     static final byte VERSION_MAJOR = (byte) 0x01;
+    // 1.6 is the same card made quicker to hold (see `slotHex`, GET_PIECES' two short forms, and several
+    // pieces to one LOAD_PROOF): nothing it signs, refuses or stores for a piece is different.
     // 1.3 was a limit on one tap, a window of ten seconds that refused. 1.5 makes it the limit on one
     // payment, which asks no clock and is waited for (docs/FOXY-CARD-DAILY-LIMIT.md, section 6a).
     // 1.4 is one signature for a whole payment (NUT-11 SIG_ALL): format 4, in
     // which every piece's secret carries the flag and SPEND_PROOF is gone.
-    static final byte VERSION_MINOR = (byte) 0x05;
+    static final byte VERSION_MINOR = (byte) 0x06;
     static final byte FORMAT        = (byte) 0x04;
 
     // -------------------------------------------------------------------------
@@ -176,6 +178,12 @@ public class CashuApplet extends Applet {
     // GET_PIECES' answer is at most this many bytes: under what a short APDU
     // carries (256), and room for three unspent entries (1 + 3 * 82 = 247).
     static final short PAGE_MAX = (short) 255;
+    /** A place's text for hashing, kept beside it: its nonce in hex (64) and its C in hex (66). See `slotHex`. */
+    static final short HEX_LEN = (short) 130;
+    /** GET_PIECES, P2 = 1: what a place is worth and no more, for choosing: keyset (8), amount (4), date (4). */
+    static final short BRIEF_LEN = (short) 16;
+    /** The most pieces one LOAD_PROOF takes, and the most places GET_PIECES gives whole when asked for by name. */
+    static final short BATCH_MOST = (short) 3;
 
     // -------------------------------------------------------------------------
     // The card record (persistent): which mint, which unit, who may take the
@@ -244,13 +252,13 @@ public class CashuApplet extends Applet {
     static final short LOG_TAPS_OFFSET      = (short) 0;   // taps in which anything was signed for or refused, ever
     static final short LOG_SATS_OFFSET      = (short) 4;   // sats signed for, ever
     static final short LOG_REFUSED_OFFSET   = (short) 8;   // spends refused for being over a limit, ever
-    static final short LOG_TAMPERS_OFFSET   = (short) 12;  // times a third spend was refused inside ten seconds of the clock
+    static final short LOG_TAMPERS_OFFSET   = (short) 12;  // times a third spend was refused inside ten seconds of the clock, and times in the field in which the clock was moved twice (5.3)
     static final short LOG_RUN_AT_OFFSET    = (short) 16;  // the clock at the first refusal of the run in hand
     static final short LOG_RUN_OFFSET       = (short) 20;  // how many refusals are in that run (1 byte)
     static final short LOG_HEAD_LEN         = (short) 21;
     // the last eight taps, in a ring: the tap numbered n is at (n - 1) mod 8
     static final short LOG_ENTRIES          = (short) 8;
-    static final short LOG_ENTRY_LEN        = (short) 12;
+    static final short LOG_ENTRY_LEN        = (short) 16;
     static final short LOG_E_TIME           = (short) 0;   // the clock when the tap's first entry was made (4)
     static final short LOG_E_SATS           = (short) 4;   // sats signed for in it (4)
     static final short LOG_E_PIECES         = (short) 8;   // pieces signed (1, stops at 255)
@@ -258,7 +266,34 @@ public class CashuApplet extends Applet {
     static final short LOG_E_FLAGS          = (short) 10;  // bit 0: the third refusal of a run, or one after it, was in this tap; bit 1: a payment in it waited (6a)
     static final byte  LOG_FLAG_TAMPER      = (byte) 0x01;
     static final byte  LOG_FLAG_WAITED      = (byte) 0x02; // a payment in this tap was over the limit on one payment, and was waited for
-    static final short LOG_LEN              = (short) 117; // LOG_HEAD_LEN + LOG_ENTRIES * LOG_ENTRY_LEN
+    static final byte  LOG_FLAG_CLOCK       = (byte) 0x04; // the clock was moved on a second time in this tap, by more than CLOCK_JUMP (5.3)
+    static final short LOG_E_LOADS          = (short) 11;  // pieces put on in it (1, stops at 255)
+    static final short LOG_E_LOADED         = (short) 12;  // sats put on in it (4)
+    static final short LOG_LEN              = (short) 149; // LOG_HEAD_LEN + LOG_ENTRIES * LOG_ENTRY_LEN
+
+    /* ---- receipts -----------------------------------------------------------
+     * For each payment the card signs, kept after the pieces are burned: the
+     * clock (4), what the pieces were worth (4), SHA-256 of the message it
+     * signed (32), and the first output's blinded message as it was given
+     * (33; zeros for a payment with no outputs). The last RECEIPTS of them,
+     * in a ring, after a count of every payment ever (4).
+     *
+     * The log says what left the card and when. A receipt says where it went,
+     * as far as a card can: under SIG_ALL the message names every output of
+     * the one swap the mint took the signature for, and an output is made
+     * from its receiver's seed. Nobody can tell whose it is by looking; but
+     * anyone who is later shown a wallet's seed can make that wallet's
+     * outputs again and find this one among them, and the hash then pins the
+     * whole swap, piece for piece and output for output. It is what a holder
+     * has to show for a payment they did not mean to make. Read with the
+     * owner's grant and nothing less: a terminal that has the PIN cannot read
+     * it, and no command clears it. */
+    static final short RECEIPTS             = (short) 16;
+    static final short RECEIPT_LEN          = (short) 73;
+    static final short RECEIPTS_HEAD        = (short) 4;
+    static final short RECEIPTS_LEN         = (short) 1172; // RECEIPTS_HEAD + RECEIPTS * RECEIPT_LEN
+    /** Seconds: the clock moved on by more than this for a second time in one tap is written down (5.3). */
+    private static final byte[] CLOCK_JUMP = { (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x78 };
     // GET_LOG's answer: the four counts, then the taps the ring holds, newest first
     static final short LOG_ANSWER_HEAD      = (short) 16;
     // a run of this many refusals inside one tap's ten seconds is a terminal trying the limit, and is marked
@@ -479,6 +514,20 @@ public class CashuApplet extends Applet {
 
     /** Proof storage: MAX_PROOFS * PROOF_SIZE bytes */
     private byte[] proofStorage;
+    /**
+     * For each place, its nonce and its C as lowercase hex text, HEX_LEN bytes:
+     * the two parts of a piece's secret and of a payment's message that differ
+     * from piece to piece. Written when the piece is loaded, before its status
+     * byte, and read only for a place that is UNSPENT.
+     *
+     * It is here for time and nothing else. A payment's message is every
+     * piece's secret and C as text, and the card used to make that text for
+     * each piece as it was named: a hundred and thirty bytes turned to hex a
+     * byte at a time, in bytecode, most of a tenth of a second a piece on the
+     * chip, while the card was being held to a till. Now that is done once,
+     * when the piece goes on, and a payment hashes what is already written.
+     */
+    private byte[] slotHex;
 
     /** Card locked flag — once set to 1, write operations are disabled */
     private byte[] cardLocked;   // 1-byte array (persistent)
@@ -590,10 +639,22 @@ public class CashuApplet extends Applet {
     private static final short X_NUM   = (short) 108;
     private static final short X_SUM   = (short) 112;
     private static final short X_TAP   = (short) 116;
-    private static final short X_LEN   = (short) 120;
+    // an output's text for the hash, in one piece: its amount in decimal, right-aligned in ten bytes, then its B_ in hex (66)
+    private static final short X_OUT   = (short) 120;
+    private static final short X_LEN   = (short) 196;
     private byte[] scratch;
     /** The log (LOG_*). Permanent. */
     private byte[] cardLog;
+    private byte[] cardReceipts;
+    /** The first output of the payment in hand, for its receipt (RAM). */
+    private byte[] allOut;
+    /**
+     * What the card knows of the time it has been told in this time in the
+     * field (RAM, gone with the power): [0] whether it has been told, [1]
+     * whether the clock has since been moved on past CLOCK_JUMP from where
+     * that first telling left it, [2..5] where that was.
+     */
+    private byte[] timeTold;
     /** Whether this time in the field has an entry in the log yet. Gone with the power, not with a SELECT. */
     private byte[] tapOpen;
     private MessageDigest sha;
@@ -640,6 +701,7 @@ public class CashuApplet extends Applet {
 
     private CashuApplet() {
         proofStorage    = new byte[(short)(MAX_PROOFS * PROOF_SIZE)];
+        slotHex         = new byte[(short)(MAX_PROOFS * HEX_LEN)];
         cardLocked      = new byte[1];
         pinState        = new byte[1];
         pin             = new OwnerPIN(PIN_MAX_TRIES, (byte) PIN_MAX_LEN);
@@ -657,12 +719,16 @@ public class CashuApplet extends Applet {
         changeGrant     = JCSystem.makeTransientByteArray((short) 1, JCSystem.CLEAR_ON_DESELECT);
         scratch         = JCSystem.makeTransientByteArray(X_LEN, JCSystem.CLEAR_ON_DESELECT);
         cardLog         = new byte[LOG_LEN];
+        cardReceipts    = new byte[RECEIPTS_LEN];
+        allOut          = JCSystem.makeTransientByteArray((short) 33, JCSystem.CLEAR_ON_DESELECT);
+        timeTold        = JCSystem.makeTransientByteArray((short) 6, JCSystem.CLEAR_ON_RESET);
         tapOpen         = JCSystem.makeTransientByteArray((short) 1, JCSystem.CLEAR_ON_RESET);
         sha             = MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
         shaAll          = MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
         allSlots        = JCSystem.makeTransientByteArray(ALL_MOST, JCSystem.CLEAR_ON_DESELECT);
-        // [0] a payment is begun, [1] its places, [2..3] the signatures of work still to be done before it is signed, [4] it waited
-        allState        = JCSystem.makeTransientByteArray((short) 5, JCSystem.CLEAR_ON_DESELECT);
+        // [0] a payment is begun, [1] its places, [2..3] the signatures of work still to be done before it is signed, [4] it waited,
+        // [5] its first output is kept (`allOut`)
+        allState        = JCSystem.makeTransientByteArray((short) 6, JCSystem.CLEAR_ON_DESELECT);
         allSum          = JCSystem.makeTransientByteArray((short) 4, JCSystem.CLEAR_ON_DESELECT);
         lastSig         = new byte[(short) 65];
         rng             = RandomData.getInstance(RandomData.ALG_SECURE_RANDOM);
@@ -824,7 +890,9 @@ public class CashuApplet extends Applet {
         //   bit0 = secp256k1 native key generation (set — ENG-181 complete)
         //   bit1 = BIP-340 Schnorr signing (set — ENG-181 complete)
         //   bit2 = PIN supported (always set)
-        buf[6] = (byte) 0x0F; // secp256k1 + Schnorr + PIN + the limit on one payment is waited for, not refused
+        // secp256k1 + Schnorr + PIN + the limit on one payment is waited for, not refused
+        // + GET_PIECES has its two short forms and LOAD_PROOF takes several pieces (bit 4)
+        buf[6] = (byte) 0x1F;
         buf[7] = pinState[0];
         // The fork's: the first eight bytes are upstream's, so a reader that
         // knows only those still reads them right.
@@ -846,7 +914,19 @@ public class CashuApplet extends Applet {
          * and not simply appended, so that a reader that knows the thirty
          * bytes and checks for them still gets thirty. */
         if (p1 == (byte) 1) {
-            Util.arrayCopyNonAtomic(cardRecord, CARD_TAP_LIMIT_OFFSET, buf, (short) 30, (short) 4);
+            /* The limit on one payment is the holder's and is said to the
+             * holder only: with the owner's grant given in this tap, and to
+             * nobody else, not even under the PIN, which a till has. A
+             * terminal that knew it would ask for just under it, again and
+             * again, and never be made to wait. To anyone else these four
+             * bytes are zeros, which is also what a card with no such limit
+             * says: a terminal cannot tell the two apart by asking. (What it
+             * can do is find out by trying, a wait at a time: see 6a.) */
+            if (loadGrant[0] == (byte) 1) {
+                Util.arrayCopyNonAtomic(cardRecord, CARD_TAP_LIMIT_OFFSET, buf, (short) 30, (short) 4);
+            } else {
+                Util.arrayFillNonAtomic(buf, (short) 30, (short) 4, (byte) 0);
+            }
             Util.arrayCopyNonAtomic(cardRecord, CARD_TAP_WINDOW_OFFSET, buf, (short) 34, (short) 4);
             Util.arrayCopyNonAtomic(cardRecord, CARD_TAP_SPENT_OFFSET, buf, (short) 38, (short) 4);
             apdu.setOutgoingAndSend((short) 0, (short) 42);
@@ -960,15 +1040,26 @@ public class CashuApplet extends Applet {
      */
     private void processGetPieces(APDU apdu) {
         byte[] buf = apdu.getBuffer();
+        /* P2 = 2: the places named in the data, whole. A till that has chosen
+         * its pieces from the brief listing asks for those and no others. */
+        if (buf[ISO7816.OFFSET_P2] == (byte) 2) { processGetSome(apdu); return; }
+        // a form this card does not have is refused, and not answered with another
+        if (buf[ISO7816.OFFSET_P2] != (byte) 0 && buf[ISO7816.OFFSET_P2] != (byte) 1) ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
+        /* P2 = 1: the brief listing. The same pages and the same tags, and for
+         * an unspent place sixteen bytes in place of eighty-one: its keyset,
+         * its amount and its date, which is all that choosing pieces needs.
+         * Fourteen places to a page where the whole form has three. */
+        boolean brief = buf[ISO7816.OFFSET_P2] == (byte) 1;
         short from = (short)(buf[ISO7816.OFFSET_P1] & 0xFF);
         if (from >= MAX_PROOFS) ISOException.throwIt(SW_SLOT_OUT_OF_RANGE);
 
         // what fits: slots from `from` while the next entry still leaves the answer within the page
         short length = 1;
         short next = from;
+        short whole = brief ? (short)(BRIEF_LEN + 1) : PROOF_SIZE;
         while (next < MAX_PROOFS) {
             byte status = proofStorage[(short)(next * PROOF_SIZE + PROOF_STATUS_OFFSET)];
-            short cost = (status == STATUS_UNSPENT) ? PROOF_SIZE : (status == STATUS_SPENT) ? (short) 1 : (short) 0;
+            short cost = (status == STATUS_UNSPENT) ? whole : (status == STATUS_SPENT) ? (short) 1 : (short) 0;
             if ((short)(length + cost) > PAGE_MAX) break;
             length += cost;
             next++;
@@ -984,9 +1075,35 @@ public class CashuApplet extends Applet {
             if (status != STATUS_UNSPENT && status != STATUS_SPENT) continue;
             buf[0] = (byte)((status << 6) | i);
             apdu.sendBytes((short) 0, (short) 1);
-            if (status == STATUS_UNSPENT) {
+            if (status == STATUS_UNSPENT && brief) {
+                // the keyset and the amount lie together in the slot; the date is at its end
+                apdu.sendBytesLong(proofStorage, (short)(base + PROOF_KEYSET_OFFSET), (short) 12);
+                apdu.sendBytesLong(proofStorage, (short)(base + PROOF_DATE_OFFSET), (short) 4);
+            } else if (status == STATUS_UNSPENT) {
                 apdu.sendBytesLong(proofStorage, (short)(base + PROOF_KEYSET_OFFSET), PROOF_DATA_LEN);
             }
+        }
+    }
+
+    /**
+     * GET_PIECES with P2 = 2: one to BATCH_MOST places, a byte each, answered
+     * with each one's slot as GET_PROOF gives it (status, then its 81 bytes),
+     * in the order asked. An empty or spent place is answered as it is, so
+     * the terminal sees for itself that it is not what the listing said.
+     */
+    private void processGetSome(APDU apdu) {
+        short n = apdu.setIncomingAndReceive();
+        if (n < 1 || n > BATCH_MOST) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        byte[] buf = apdu.getBuffer();
+        // the places are kept aside: the answer is written over the buffer they came in
+        Util.arrayCopyNonAtomic(buf, ISO7816.OFFSET_CDATA, scratch, X_NUM, n);
+        for (short i = 0; i < n; i++) {
+            if ((short)(scratch[(short)(X_NUM + i)] & 0xFF) >= MAX_PROOFS) ISOException.throwIt(SW_SLOT_OUT_OF_RANGE);
+        }
+        apdu.setOutgoing();
+        apdu.setOutgoingLength((short)(n * PROOF_SIZE));
+        for (short i = 0; i < n; i++) {
+            apdu.sendBytesLong(proofStorage, (short)((short)(scratch[(short)(X_NUM + i)] & 0xFF) * PROOF_SIZE), PROOF_SIZE);
         }
     }
 
@@ -1066,13 +1183,18 @@ public class CashuApplet extends Applet {
         short waits = waitsFor(carry);
         Util.setShort(allState, (short) 2, waits);
         allState[4] = (byte)(waits > 0 ? 1 : 0);
+        allState[5] = (byte) 0;
 
+        /* The message's half that is the card's to build. Every piece of a
+         * payment has the same key and the same date, so everything in a
+         * secret after its nonce is the same text for all of them: built once
+         * here (`secretTail`, into the APDU buffer, which is free now that the
+         * places are in `allSlots`), and each piece is then four spans handed
+         * to the hash, two of them its own hex as it was written at loading. */
+        short tail = secretTail(buf, first);
         shaAll.reset();
         for (short i = 0; i < n; i++) {
-            short base = (short)((short)(allSlots[i] & 0xFF) * PROOF_SIZE);
-            secretInto(shaAll, base, buf);
-            toHex(proofStorage, (short)(base + PROOF_C_OFFSET), (short) 33);
-            shaAll.update(scratch, X_HEX, (short) 66);
+            secretInto(shaAll, (short)(allSlots[i] & 0xFF), buf, tail);
         }
         allState[1] = (byte) n;
         allState[0] = (byte) 1;
@@ -1094,12 +1216,17 @@ public class CashuApplet extends Applet {
             ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         }
         byte[] buf = apdu.getBuffer();
+        // the first output of the payment, for its receipt
+        if (allState[5] != (byte) 1) {
+            Util.arrayCopyNonAtomic(buf, (short)(ISO7816.OFFSET_CDATA + 4), allOut, (short) 0, (short) 33);
+            allState[5] = (byte) 1;
+        }
         short end = (short)(ISO7816.OFFSET_CDATA + len);
         for (short at = ISO7816.OFFSET_CDATA; at < end; at += ALL_OUTPUT_LEN) {
-            short digits = toDecimal(buf, at);
-            shaAll.update(scratch, (short)(X_DEC + 10 - digits), digits);
-            toHex(buf, (short)(at + 4), (short) 33);
-            shaAll.update(scratch, X_HEX, (short) 66);
+            // its amount in decimal ending where its B_ in hex begins: one span to the hash
+            short digits = decimalBefore(buf, at, (short)(X_OUT + 10));
+            hexInto(buf, (short)(at + 4), (short) 33, (short)(X_OUT + 10));
+            shaAll.update(scratch, (short)(X_OUT + 10 - digits), (short)(digits + 66));
         }
     }
 
@@ -1130,8 +1257,7 @@ public class CashuApplet extends Applet {
          * That is the one thing here whose time is the chip's and no
          * terminal's. One to a command, so that no command is longer than a
          * signature (a phone gives up on a card that is silent for long), and
-         * the answer is how many are still to come, two bytes, in place of
-         * the signature. Nothing is burned and nothing counted until they
+         * the answer is "not yet", two bytes, in place of the signature. Nothing is burned and nothing counted until they
          * are done: a card lifted in the wait has lost nothing, and whatever
          * else is sent drops the payment and the wait with it. */
         short waits = Util.getShort(allState, (short) 2);
@@ -1141,7 +1267,11 @@ public class CashuApplet extends Applet {
             Util.arrayFillNonAtomic(buf, (short) 0, (short) 64, (byte) 0);
             waits--;
             Util.setShort(allState, (short) 2, waits);
-            Util.setShort(buf, (short) 0, waits);
+            /* "Not yet", and not how many are still to come: the count would
+             * say how many limits the payment is over, and so what the limit
+             * is, to a terminal that had only to ask for a large payment and
+             * give it up. Two bytes, 00 01, every time. */
+            Util.setShort(buf, (short) 0, (short) 1);
             apdu.setOutgoingAndSend((short) 0, (short) 2);
             return;
         }
@@ -1188,6 +1318,23 @@ public class CashuApplet extends Applet {
             ISOException.throwIt(SW_TOO_MANY);
         }
         tapOpen[0] = (byte) 1;
+
+        /* The receipt, after the burn and by itself: what it says is true
+         * only of a payment that was made, and it is kept out of the burn's
+         * own transaction, which has to hold thirty-two places. A card pulled
+         * away between the two has the payment in its log and no receipt. */
+        short slot = (short)((cardReceipts[3] & 0x0F) * RECEIPT_LEN + RECEIPTS_HEAD);
+        JCSystem.beginTransaction();
+        Util.arrayCopy(cardRecord, CARD_NOW_OFFSET, cardReceipts, slot, (short) 4);
+        Util.arrayCopy(allSum, (short) 0, cardReceipts, (short)(slot + 4), (short) 4);
+        Util.arrayCopy(scratch, X_MSG, cardReceipts, (short)(slot + 8), (short) 32);
+        if (allState[5] == (byte) 1) {
+            Util.arrayCopy(allOut, (short) 0, cardReceipts, (short)(slot + 40), (short) 33);
+        } else {
+            Util.arrayFillNonAtomic(cardReceipts, (short)(slot + 40), (short) 33, (byte) 0);
+        }
+        addUint32Stop(cardReceipts, (short) 0, ONE, (short) 0);
+        JCSystem.commitTransaction();
 
         apdu.setOutgoingAndSend((short) 0, sigLen);
     }
@@ -1279,30 +1426,45 @@ public class CashuApplet extends Applet {
     }
 
     /**
-     * The NUT-10 secret of the piece at `base`, as text, into `md`: not
-     * finished, so that more can follow it. `buf` is the APDU buffer, used for
-     * the card's public key.
+     * What comes after the nonce in the NUT-10 secret of every piece of a
+     * payment, as text, into `buf` from 0; answers its length (216 at most):
+     *
+     *   ","data":"<card key>","tags":[["sigflag","SIG_ALL"]]}]
+     *   ","data":"<card key>","tags":[["locktime","<date>"],["refund","<refund key>"],["sigflag","SIG_ALL"]]}]
+     *
+     * `base` is one of the payment's slots: they are all of one date
+     * (SPEND_ALL_BEGIN has seen to it), and the key is the card's.
      */
-    private void secretInto(MessageDigest md, short base, byte[] buf) {
-        md.update(SECRET_1, (short) 0, (short) SECRET_1.length);
-        toHex(proofStorage, (short)(base + PROOF_NONCE_OFFSET), (short) 32);
-        md.update(scratch, X_HEX, (short) 64);
-        md.update(SECRET_2, (short) 0, (short) SECRET_2.length);
+    private short secretTail(byte[] buf, short base) {
+        // the key first, since exporting it uses the buffer: its hex waits in scratch while the text is begun
         short len = toCompressed(buf, cardPubKey.getW(buf, (short) 0));
         toHex(buf, (short) 0, len);
-        md.update(scratch, X_HEX, (short) 66);
-        md.update(SECRET_3, (short) 0, (short) SECRET_3.length);
+        short at = Util.arrayCopyNonAtomic(SECRET_2, (short) 0, buf, (short) 0, (short) SECRET_2.length);
+        at = Util.arrayCopyNonAtomic(scratch, X_HEX, buf, at, (short) 66);
+        at = Util.arrayCopyNonAtomic(SECRET_3, (short) 0, buf, at, (short) SECRET_3.length);
         if (isZero(proofStorage, (short)(base + PROOF_DATE_OFFSET), (short) 4)) {
-            md.update(SECRET_END, (short) 0, (short) SECRET_END.length);
-            return;
+            return Util.arrayCopyNonAtomic(SECRET_END, (short) 0, buf, at, (short) SECRET_END.length);
         }
-        md.update(SECRET_DATE, (short) 0, (short) SECRET_DATE.length);
+        at = Util.arrayCopyNonAtomic(SECRET_DATE, (short) 0, buf, at, (short) SECRET_DATE.length);
         short digits = toDecimal(proofStorage, (short)(base + PROOF_DATE_OFFSET));
-        md.update(scratch, (short)(X_DEC + 10 - digits), digits);
-        md.update(SECRET_REFUND, (short) 0, (short) SECRET_REFUND.length);
+        at = Util.arrayCopyNonAtomic(scratch, (short)(X_DEC + 10 - digits), buf, at, digits);
+        at = Util.arrayCopyNonAtomic(SECRET_REFUND, (short) 0, buf, at, (short) SECRET_REFUND.length);
         toHex(cardRecord, CARD_REFUND_OFFSET, (short) 33);
-        md.update(scratch, X_HEX, (short) 66);
-        md.update(SECRET_END_DATED, (short) 0, (short) SECRET_END_DATED.length);
+        at = Util.arrayCopyNonAtomic(scratch, X_HEX, buf, at, (short) 66);
+        return Util.arrayCopyNonAtomic(SECRET_END_DATED, (short) 0, buf, at, (short) SECRET_END_DATED.length);
+    }
+
+    /**
+     * The piece in place `idx` into `md`, as a payment's message has it: its
+     * NUT-10 secret as text and then its C in hex, not finished, so that more
+     * can follow. `buf` holds the `tail` bytes `secretTail` wrote.
+     */
+    private void secretInto(MessageDigest md, short idx, byte[] buf, short tail) {
+        short hex = (short)(idx * HEX_LEN);
+        md.update(SECRET_1, (short) 0, (short) SECRET_1.length);
+        md.update(slotHex, hex, (short) 64);
+        md.update(buf, (short) 0, tail);
+        md.update(slotHex, (short)(hex + 64), (short) 66);
     }
 
     /**
@@ -1375,31 +1537,80 @@ public class CashuApplet extends Applet {
         // forward) no older time can ever get in after it.
         if (isZero(cardRecord, CARD_NOW_OFFSET, (short) 4)) ISOException.throwIt(SW_NO_TIME);
 
-        short slot = -1;
-        for (short i = 0; i < MAX_PROOFS; i++) {
-            if (proofStorage[(short)(i * PROOF_SIZE + PROOF_STATUS_OFFSET)] == STATUS_EMPTY) {
-                slot = i;
+        // a full card says so whatever it is sent
+        if (emptySlot() < 0) ISOException.throwIt(SW_NO_SPACE);
+
+        /* One piece, or up to BATCH_MOST of them end to end: a card is loaded
+         * with thirty at a time, and a command each was most of what loading
+         * took. They are taken in order, each exactly as one alone would be.
+         * The first that cannot be stored stops it: alone, or first, it is
+         * refused with its own word, as it always was; after others, the
+         * answer is the ones that did go on, and the terminal sends the rest
+         * again to hear why. The answer is the place of each piece stored. */
+        short dataLen = apdu.setIncomingAndReceive();
+        if (dataLen < PROOF_DATA_LEN || dataLen > (short)(BATCH_MOST * PROOF_DATA_LEN)
+            || (short)(dataLen % PROOF_DATA_LEN) != (short) 0) {
+            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        }
+        byte[] buf = apdu.getBuffer();
+        short n = (short)(dataLen / PROOF_DATA_LEN);
+        short done = 0;
+        for (short k = 0; k < n; k++) {
+            short sw = loadOne(buf, (short)(ISO7816.OFFSET_CDATA + (short)(k * PROOF_DATA_LEN)), (short)(X_NUM + k));
+            if (sw != (short) 0) {
+                if (k == (short) 0) ISOException.throwIt(sw);
                 break;
             }
+            done++;
         }
-        if (slot < 0) ISOException.throwIt(SW_NO_SPACE);
+        /* And the card's own account of it (6b): what was put on in this tap,
+         * once for the command. After the pieces, which are on the card
+         * whether or not this is written. */
+        if (done > 0) {
+            Util.arrayFillNonAtomic(scratch, X_SUM, (short) 4, (byte) 0);
+            for (short k = 0; k < done; k++) {
+                addUint32Stop(scratch, X_SUM, buf, (short)(ISO7816.OFFSET_CDATA + (short)(k * PROOF_DATA_LEN) + PROOF_AMOUNT_OFFSET - 1));
+            }
+            JCSystem.beginTransaction();
+            short entry = logEntry();
+            addUint32Stop(cardLog, (short)(entry + LOG_E_LOADED), scratch, X_SUM);
+            short loads = (short)((short)(cardLog[(short)(entry + LOG_E_LOADS)] & 0xFF) + done);
+            cardLog[(short)(entry + LOG_E_LOADS)] = (byte)(loads > (short) 255 ? (short) 255 : loads);
+            JCSystem.commitTransaction();
+            tapOpen[0] = (byte) 1;
+        }
+        Util.arrayCopyNonAtomic(scratch, X_NUM, buf, (short) 0, done);
+        apdu.setOutgoingAndSend((short) 0, done);
+    }
 
-        short dataLen = apdu.setIncomingAndReceive();
-        if (dataLen != PROOF_DATA_LEN) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+    /** The first empty place, or -1. */
+    private short emptySlot() {
+        for (short i = 0; i < MAX_PROOFS; i++) {
+            if (proofStorage[(short)(i * PROOF_SIZE + PROOF_STATUS_OFFSET)] == STATUS_EMPTY) return i;
+        }
+        return (short) -1;
+    }
 
-        byte[] buf = apdu.getBuffer();
+    /**
+     * One piece, its 81 bytes at `in` in `buf`, into the first empty place.
+     * Answers 0 and leaves the place's number in scratch[`out`], or answers
+     * the status word it is refused with, having written nothing.
+     */
+    private short loadOne(byte[] buf, short in, short out) {
+        short slot = emptySlot();
+        if (slot < 0) return SW_NO_SPACE;
         /* A piece with a date names the card's refund key in its secret, so a
          * card with none cannot hold one: the card could not build the secret
          * the mint signed, and its signature would be worth nothing. */
-        if (!isZero(buf, (short)(ISO7816.OFFSET_CDATA + PROOF_DATE_OFFSET - 1), (short) 4)
+        if (!isZero(buf, (short)(in + PROOF_DATE_OFFSET - 1), (short) 4)
             && cardRecord[CARD_REFUND_OFFSET] == (byte) 0) {
-            ISOException.throwIt(SW_NO_REFUND_KEY);
+            return SW_NO_REFUND_KEY;
         }
         // not a point, or worth nothing: not a piece
-        byte c0 = buf[(short)(ISO7816.OFFSET_CDATA + PROOF_C_OFFSET - 1)];
+        byte c0 = buf[(short)(in + PROOF_C_OFFSET - 1)];
         if ((c0 != (byte) 0x02 && c0 != (byte) 0x03)
-            || isZero(buf, (short)(ISO7816.OFFSET_CDATA + PROOF_AMOUNT_OFFSET - 1), (short) 4)) {
-            ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+            || isZero(buf, (short)(in + PROOF_AMOUNT_OFFSET - 1), (short) 4)) {
+            return ISO7816.SW_WRONG_DATA;
         }
         /* Not a piece that is here already. What the card signs is the piece's
          * secret, which is its nonce (with the card's key and the date) and
@@ -1409,23 +1620,30 @@ public class CashuApplet extends Applet {
          * and the day's limit would count for nothing. A nonce that is in any
          * slot, spent or not, is refused, before anything is written. A slot
          * that CLEAR_SPENT has freed holds nothing, so that piece may be
-         * loaded again then, if its signature was lost. */
+         * loaded again then, if its signature was lost. (One of the pieces
+         * before it in the same command is in a slot by now, and is seen.) */
         for (short i = 0; i < MAX_PROOFS; i++) {
             short at = (short)(i * PROOF_SIZE);
             if (proofStorage[(short)(at + PROOF_STATUS_OFFSET)] != STATUS_EMPTY
                 && Util.arrayCompare(proofStorage, (short)(at + PROOF_NONCE_OFFSET),
-                                     buf, (short)(ISO7816.OFFSET_CDATA + PROOF_NONCE_OFFSET - 1), (short) 32) == 0) {
-                ISOException.throwIt(SW_PIECE_ON_CARD);
+                                     buf, (short)(in + PROOF_NONCE_OFFSET - 1), (short) 32) == 0) {
+                return SW_PIECE_ON_CARD;
             }
         }
         short base = (short)(slot * PROOF_SIZE);
+        short hex = (short)(slot * HEX_LEN);
+        // its nonce and its C as the text a payment hashes (`slotHex`): before the data, and long before the status byte
+        toHex(buf, (short)(in + PROOF_NONCE_OFFSET - 1), (short) 32);
+        Util.arrayCopyNonAtomic(scratch, X_HEX, slotHex, hex, (short) 64);
+        toHex(buf, (short)(in + PROOF_C_OFFSET - 1), (short) 33);
+        Util.arrayCopyNonAtomic(scratch, X_HEX, slotHex, (short)(hex + 64), (short) 66);
         // The status byte is the slot's commit, written last (D14, ENG-620).
         // Util.arrayCopy into persistent memory is atomic, and so is a single
         // byte write, but the pair is not: with the status first, a card
         // pulled between them left a slot marked UNSPENT over whatever it held
         // before. Data first, a tear leaves the slot EMPTY with the new bytes
         // in it, which no read looks at and the next LOAD_PROOF overwrites.
-        Util.arrayCopy(buf, ISO7816.OFFSET_CDATA, proofStorage, (short)(base + PROOF_KEYSET_OFFSET), PROOF_DATA_LEN);
+        Util.arrayCopy(buf, in, proofStorage, (short)(base + PROOF_KEYSET_OFFSET), PROOF_DATA_LEN);
         proofStorage[(short)(base + PROOF_STATUS_OFFSET)] = STATUS_UNSPENT;
 
         // A load that the change grant alone allowed (no verified PIN, no
@@ -1436,9 +1654,8 @@ public class CashuApplet extends Applet {
         if (pinVerifiedFlag[0] != (byte) 1 && loadGrant[0] != (byte) 1) {
             changeDue[0] = (byte) 0;
         }
-
-        buf[0] = (byte) slot;
-        apdu.setOutgoingAndSend((short) 0, (short) 1);
+        scratch[out] = (byte) slot;
+        return (short) 0;
     }
 
     private void processClearSpent(APDU apdu) {
@@ -1643,9 +1860,47 @@ public class CashuApplet extends Applet {
             good = false;
         }
         if (!good) ISOException.throwIt(SW_NOT_THE_TIME);
+        /* The card cannot know the time, only that it is not being told an
+         * earlier one. What it can see is being told twice in one time in the
+         * field, times far apart: no phone's clock moves two minutes in the
+         * one tap, and a terminal walking the clock forward to turn the day
+         * does exactly that. It is not refused (the card has no way to say
+         * which of the two was the lie) and it is written down (6b). A
+         * terminal that cuts the field between the two is not seen here; the
+         * holder's phone, which knows the time, sees a clock that is ahead
+         * of it.
+         *
+         * Judged against where the FIRST telling of this time in the field
+         * left the clock, and not against the clock as it stands: a terminal
+         * that walked it on a minute at a time would never be two minutes
+         * from where it stood. And it begins no entry in the log: SET_TIME
+         * needs no PIN, and an entry for every mark would let anybody near
+         * the card push its eight taps out of the ring with marks. The count
+         * of marked things goes up by one, once for this time in the field;
+         * the tap's entry is marked if it has one, and if it gets one later
+         * (`logEntry`). */
+        boolean jumped = false;
+        if (timeTold[0] == (byte) 1 && timeTold[1] != (byte) 1 && !isZero(timeTold, (short) 2, (short) 4)) {
+            Util.arrayCopyNonAtomic(timeTold, (short) 2, scratch, X_NUM, (short) 4);
+            jumped = addUint32Carry(scratch, X_NUM, CLOCK_JUMP, (short) 0) == 0 && cmpUint32(buf, at, scratch, X_NUM) > 0;
+        }
         // only forward; one four-byte copy, so the clock is the old time or the new
         if (cmpUint32(buf, at, cardRecord, CARD_NOW_OFFSET) > 0) {
             Util.arrayCopy(buf, at, cardRecord, CARD_NOW_OFFSET, (short) 4);
+        }
+        if (timeTold[0] != (byte) 1) {
+            timeTold[0] = (byte) 1;
+            Util.arrayCopyNonAtomic(cardRecord, CARD_NOW_OFFSET, timeTold, (short) 2, (short) 4);
+        }
+        if (jumped) {
+            timeTold[1] = (byte) 1;
+            JCSystem.beginTransaction();
+            addUint32Stop(cardLog, LOG_TAMPERS_OFFSET, ONE, (short) 0);
+            if (tapOpen[0] == (byte) 1) {
+                short entry = logEntry();
+                cardLog[(short)(entry + LOG_E_FLAGS)] |= LOG_FLAG_CLOCK;
+            }
+            JCSystem.commitTransaction();
         }
         Util.arrayCopyNonAtomic(cardRecord, CARD_NOW_OFFSET, buf, (short) 0, (short) 4);
         apdu.setOutgoingAndSend((short) 0, (short) 4);
@@ -2022,6 +2277,8 @@ public class CashuApplet extends Applet {
         if (tapOpen[0] != (byte) 1) {
             Util.arrayFillNonAtomic(cardLog, at, LOG_ENTRY_LEN, (byte) 0);
             Util.arrayCopy(cardRecord, CARD_NOW_OFFSET, cardLog, (short)(at + LOG_E_TIME), (short) 4);
+            // a clock moved twice in this time in the field, before the tap had an entry to say so
+            if (timeTold[1] == (byte) 1) cardLog[(short)(at + LOG_E_FLAGS)] = LOG_FLAG_CLOCK;
         }
         return at;
     }
@@ -2078,10 +2335,12 @@ public class CashuApplet extends Applet {
      * with no PIN yet has nothing in it, and answers anyone.
      */
     private void processGetLog(APDU apdu) {
+        byte[] buf = apdu.getBuffer();
+        if (buf[ISO7816.OFFSET_P1] == (byte) 1) { processGetReceipts(apdu); return; }
+        if (buf[ISO7816.OFFSET_P1] != (byte) 0) ISOException.throwIt(ISO7816.SW_INCORRECT_P1P2);
         if (pinState[0] != (byte) 0 && pinVerifiedFlag[0] != (byte) 1 && loadGrant[0] != (byte) 1) {
             ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
         }
-        byte[] buf = apdu.getBuffer();
         Util.arrayCopyNonAtomic(cardLog, (short) 0, buf, (short) 0, LOG_ANSWER_HEAD);
         short held = LOG_ENTRIES;
         if (isZero(cardLog, LOG_TAPS_OFFSET, (short) 3) && (short)(cardLog[(short)(LOG_TAPS_OFFSET + 3)] & 0xFF) < LOG_ENTRIES) {
@@ -2093,6 +2352,37 @@ public class CashuApplet extends Applet {
             short at = (short)(LOG_HEAD_LEN + (short)(((short)(newest - k) & 0x07) * LOG_ENTRY_LEN));
             Util.arrayCopyNonAtomic(cardLog, at, buf, out, LOG_ENTRY_LEN);
             out += LOG_ENTRY_LEN;
+        }
+        apdu.setOutgoingAndSend((short) 0, out);
+    }
+
+    /**
+     * GET_LOG with P1 = 1: the receipts. The count of every payment the card
+     * has signed (4), then up to three receipts of RECEIPT_LEN, newest first,
+     * beginning P2 back from the newest (P2 = 0 is the newest itself; one at
+     * or past what the ring holds answers the count alone).
+     *
+     * By the owner's grant, given in this tap, and nothing else: not the PIN,
+     * which a till has. (A card with no PIN yet has signed nothing.)
+     */
+    private void processGetReceipts(APDU apdu) {
+        if (pinState[0] != (byte) 0 && loadGrant[0] != (byte) 1) {
+            ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
+        }
+        byte[] buf = apdu.getBuffer();
+        short back = (short)(buf[ISO7816.OFFSET_P2] & 0xFF);
+        short held = RECEIPTS;
+        if (isZero(cardReceipts, (short) 0, (short) 3) && (short)(cardReceipts[3] & 0xFF) < RECEIPTS) {
+            held = (short)(cardReceipts[3] & 0xFF);
+        }
+        Util.arrayCopyNonAtomic(cardReceipts, (short) 0, buf, (short) 0, RECEIPTS_HEAD);
+        short out = RECEIPTS_HEAD;
+        // the payment numbered n is at (n - 1) mod 16: sixteen divides 256, so the last byte of the count says it
+        short newest = (short)(((short)(cardReceipts[3] & 0xFF) - 1) & 0x0F);
+        for (short k = back; k < held && k < (short)(back + 3); k++) {
+            short at = (short)(RECEIPTS_HEAD + (short)(((short)(newest - k) & 0x0F) * RECEIPT_LEN));
+            Util.arrayCopyNonAtomic(cardReceipts, at, buf, out, RECEIPT_LEN);
+            out += RECEIPT_LEN;
         }
         apdu.setOutgoingAndSend((short) 0, out);
     }
@@ -2136,11 +2426,40 @@ public class CashuApplet extends Applet {
 
     /** `len` bytes, 33 at most, as lowercase hex text into scratch[X_HEX]. */
     private void toHex(byte[] src, short off, short len) {
-        for (short i = 0; i < len; i++) {
-            short v = (short)(src[(short)(off + i)] & 0xFF);
-            scratch[(short)(X_HEX + 2 * i)]     = HEX[(short)(v >> 4)];
-            scratch[(short)(X_HEX + 2 * i + 1)] = HEX[(short)(v & 0x0F)];
+        hexInto(src, off, len, X_HEX);
+    }
+
+    /** `len` bytes as lowercase hex text into scratch from `at`. The arrays and the two ends are in locals: this loop is most of what the card does in bytecode. */
+    private void hexInto(byte[] src, short off, short len, short at) {
+        byte[] to = scratch;
+        byte[] hex = HEX;
+        short end = (short)(off + len);
+        while (off < end) {
+            short v = (short)(src[off++] & 0xFF);
+            to[at++] = hex[(short)(v >> 4)];
+            to[at++] = hex[(short)(v & 0x0F)];
         }
+    }
+
+    /**
+     * A big-endian uint32 as decimal text in scratch, its last digit just
+     * before `end`; answers how many digits. An amount under 32,768, which
+     * nearly every output of a swap is, is divided as a short; a larger one
+     * the long way (`toDecimal`).
+     */
+    private short decimalBefore(byte[] src, short off, short end) {
+        if (src[off] == (byte) 0 && src[(short)(off + 1)] == (byte) 0 && src[(short)(off + 2)] >= (byte) 0) {
+            short v = Util.getShort(src, (short)(off + 2));
+            short at = end;
+            do {
+                scratch[--at] = (byte)('0' + (short)(v % 10));
+                v = (short)(v / 10);
+            } while (v != (short) 0);
+            return (short)(end - at);
+        }
+        short digits = toDecimal(src, off);
+        Util.arrayCopyNonAtomic(scratch, (short)(X_DEC + 10 - digits), scratch, (short)(end - digits), digits);
+        return digits;
     }
 
     /**

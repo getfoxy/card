@@ -301,12 +301,18 @@ class CashuAppletTest {
     private long logSats() { return readUint32(log(), 4); }
     private long logRefused() { return readUint32(log(), 8); }
     private long logTampers() { return readUint32(log(), 12); }
-    private int logHeld() { return (log().length - 16) / 12; }
+    private int logHeld() { return (log().length - 16) / 16; }
     /** The tap `k` back from the newest: { the clock when it began, sats signed for, pieces, refused, flags }. */
     private long[] logTap(int k) {
         byte[] d = log();
-        int at = 16 + 12 * k;
+        int at = 16 + 16 * k;
         return new long[] { readUint32(d, at), readUint32(d, at + 4), d[at + 8] & 0xFF, d[at + 9] & 0xFF, d[at + 10] & 0xFF };
+    }
+    /** What was put on in the tap `k` back from the newest: { pieces, sats }. */
+    private long[] logLoaded(int k) {
+        byte[] d = log();
+        int at = 16 + 16 * k;
+        return new long[] { d[at + 11] & 0xFF, readUint32(d, at + 12) };
     }
     /** The card taken out of the field and put back: a new tap, selected, with the PIN. */
     private void newTap() {
@@ -319,8 +325,19 @@ class CashuAppletTest {
      * payment that is waiting.)
      */
     private byte[] infoTap() { return transmit(new CommandAPDU(CLA, INS_GET_INFO, 1, 0, 256)).getData(); }
-    /** The most the card signs for in one payment without making the terminal wait: bytes 30..33. 0 is none. */
-    private long paymentLimit() { return readUint32(infoTap(), 30); }
+    /**
+     * The most the card signs for in one payment without making the terminal wait, as the holder reads it: bytes 30..33 of
+     * GET_INFO asked for with P1 = 1, which the card gives only with the owner's grant in this tap, so the grant is given
+     * first (ALLOW_LOAD; it needs an owner, and a card that is not locked). 0 is none.
+     */
+    private long paymentLimit() {
+        assertEquals(SW_OK, allowLoad(), "the owner's grant, to read the limit on one payment");
+        return readUint32(infoTap(), 30);
+    }
+    /** The limit on one payment as the record holds it, read without a command: for a card with no owner, which can give nobody the grant. */
+    private long paymentLimitInTheRecord() throws Exception { return readUint32(field("cardRecord"), CashuApplet.CARD_TAP_LIMIT_OFFSET); }
+    /** The same four bytes as a terminal gets them, under the PIN or not: without the owner's grant they are zeros. */
+    private long paymentLimitAsATerminalSeesIt() { return readUint32(infoTap(), 30); }
     /** What the card remembers of that limit: bytes 34..41. It remembers nothing, so these are always zero. */
     private byte[] remembered() { return Arrays.copyOfRange(infoTap(), 34, 42); }
     private void assertNothingRemembered(String why) {
@@ -375,32 +392,35 @@ class CashuAppletTest {
     }
 
     /**
-     * The two-byte answers SPEND_ALL_SIGN gave in the last payment spendAll (or signAll) ran: each is how many waits were
-     * still to come after it. Empty for a payment that was not waited for, and for one refused before it was signed.
+     * The two-byte answers SPEND_ALL_SIGN gave in the last payment spendAll (or signAll) ran, as the number they say: while a
+     * payment waits the card answers "not yet", 00 01, every time, and never how many are left. Empty for a payment that was
+     * not waited for, and for one refused before it was signed.
      */
     private final java.util.List<Integer> waitAnswers = new java.util.ArrayList<>();
     /** How many times the last payment was made to wait: the two-byte answers it was given before its signature. */
     private int waitsTaken() { return waitAnswers.size(); }
-    /** Whether this is the card saying how many waits are still to come: 9000 and two bytes, where a signature is 64. */
+    /** What a payment that waits is answered, each time: 00 01. */
+    static final byte[] NOT_YET = { 0x00, 0x01 };
+    /** Whether this is the card saying a payment is waiting: 9000 and two bytes, where a signature is 64. */
     private static boolean isWait(ResponseAPDU r) { return r.getSW() == SW_OK && r.getData().length == 2; }
-    private static int waitsLeft(ResponseAPDU r) { return ((r.getData()[0] & 0xFF) << 8) | (r.getData()[1] & 0xFF); }
+    /** That this is the card's "not yet": 9000 and 00 01, the same whatever the limit is or how much is left. */
+    private static void assertNotYet(ResponseAPDU r, String why) {
+        assertEquals(SW_OK, r.getSW(), why);
+        assertArrayEquals(NOT_YET, r.getData(), why);
+    }
 
     /**
-     * SPEND_ALL_SIGN, sent again for as long as the card answers with the waits that are still to come. Answers what ends
-     * it: the signature, or a refusal. A payment of W waits is W answers, W-1 down to 0, and then that; the counting down
-     * is checked for every payment that goes through here.
+     * SPEND_ALL_SIGN, sent again for as long as the card answers "not yet". Answers what ends it: the signature, or a
+     * refusal. Every wait is checked to be exactly 00 01 and so to say nothing of how many are left; how many there were is
+     * waitsTaken().
      */
     private ResponseAPDU signAll() {
         waitAnswers.clear();
         for (int sent = 0; sent <= WAITS_MOST; sent++) {
             ResponseAPDU r = transmit(SIGN_ALL);
-            if (!isWait(r)) {
-                for (int i = 0; i < waitAnswers.size(); i++) {
-                    assertEquals(waitAnswers.size() - 1 - i, (int) waitAnswers.get(i), "wait " + (i + 1) + " of " + waitAnswers.size() + " says how many are still to come");
-                }
-                return r;
-            }
-            waitAnswers.add(waitsLeft(r));
+            if (!isWait(r)) return r;
+            assertNotYet(r, "wait " + (waitAnswers.size() + 1) + ": not yet, and not how many are still to come");
+            waitAnswers.add(1);
         }
         fail("the card is still making a payment wait after " + (WAITS_MOST + 1) + " answers, which is more than its most");
         return null;
@@ -494,7 +514,7 @@ class CashuAppletTest {
         // what a phone sends: iOS chooses by the name in the app's Info.plist, and Foxy by the same ten bytes
         ResponseAPDU whole = transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_HEX), 256));
         assertEquals(SW_OK, whole.getSW());
-        assertArrayEquals(new byte[] { 0x01, 0x05 }, whole.getData(), "the same answer either way: version 1.5");
+        assertArrayEquals(new byte[] { 0x01, 0x06 }, whole.getData(), "the same answer either way: version 1.6");
         assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)), "and its instructions follow");
     }
 
@@ -503,21 +523,21 @@ class CashuAppletTest {
     void testSelect() {
         ResponseAPDU resp = transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR)));
         assertEquals(SW_OK, resp.getSW());
-        assertArrayEquals(new byte[] { 0x01, 0x05 }, resp.getData(), "version 1.5: the limit on one payment is waited for");
+        assertArrayEquals(new byte[] { 0x01, 0x06 }, resp.getData(), "version 1.6: the same card, made quicker to hold");
         assertNotEquals(SW_OK, sw(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(UPSTREAM_AID))),
             "an upstream reader must not find this applet under upstream's AID: the wire is not the same");
     }
 
     @Test
-    @DisplayName("GET_INFO on a new card: 30 bytes: version 1.5, 64 empty slots, no PIN, three tries, format 4, capabilities 0F, no record, no limit, no owner, no time, no change due")
+    @DisplayName("GET_INFO on a new card: 30 bytes: version 1.6, 64 empty slots, no PIN, three tries, format 4, capabilities 1F, no record, no limit, no owner, no time, no change due")
     void testInfoFresh() {
         byte[] d = info();
         assertEquals(30, d.length);
-        assertEquals(1, d[0]); assertEquals(5, d[1]);
+        assertEquals(1, d[0]); assertEquals(6, d[1]);
         assertEquals(MAX_PROOFS, d[2] & 0xFF);
         assertEquals(0, d[3]); assertEquals(0, d[4]);
         assertEquals(MAX_PROOFS, d[5] & 0xFF);
-        assertEquals(0x0F, d[6], "secp256k1, Schnorr, PIN, and the limit on one payment waited for and not refused (it was 07)");
+        assertEquals(0x1F, d[6], "secp256k1, Schnorr, PIN, the limit on one payment waited for and not refused, and the 1.6 forms: several pieces to a LOAD_PROOF and GET_PIECES' two short listings (it was 0F, and 07 before)");
         assertEquals(0, d[7], "no PIN");
         assertEquals(4, d[8], "format");
         assertEquals(3, d[9], "tries");
@@ -689,7 +709,9 @@ class CashuAppletTest {
     private static final class Page {
         final int next, length;
         final java.util.List<Object[]> entries = new java.util.ArrayList<>();
-        Page(byte[] d) {
+        Page(byte[] d) { this(d, 81); }
+        /** `unspentLen` is what an unspent place carries after its tag: 81 whole, 16 in the brief listing. */
+        Page(byte[] d, int unspentLen) {
             length = d.length;
             next = d[0] & 0xFF;
             int at = 1;
@@ -697,7 +719,7 @@ class CashuAppletTest {
                 int tag = d[at++] & 0xFF;
                 int state = tag >> 6, slot = tag & 0x3F;
                 byte[] piece = null;
-                if (state == 1) { piece = Arrays.copyOfRange(d, at, at + 81); at += 81; }
+                if (state == 1) { piece = Arrays.copyOfRange(d, at, at + unspentLen); at += unspentLen; }
                 entries.add(new Object[] { slot, state, piece });
             }
             assertEquals(d.length, at, "the answer is made of whole entries");
@@ -835,6 +857,1912 @@ class CashuAppletTest {
         // a locked or blocked card still tells what it holds, as GET_PROOF does
         assertEquals(SW_OK, lock());
         assertEquals(SW_OK, pieces(0).getSW());
+    }
+
+    // =========================================================================
+    // Version 1.6: the text kept beside each place, several pieces to a command, the short listings
+    // =========================================================================
+
+    /** A piece as LOAD_PROOF takes it, 81 bytes, with the nonce and the C asked for: keyset (8), amount (4), nonce (32), C (33), date (4). */
+    static byte[] proofOf(byte[] nonce, byte[] c, long amount, long date) {
+        assertEquals(32, nonce.length);
+        assertEquals(33, c.length);
+        byte[] p = new byte[81];
+        System.arraycopy(hexToBytes(KEYSET), 0, p, 0, 8);
+        putUint32(p, 8, amount);
+        System.arraycopy(nonce, 0, p, 12, 32);
+        System.arraycopy(c, 0, p, 44, 33);
+        putUint32(p, 77, date);
+        return p;
+    }
+
+    /** A piece as GET_PROOF gives it while it is unspent, and as allMessage reads a place: a status byte, then the 81 bytes that were sent. */
+    static byte[] asSlot(byte[] proof) { return concat(new byte[] { 1 }, proof); }
+
+    /** Bytes that are every edge of a hex digit pair: leading zeros, a zero nibble either side, all ones, a high bit. */
+    private static final int[] EDGE_BYTES = { 0x00, 0x0f, 0xf0, 0xff, 0x80, 0x08, 0x01, 0x10, 0x7f, 0xa5 };
+
+    private static byte[] edgeBytes(int len, int zeroLead, int shift) {
+        byte[] b = new byte[len];
+        for (int i = zeroLead; i < len; i++) b[i] = (byte) EDGE_BYTES[(i + shift) % EDGE_BYTES.length];
+        return b;
+    }
+
+    /** One of six pieces whose nonces and Cs are all edge cases of hex text, with that date; k = 0..5, and 1 << k sats. */
+    static byte[] edgeProof(int k, long date) {
+        byte[] nonce, c;
+        switch (k % 6) {
+            case 0:  nonce = new byte[32]; c = new byte[33]; c[0] = 0x02; break;
+            case 1:  nonce = new byte[32]; Arrays.fill(nonce, (byte) 0xff); c = new byte[33]; Arrays.fill(c, (byte) 0xff); c[0] = 0x03; break;
+            case 2:  nonce = edgeBytes(32, 0, 0); c = edgeBytes(33, 1, 3); c[0] = 0x02; break;
+            case 3:  nonce = edgeBytes(32, 5, 1); c = edgeBytes(33, 1, 7); c[0] = 0x03; break;
+            case 4:  nonce = edgeBytes(32, 0, 5); nonce[31] = 0; c = edgeBytes(33, 1, 2); c[0] = 0x02; c[32] = 0; break;
+            default: nonce = edgeBytes(32, 0, 8); nonce[0] = (byte) 0x80; nonce[1] = 0x08; c = edgeBytes(33, 1, 4); c[0] = 0x03; c[1] = 0x0f; break;
+        }
+        return proofOf(nonce, c, 1L << (k % 6), date);
+    }
+
+    /** Several pieces end to end in one LOAD_PROOF: the places they went to, a byte each, or the word that refused the first. */
+    private ResponseAPDU loadBatch(byte[]... proofs) { return loadRaw(concat(proofs)); }
+    private ResponseAPDU loadRaw(byte[] data) { return transmit(new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, data, 3)); }
+    private int placeStatus(int place) { return transmit(new CommandAPDU(CLA, INS_GET_SLOT_STATUS, 0, 0, 256)).getData()[place]; }
+
+    @Test
+    @DisplayName("A payment's signature is over the text of each piece as it was sent, however it was loaded (singly, two to a command, three to a command), dated or not, with nonces and Cs of every edge of hex: for one piece, for several, and in the order named")
+    void testTheStoredHexIsWhatIsHashed() throws Exception {
+        long[] dates = { 0L, 7L, 1900000000L, 4294967295L };
+        for (int mode = 1; mode <= 3; mode++) {
+            for (long date : dates) {
+                String what = (mode == 1 ? "loaded singly" : "loaded " + mode + " to a command") + ", date " + date;
+                simulator = freshCard();
+                ready();
+                byte[][] sent = new byte[6][];
+                for (int k = 0; k < 6; k++) sent[k] = edgeProof(k, date);
+                for (int at = 0; at < 6; at += mode) {
+                    byte[][] group = Arrays.copyOfRange(sent, at, at + mode);
+                    ResponseAPDU r = mode == 1 ? load(group[0]) : loadBatch(group);
+                    assertEquals(SW_OK, r.getSW(), what);
+                    assertEquals(mode, r.getData().length, what + ": a place for each");
+                    for (int j = 0; j < mode; j++) assertEquals(at + j, r.getData()[j] & 0xFF, what + ": in order");
+                }
+                // what is kept beside each place is the text of what was sent: the nonce's 64 hex characters and the C's 66
+                byte[] kept = field("slotHex");
+                for (int k = 0; k < 6; k++) {
+                    String expected = toHex(Arrays.copyOfRange(sent[k], 12, 44)) + toHex(Arrays.copyOfRange(sent[k], 44, 77));
+                    assertEquals(expected, new String(kept, k * 130, 130, StandardCharsets.US_ASCII), what + ": the text kept beside place " + k);
+                    assertArrayEquals(asSlot(sent[k]), slot(k), what + ": and the slot is what was sent");
+                }
+                newTap();
+                // one piece alone
+                ResponseAPDU alone = spend(0);
+                assertEquals(SW_OK, alone.getSW(), what);
+                assertTrue(signedForAll(alone.getData(), new byte[][] { asSlot(sent[0]) }, new byte[0][], REFUND), what + ": one piece alone");
+                byte[] wrong = sent[0].clone();
+                wrong[43] ^= 0x01;
+                assertFalse(signedForAll(alone.getData(), new byte[][] { asSlot(wrong) }, new byte[0][], REFUND), what + ": and the check can say no, for one nibble of the nonce");
+                // two pieces, into outputs
+                byte[][] outs = { output(2, blinded(1)), output(1, blinded(2)) };
+                ResponseAPDU two = spendAll(new int[] { 1, 2 }, outs);
+                assertEquals(SW_OK, two.getSW(), what);
+                assertTrue(signedForAll(two.getData(), new byte[][] { asSlot(sent[1]), asSlot(sent[2]) }, outs, REFUND), what + ": two pieces");
+                assertFalse(signedForAll(two.getData(), new byte[][] { asSlot(sent[2]), asSlot(sent[1]) }, outs, REFUND), what + ": in the order named");
+                // three, named out of their order
+                byte[][] outs3 = { output(4, blinded(3)) };
+                ResponseAPDU three = spendAll(new int[] { 5, 3, 4 }, outs3);
+                assertEquals(SW_OK, three.getSW(), what);
+                assertTrue(signedForAll(three.getData(), new byte[][] { asSlot(sent[5]), asSlot(sent[3]), asSlot(sent[4]) }, outs3, REFUND), what + ": three pieces");
+                assertEquals(0, balance(), what);
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("A place that is spent, freed with CLEAR_SPENT and loaded again with a different piece hashes the new piece's text and never the old one's: another nonce only, another C only, both; and the same in a batch")
+    void testAFreedPlaceHashesItsNewPiece() throws Exception {
+        ready();
+        byte[] bystander = edgeProof(5, 0);
+        byte[] old = edgeProof(2, 0);
+        // the places: 0 is to be spent, freed and used again; 1 holds a piece that is never touched
+        assertEquals(SW_OK, load(old).getSW());
+        assertEquals(SW_OK, load(bystander).getSW());
+        byte[] nonceOnly = old.clone();   nonceOnly[43] ^= 0xff; putUint32(nonceOnly, 8, 3);     // another last byte of the nonce, the same C
+        byte[] cOnly = nonceOnly.clone(); cOnly[76] ^= 0x01; putUint32(cOnly, 8, 5);             // the same nonce, another C
+        byte[] both = proofOf(edgeBytes(32, 3, 6), edgeBytes(33, 1, 9), 9, 0);                  // another of each
+        both[44] = 0x03;
+        byte[][] rounds = { old, nonceOnly, cOnly, both };
+        for (int i = 0; i < rounds.length; i++) {
+            if (i > 0) {
+                ResponseAPDU again = load(rounds[i]);
+                assertEquals(SW_OK, again.getSW(), "round " + i);
+                assertEquals(0, again.getData()[0], "round " + i + ": the same place number, 0, the first that is empty");
+            }
+            assertArrayEquals(asSlot(rounds[i]), slot(0), "round " + i);
+            ResponseAPDU r = spend(0);
+            assertEquals(SW_OK, r.getSW(), "round " + i);
+            assertTrue(signedForAll(r.getData(), new byte[][] { asSlot(rounds[i]) }, new byte[0][], REFUND), "round " + i + ": the text of the piece that is there");
+            for (int before = 0; before < i; before++) {
+                assertFalse(signedForAll(r.getData(), new byte[][] { asSlot(rounds[before]) }, new byte[0][], REFUND), "round " + i + ": and not the text of the piece that was there in round " + before);
+            }
+            assertEquals(SW_OK, clearSpent(), "round " + i);
+            assertEquals(0, placeStatus(0), "round " + i + ": freed");
+        }
+        // the bystander, which was never touched, still hashes as itself
+        ResponseAPDU by = spend(1);
+        assertTrue(signedForAll(by.getData(), new byte[][] { asSlot(bystander) }, new byte[0][], REFUND), "the piece beside it, untouched");
+
+        // a batch into freed places: 0 and 2 are freed and used again, with the old nonce at 0 and a new one at 2
+        simulator = freshCard();
+        ready();
+        byte[][] first = { edgeProof(0, 0), edgeProof(1, 0), edgeProof(2, 0), edgeProof(3, 0) };
+        ResponseAPDU a = loadBatch(first[0], first[1], first[2]);
+        assertEquals(SW_OK, a.getSW());
+        assertEquals(SW_OK, load(first[3]).getSW());
+        ResponseAPDU paid = spendAll(new int[] { 0, 2 }, new byte[0][]);
+        assertEquals(SW_OK, paid.getSW());
+        assertEquals(SW_OK, clearSpent());
+        byte[] reused0 = first[0].clone(); reused0[76] ^= 0x10;     // the nonce that was at place 0, another C
+        byte[] new2 = edgeProof(4, 0);
+        byte[] new4 = edgeProof(5, 0);
+        ResponseAPDU filled = loadBatch(reused0, new2, new4);
+        assertEquals(SW_OK, filled.getSW());
+        assertArrayEquals(new byte[] { 0, 2, 4 }, filled.getData(), "the freed places first, in order, then the next that is empty");
+        ResponseAPDU all = spendAll(new int[] { 0, 2, 4, 1, 3 }, new byte[0][]);
+        assertEquals(SW_OK, all.getSW());
+        assertTrue(signedForAll(all.getData(), new byte[][] { asSlot(reused0), asSlot(new2), asSlot(new4), asSlot(first[1]), asSlot(first[3]) }, new byte[0][], REFUND),
+            "the new pieces' text where they went, and the old pieces' that stayed");
+        assertFalse(signedForAll(all.getData(), new byte[][] { asSlot(first[0]), asSlot(first[2]), asSlot(new4), asSlot(first[1]), asSlot(first[3]) }, new byte[0][], REFUND),
+            "and not the text that was in those places before");
+    }
+
+    /** Pay `output` amounts out of one place and check the signature against the message the test builds itself. */
+    private void assertOutputsSigned(String what, byte[] piece, int place, byte[][] outputs, int[] groups) throws Exception {
+        assertEquals(SW_OK, sw(beginCommand(place)), what);
+        int at = 0, g = 0;
+        while (at < outputs.length) {
+            int n = Math.min(groups[g++ % groups.length], outputs.length - at);
+            assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_SPEND_ALL_OUTPUTS, 0, 0, concat(Arrays.copyOfRange(outputs, at, at + n)))), what + ": outputs " + at + " to " + (at + n - 1));
+            at += n;
+        }
+        ResponseAPDU r = signAll();
+        assertEquals(SW_OK, r.getSW(), what);
+        assertTrue(signedForAll(r.getData(), new byte[][] { asSlot(piece) }, outputs, REFUND), what + ": signed over the amounts as decimal text");
+    }
+
+    @Test
+    @DisplayName("Every output's amount is hashed as its decimal text, by the short division and by the long one: 0, 1, 9, 10, 99, 100, 255, 256, 32766, 32767, 32768, 32769, 65535, 65536, 1000000, 4294967295 and more; each alone, six to a command, one to a command, and in groups of every size")
+    void testOutputAmountsAreHashedAsDecimal() throws Exception {
+        long[] amounts = { 0, 1, 9, 10, 11, 99, 100, 101, 255, 256, 1000, 9999, 10000, 12345, 32766, 32767, 32768, 32769, 40000, 65535, 65536, 65537,
+                           99999, 100000, 1000000, 16777215, 16777216, 999999999L, 1000000000L, 2147483647L, 2147483648L, 4294967294L, 4294967295L };
+        byte[][] outputs = new byte[amounts.length][];
+        for (int i = 0; i < amounts.length; i++) {
+            byte[] b = blinded(i + 1);
+            if (i % 5 == 1) { b = new byte[33]; b[0] = 0x02; }                       // a B_ of 02 and zeros
+            if (i % 5 == 3) { b = new byte[33]; Arrays.fill(b, (byte) 0xff); b[0] = 0x03; }   // a B_ of 03 and ones
+            outputs[i] = output(amounts[i], b);
+        }
+        simulator = freshCard();
+        ready();
+        byte[][] pieces = new byte[amounts.length + 6][];
+        for (int i = 0; i < pieces.length; i++) pieces[i] = buildProof(KEYSET, 50 + i, i + 1);
+        for (int at = 0; at < pieces.length; at += 3) {
+            ResponseAPDU r = loadBatch(Arrays.copyOfRange(pieces, at, Math.min(pieces.length, at + 3)));
+            assertEquals(SW_OK, r.getSW());
+        }
+        newTap();
+        int place = 0;
+        // each amount alone, as the only output of a payment
+        for (int i = 0; i < amounts.length; i++) {
+            assertOutputsSigned("amount " + amounts[i] + " alone", pieces[place], place, new byte[][] { outputs[i] }, new int[] { 1 });
+            place++;
+        }
+        // every amount in one payment: six to a command (the most a command takes), then one to a command, then groups of every size
+        assertOutputsSigned("all of them, six to a command", pieces[place], place, outputs, new int[] { 6 });
+        place++;
+        assertOutputsSigned("all of them, one to a command", pieces[place], place, outputs, new int[] { 1 });
+        place++;
+        assertOutputsSigned("all of them, in groups of 1 to 6", pieces[place], place, outputs, new int[] { 1, 2, 3, 4, 5, 6, 3, 2 });
+        place++;
+        // and over two pieces at once, the outputs following both pieces' text
+        ResponseAPDU both = spendAll(new int[] { place, place + 1 }, Arrays.copyOfRange(outputs, 14, 24));
+        assertEquals(SW_OK, both.getSW());
+        assertTrue(signedForAll(both.getData(), new byte[][] { asSlot(pieces[place]), asSlot(pieces[place + 1]) }, Arrays.copyOfRange(outputs, 14, 24), REFUND), "ten outputs after two pieces");
+    }
+
+    // ---- the short listings (GET_PIECES, P2 = 1 and 2) -----------------------------------
+
+    private ResponseAPDU briefPieces(int from) { return transmit(new CommandAPDU(CLA, INS_GET_PIECES, from, 1, 256)); }
+    private ResponseAPDU somePieces(byte[] places) { return transmit(new CommandAPDU(CLA, INS_GET_PIECES, 0, 2, places, 256)); }
+
+    /** Every place as the card holds it: null where it is empty, and its slot as GET_PROOF gives it where it is not. */
+    private byte[][] allSlots() {
+        byte[] status = transmit(new CommandAPDU(CLA, INS_GET_SLOT_STATUS, 0, 0, 256)).getData();
+        byte[][] s = new byte[MAX_PROOFS][];
+        for (int i = 0; i < MAX_PROOFS; i++) s[i] = status[i] == 0 ? null : slot(i);
+        return s;
+    }
+
+    /**
+     * The listing a card is to give from P1 = `from`, worked out from the slots by the rule alone and not by asking the
+     * card: next (1), then for each place that is not empty its tag, (state << 6) | place, and for an unspent one its 81 bytes
+     * (whole form) or its keyset, amount and date, 16 (brief form). A page is at most 255 bytes, and holds places while the
+     * next entry still fits; an empty place costs nothing.
+     */
+    private static byte[] listingFrom(byte[][] slots, int from, boolean brief) {
+        java.io.ByteArrayOutputStream body = new java.io.ByteArrayOutputStream();
+        int length = 1, next = from;
+        while (next < MAX_PROOFS) {
+            int state = slots[next] == null ? 0 : slots[next][0];
+            int cost = state == 1 ? (brief ? 17 : 82) : state == 2 ? 1 : 0;
+            if (length + cost > 255) break;
+            if (state != 0) {
+                body.write((state << 6) | next);
+                if (state == 1) {
+                    byte[] s = slots[next];
+                    if (brief) { body.write(s, 1, 12); body.write(s, 78, 4); } else body.write(s, 1, 81);
+                }
+            }
+            length += cost;
+            next++;
+        }
+        return concat(new byte[] { (byte) next }, body.toByteArray());
+    }
+
+    /**
+     * A card with empty, unspent and spent places: forty pieces (a few of them dated) loaded three to a command, ten of them
+     * paid and freed, which leaves holes, two new ones put into the first two holes, and seven more paid and left spent.
+     * Places 4, 9, 10, 17, 18, 19, 20, 33 and 40 to 63 are empty; 0, 5, 6, 12, 25, 26, 38 are spent; the rest are unspent.
+     */
+    private void mixedCard() {
+        ready();
+        byte[][] sent = new byte[40][];
+        for (int i = 0; i < 40; i++) sent[i] = buildProof(KEYSET, 100 + i, i + 1, i % 7 == 3 ? 1900000000L : 0);
+        for (int at = 0; at < 40; at += 3) {
+            byte[][] group = Arrays.copyOfRange(sent, at, Math.min(40, at + 3));
+            ResponseAPDU r = loadBatch(group);
+            assertEquals(SW_OK, r.getSW());
+            assertEquals(group.length, r.getData().length);
+        }
+        for (int h : new int[] { 2, 3, 4, 9, 10, 17, 18, 19, 20, 33 }) assertEquals(SW_OK, spend(h).getSW(), "paid " + h);
+        assertEquals(SW_OK, clearSpent());
+        ResponseAPDU filled = loadBatch(buildProof(KEYSET, 500, 61), buildProof(KEYSET, 501, 62, 1900000000L));
+        assertArrayEquals(new byte[] { 2, 3 }, filled.getData());
+        for (int s : new int[] { 0, 5, 6, 12, 25, 26, 38 }) assertEquals(SW_OK, spend(s).getSW(), "paid " + s);
+    }
+
+    @Test
+    @DisplayName("GET_PIECES P2 = 1, the brief listing: from every starting place, on a card of empty, unspent and spent places, each page is what the rule gives from the slots, in the whole form and the brief; the tags and the chain of next are the whole form's places, and an unspent entry is 16 bytes: its keyset, amount and date")
+    void testBriefListing() {
+        mixedCard();
+        reselect();     // a new tap: the PIN is not verified, and neither listing asks for it
+        byte[][] slots = allSlots();
+        for (int from = 0; from < MAX_PROOFS; from++) {
+            for (int form = 0; form <= 1; form++) {
+                ResponseAPDU r = form == 0 ? pieces(from) : briefPieces(from);
+                assertEquals(SW_OK, r.getSW(), "from " + from);
+                assertArrayEquals(listingFrom(slots, from, form == 1), r.getData(), (form == 1 ? "brief" : "whole") + " page from place " + from);
+            }
+        }
+        // walked to the end, the two forms list the same places in the same states, once each
+        java.util.List<Object[]> whole = new java.util.ArrayList<>(), brief = new java.util.ArrayList<>();
+        int wholePages = 0, briefPages = 0;
+        for (int from = 0; from < MAX_PROOFS; wholePages++) {
+            Page page = new Page(pieces(from).getData());
+            assertTrue(page.next > from, "every whole answer moves on");
+            whole.addAll(page.entries);
+            from = page.next;
+        }
+        for (int from = 0; from < MAX_PROOFS; briefPages++) {
+            Page page = new Page(briefPieces(from).getData(), 16);
+            assertTrue(page.next > from, "every brief answer moves on");
+            brief.addAll(page.entries);
+            from = page.next;
+        }
+        assertEquals(whole.size(), brief.size(), "the same places listed");
+        int unspent = 0, spent = 0;
+        for (int i = 0; i < whole.size(); i++) {
+            assertEquals(whole.get(i)[0], brief.get(i)[0], "the same place " + i);
+            assertEquals(whole.get(i)[1], brief.get(i)[1], "in the same state, the same tag");
+            int place = (int) brief.get(i)[0];
+            if ((int) brief.get(i)[1] == 1) {
+                unspent++;
+                byte[] w = (byte[]) whole.get(i)[2], b = (byte[]) brief.get(i)[2];
+                assertEquals(16, b.length);
+                assertArrayEquals(Arrays.copyOfRange(slots[place], 1, 9), Arrays.copyOfRange(b, 0, 8), "place " + place + ": its keyset");
+                assertArrayEquals(Arrays.copyOfRange(slots[place], 9, 13), Arrays.copyOfRange(b, 8, 12), "place " + place + ": its amount");
+                assertArrayEquals(Arrays.copyOfRange(slots[place], 78, 82), Arrays.copyOfRange(b, 12, 16), "place " + place + ": its date");
+                assertArrayEquals(Arrays.copyOfRange(w, 0, 12), Arrays.copyOfRange(b, 0, 12), "the whole form's keyset and amount");
+                assertArrayEquals(Arrays.copyOfRange(w, 77, 81), Arrays.copyOfRange(b, 12, 16), "and its date");
+            } else {
+                spent++;
+                assertNull(brief.get(i)[2], "a spent place is its tag alone, as in the whole form");
+            }
+        }
+        assertEquals(25, unspent);
+        assertEquals(7, spent);
+        assertTrue(briefPages < wholePages, "the brief form is fewer answers: " + briefPages + " against " + wholePages);
+    }
+
+    @Test
+    @DisplayName("GET_PIECES P2 = 1 puts 14 unspent places on a page (1 + 14 * 17 = 239) and starts the 15th on the next, skipping the empty places between; spent tags fill it to 255 and not a byte over; place 64 is 6A83; an empty card is one byte")
+    void testBriefPageEdge() {
+        ready();
+        assertArrayEquals(new byte[] { 64 }, briefPieces(0).getData(), "an empty card: nothing more to ask for");
+        assertEquals(SW_SLOT_OUT_OF_RANGE, briefPieces(MAX_PROOFS).getSW());
+        assertEquals(SW_SLOT_OUT_OF_RANGE, briefPieces(255).getSW());
+        for (int at = 0; at < 15; at += 3) {
+            assertEquals(SW_OK, loadBatch(buildProof(KEYSET, 1 + at, at + 1), buildProof(KEYSET, 2 + at, at + 2), buildProof(KEYSET, 3 + at, at + 3)).getSW());
+        }
+        Page one = new Page(briefPieces(0).getData(), 16);
+        assertEquals(239, one.length, "1 + 14 * 17");
+        assertEquals(14, one.next);
+        assertEquals(14, one.entries.size());
+        Page two = new Page(briefPieces(14).getData(), 16);
+        assertEquals(18, two.length);
+        assertEquals(64, two.next);
+        assertEquals(14, two.entries.get(0)[0], "the 15th starts the next page");
+        // 14 unspent, an empty place, and a 15th: the empty place costs nothing and goes on the first page
+        assertEquals(SW_OK, load(buildProof(KEYSET, 20, 40)).getSW());          // place 15
+        assertEquals(SW_OK, spend(14).getSW());
+        assertEquals(SW_OK, clearSpent());                                       // place 14 is empty
+        Page gap = new Page(briefPieces(0).getData(), 16);
+        assertEquals(239, gap.length);
+        assertEquals(15, gap.next, "next is the first place not covered: the empty place went with the page");
+        Page rest = new Page(briefPieces(gap.next).getData(), 16);
+        assertEquals(1, rest.entries.size());
+        assertEquals(15, rest.entries.get(0)[0]);
+
+        // spent tags cost a byte each: 14 unspent and 16 spent make 255 exactly, and a 17th spent tag is for the next page
+        simulator = freshCard();
+        ready();
+        for (int at = 0; at < 32; at += 3) {
+            byte[][] group = new byte[Math.min(3, 32 - at)][];
+            for (int j = 0; j < group.length; j++) group[j] = buildProof(KEYSET, 1 + at + j, at + j + 1);
+            assertEquals(SW_OK, loadBatch(group).getSW());
+        }
+        int[] sixteen = new int[16];
+        for (int i = 0; i < 16; i++) sixteen[i] = 14 + i;
+        assertEquals(SW_OK, spendAll(sixteen, new byte[0][]).getSW());
+        Page full = new Page(briefPieces(0).getData(), 16);
+        assertEquals(255, full.length, "14 unspent and 16 spent tags");
+        assertEquals(30, full.next, "and the unspent place 30 is for the next page");
+        assertEquals(30, full.entries.size());
+        assertEquals(SW_OK, spend(30).getSW());
+        Page over = new Page(briefPieces(0).getData(), 16);
+        assertEquals(255, over.length, "a 17th spent tag would be 256");
+        assertEquals(30, over.next, "so it starts the next page");
+        Page tail = new Page(briefPieces(over.next).getData(), 16);
+        assertEquals(2, tail.entries.size());
+        assertEquals(30, tail.entries.get(0)[0]);
+        assertEquals(2, tail.entries.get(0)[1], "a spent tag");
+        assertEquals(31, tail.entries.get(1)[0]);
+        assertEquals(1, tail.entries.get(1)[1]);
+    }
+
+    @Test
+    @DisplayName("GET_PIECES P2 = 1 changes nothing and asks for no PIN, on a locked or blocked card as well, and says the same twice")
+    void testBriefListingReadOnly() {
+        mixedCard();
+        byte[] infoBefore = info();
+        byte[] first = briefPieces(0).getData();
+        assertArrayEquals(first, briefPieces(0).getData(), "asking twice says the same");
+        assertArrayEquals(infoBefore, info());
+        reselect();
+        assertEquals(SW_OK, briefPieces(0).getSW(), "no PIN verified in this tap");
+        assertArrayEquals(first, briefPieces(0).getData());
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, lock());
+        assertArrayEquals(first, briefPieces(0).getData(), "a locked card still tells what it holds");
+    }
+
+    @Test
+    @DisplayName("GET_PIECES P2 = 2: one, two or three places, in any order and repeated, each answered as GET_PROOF gives it (status, then 81 bytes), whatever its state; 6700 for none and for four; 6A83 for place 64")
+    void testSomePieces() throws Exception {
+        mixedCard();
+        reselect();
+        byte[] storage = field("proofStorage");
+        // 1 unspent; 0 spent; 4 empty after being freed; 50 never used; 3 dated and unspent (loaded into a hole)
+        int[][] asked = { { 1 }, { 0 }, { 4 }, { 50 }, { 3 }, { 63 }, { 1, 0 }, { 0, 1 }, { 4, 3 }, { 1, 0, 4 }, { 4, 0, 1 }, { 3, 50, 0 },
+                          { 1, 1 }, { 0, 0, 0 }, { 3, 1, 3 }, { 7, 7, 7 }, { 12, 12 }, { 63, 0, 63 } };
+        for (int[] places : asked) {
+            byte[] request = new byte[places.length];
+            for (int i = 0; i < places.length; i++) request[i] = (byte) places[i];
+            ResponseAPDU r = somePieces(request);
+            String what = "places " + Arrays.toString(places);
+            assertEquals(SW_OK, r.getSW(), what);
+            assertEquals(82 * places.length, r.getData().length, what);
+            for (int i = 0; i < places.length; i++) {
+                byte[] got = Arrays.copyOfRange(r.getData(), 82 * i, 82 * i + 82);
+                int status = placeStatus(places[i]);
+                if (status != 0) assertArrayEquals(slot(places[i]), got, what + ": place " + places[i] + " as GET_PROOF gives it");
+                assertArrayEquals(Arrays.copyOfRange(storage, places[i] * 82, places[i] * 82 + 82), got, what + ": place " + places[i] + ", the slot itself, in the order asked");
+                assertEquals(status, got[0], what + ": its state, whatever it is");
+            }
+        }
+        assertArrayEquals(new byte[82], Arrays.copyOfRange(somePieces(new byte[] { 4 }).getData(), 0, 82), "an empty place is nothing: a status of 0 and zeros");
+        // the wrong number of places
+        assertEquals(SW_WRONG_LENGTH, transmit(new CommandAPDU(CLA, INS_GET_PIECES, 0, 2, 256)).getSW(), "none: no data");
+        assertEquals(SW_WRONG_LENGTH, somePieces(new byte[0]).getSW(), "none: empty data");
+        assertEquals(SW_WRONG_LENGTH, somePieces(new byte[] { 0, 1, 2, 3 }).getSW(), "four");
+        assertEquals(SW_WRONG_LENGTH, somePieces(new byte[] { 1, 1, 1, 1 }).getSW(), "four, the same one");
+        assertEquals(SW_WRONG_LENGTH, somePieces(new byte[40]).getSW(), "forty");
+        assertEquals(0, somePieces(new byte[] { 0, 1, 2, 3 }).getData().length, "and nothing is answered with a refusal");
+        // a place that is not one
+        assertEquals(SW_SLOT_OUT_OF_RANGE, somePieces(new byte[] { 64 }).getSW());
+        assertEquals(SW_SLOT_OUT_OF_RANGE, somePieces(new byte[] { 0, 64 }).getSW(), "anywhere among them");
+        assertEquals(SW_SLOT_OUT_OF_RANGE, somePieces(new byte[] { 1, 2, (byte) 255 }).getSW());
+        assertEquals(0, somePieces(new byte[] { 1, 64, 2 }).getData().length, "and none of the others is answered");
+        // it asks for no PIN and changes nothing
+        byte[] before = storage.clone();
+        assertEquals(SW_OK, somePieces(new byte[] { 1, 2, 3 }).getSW());
+        assertArrayEquals(before, field("proofStorage"));
+    }
+
+    @Test
+    @DisplayName("Three pieces to one LOAD_PROOF are three places, a byte each in the answer, and are all there; the card is as if they had been loaded one at a time, slots and text; a batch of one is the form it always was")
+    void testABatchOfThreeIsThreePieces() throws Exception {
+        byte[][] sent = new byte[9][];
+        for (int i = 0; i < 6; i++) sent[i] = edgeProof(i, 0);
+        for (int i = 6; i < 9; i++) sent[i] = buildProof(KEYSET, 40 + i, 60 + i, i == 7 ? 1900000000L : 0);
+        // one at a time
+        simulator = freshCard();
+        ready();
+        for (int i = 0; i < 9; i++) assertEquals(i, load(sent[i]).getData()[0]);
+        byte[] storageAlone = field("proofStorage").clone(), hexAlone = field("slotHex").clone();
+        // and the same nine as 3, 2, 3 and 1
+        simulator = freshCard();
+        ready();
+        ResponseAPDU a = loadBatch(sent[0], sent[1], sent[2]);
+        assertEquals(SW_OK, a.getSW());
+        assertArrayEquals(new byte[] { 0, 1, 2 }, a.getData(), "three pieces, three places");
+        ResponseAPDU b = loadBatch(sent[3], sent[4]);
+        assertEquals(SW_OK, b.getSW());
+        assertArrayEquals(new byte[] { 3, 4 }, b.getData());
+        ResponseAPDU c = loadBatch(sent[5], sent[6], sent[7]);
+        assertArrayEquals(new byte[] { 5, 6, 7 }, c.getData());
+        ResponseAPDU d = loadBatch(sent[8]);
+        assertEquals(SW_OK, d.getSW());
+        assertArrayEquals(new byte[] { 8 }, d.getData(), "one piece, one byte, as it always was");
+        assertArrayEquals(storageAlone, field("proofStorage"), "the slots are as if they had been loaded one at a time");
+        assertArrayEquals(hexAlone, field("slotHex"), "and so is the text kept beside them");
+        assertEquals(9, info()[3]);
+        long total = 0;
+        for (int i = 0; i < 9; i++) {
+            total += readUint32(sent[i], 8);
+            assertArrayEquals(asSlot(sent[i]), slot(i), "GET_PROOF gives the 81 bytes that were sent, place " + i);
+        }
+        assertEquals(total, balance());
+        Page all = new Page(pieces(0).getData());
+        for (int i = 0; i < all.entries.size(); i++) {
+            assertArrayEquals(sent[(int) all.entries.get(i)[0]], (byte[]) all.entries.get(i)[2], "the whole listing gives them as sent");
+        }
+        // into holes: the freed places first, in order, and the answer says which
+        ResponseAPDU paid = spendAll(new int[] { 1, 4, 6 }, new byte[0][]);
+        assertEquals(SW_OK, paid.getSW());
+        assertEquals(SW_OK, clearSpent());
+        ResponseAPDU holes = loadBatch(buildProof(KEYSET, 7, 71), buildProof(KEYSET, 8, 72), buildProof(KEYSET, 9, 73));
+        assertArrayEquals(new byte[] { 1, 4, 6 }, holes.getData(), "the places that were free, in the order they were sent");
+        ResponseAPDU next = loadBatch(buildProof(KEYSET, 7, 74), buildProof(KEYSET, 8, 75));
+        assertArrayEquals(new byte[] { 9, 10 }, next.getData());
+    }
+
+    private static final String[] BAD_PIECES = { "a C that is not a point", "an amount of nothing", "a dated piece on a card with no refund key", "a piece that is on the card already" };
+    private static final int[] BAD_WORDS = { SW_WRONG_DATA, SW_WRONG_DATA, SW_NO_REFUND_KEY, SW_PIECE_ON_CARD };
+
+    private static byte[] badPiece(int kind) {
+        switch (kind) {
+            case 0:  { byte[] p = buildProof(KEYSET, 5, 71); p[44] = 0x04; return p; }
+            case 1:  return buildProof(KEYSET, 0, 72);
+            case 2:  return buildProof(KEYSET, 5, 73, 1900000000L);
+            default: return buildProof(KEYSET, 4, 90);        // the nonce of the piece in place 0, with another amount
+        }
+    }
+
+    /** A card for the stop rule: PIN, record (with a refund key or without), owner, time; and in place 0 a piece, which `badPiece(3)` is a copy of. */
+    private void stopCard(boolean refundKey) {
+        simulator = freshCard();
+        assertEquals(SW_OK, setPin(TEST_PIN));
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, setCard(MINT, refundKey ? REFUND : NO_REFUND));
+        assertEquals(SW_OK, setOwner(OWNER));
+        assertEquals(SW_OK, setTime(T0));
+        assertEquals(SW_OK, load(buildProof(KEYSET, 9, 90)).getSW());
+    }
+
+    @Test
+    @DisplayName("A batch stops at the first piece that cannot be stored: if that is the first, the command is refused with that piece's own word and nothing is stored; if a later one, the earlier ones stay, the answer is their places alone (9000), the ones after it are not stored, and sent alone the bad one gives its word")
+    void testABatchStopsAtTheFirstBadPiece() {
+        byte[][] good = { buildProof(KEYSET, 1, 81), buildProof(KEYSET, 2, 82), buildProof(KEYSET, 4, 83) };
+        for (int kind = 0; kind < BAD_PIECES.length; kind++) {
+            for (int position = 0; position < 3; position++) {
+                String what = BAD_PIECES[kind] + ", " + (position == 0 ? "first" : position == 1 ? "second" : "third") + " of three";
+                stopCard(kind != 2);
+                byte[] bad = badPiece(kind);
+                byte[][] batch = new byte[3][];
+                for (int i = 0, g = 0; i < 3; i++) batch[i] = i == position ? bad : good[g++];
+                long balanceBefore = balance();
+                ResponseAPDU r = loadBatch(batch);
+                if (position == 0) {
+                    assertEquals(BAD_WORDS[kind], r.getSW(), what + ": refused with the piece's own word");
+                    assertEquals(0, r.getData().length, what);
+                    assertEquals(1, info()[3], what + ": nothing stored, not the good pieces after it");
+                    assertEquals(balanceBefore, balance(), what);
+                    continue;
+                }
+                assertEquals(SW_OK, r.getSW(), what + ": the ones before it went on, and that is 9000");
+                assertEquals(position, r.getData().length, what + ": a byte for each that was stored, and fewer than were sent");
+                for (int j = 0; j < position; j++) {
+                    assertEquals(1 + j, r.getData()[j] & 0xFF, what + ": the place of piece " + j);
+                    assertArrayEquals(asSlot(batch[j]), slot(1 + j), what + ": piece " + j + " is there");
+                }
+                assertEquals(1 + position, info()[3], what + ": and nothing after the bad one");
+                assertEquals(SW_SLOT_EMPTY, sw(new CommandAPDU(CLA, INS_GET_PROOF, 1 + position, 0, 256)), what + ": its place is empty");
+                ResponseAPDU alone = load(bad);
+                assertEquals(BAD_WORDS[kind], alone.getSW(), what + ": sent alone, the bad one gives its word");
+                assertEquals(1 + position, info()[3], what + ": and still stores nothing");
+                if (position == 1) {
+                    ResponseAPDU rest = load(batch[2]);
+                    assertEquals(SW_OK, rest.getSW(), what + ": the one after it, sent again, is stored");
+                    assertEquals(2, rest.getData()[0]);
+                }
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("A piece repeated within one command is refused as on the card already (6A94), because the first copy is in a place by then: the first copy is stored and the answer is its place; the repeat sent alone gives 6A94")
+    void testABatchWithARepeat() {
+        ready();
+        byte[] p = buildProof(KEYSET, 8, 5);
+        byte[] q = buildProof(KEYSET, 2, 5);        // the same nonce, another amount
+        byte[] g = buildProof(KEYSET, 1, 6);
+        ResponseAPDU r = loadBatch(p, q, g);
+        assertEquals(SW_OK, r.getSW());
+        assertArrayEquals(new byte[] { 0 }, r.getData(), "the first copy only, and not the piece after the repeat");
+        assertEquals(SW_SLOT_EMPTY, sw(new CommandAPDU(CLA, INS_GET_PROOF, 1, 0, 256)));
+        assertEquals(SW_PIECE_ON_CARD, load(q).getSW(), "the repeat, alone");
+        assertEquals(8, balance());
+        // the very same bytes three times
+        simulator = freshCard();
+        ready();
+        ResponseAPDU same = loadBatch(p, p, p);
+        assertEquals(SW_OK, same.getSW());
+        assertArrayEquals(new byte[] { 0 }, same.getData());
+        assertEquals(SW_PIECE_ON_CARD, load(p).getSW());
+        // a repeat of an earlier piece of the same command, after others
+        simulator = freshCard();
+        ready();
+        byte[] g2 = buildProof(KEYSET, 3, 7);
+        ResponseAPDU late = loadBatch(g, g2, g);
+        assertEquals(SW_OK, late.getSW());
+        assertArrayEquals(new byte[] { 0, 1 }, late.getData(), "the third is a repeat of the first");
+        assertEquals(SW_PIECE_ON_CARD, load(g).getSW());
+        // and a repeat of a piece that is on the card from an earlier command is refused first
+        ResponseAPDU first = loadBatch(g2, g);
+        assertEquals(SW_PIECE_ON_CARD, first.getSW(), "when it is the first of the batch");
+        assertEquals(0, first.getData().length);
+        assertEquals(2, info()[3]);
+    }
+
+    @Test
+    @DisplayName("A card with room for only one or two of three stores those and answers their places (9000); the rest, sent alone, is 6A84; a full card answers 6A84 whatever it is sent")
+    void testABatchOnACardThatIsNearlyFull() {
+        ready();
+        for (int at = 0; at < 61; at += 3) {
+            byte[][] group = new byte[Math.min(3, 61 - at)][];
+            for (int j = 0; j < group.length; j++) group[j] = buildProof(KEYSET, 1 + at + j, at + j + 1);
+            assertEquals(SW_OK, loadBatch(group).getSW());
+        }
+        assertEquals(61, info()[3]);
+        // room for three
+        ResponseAPDU three = loadBatch(buildProof(KEYSET, 1, 101), buildProof(KEYSET, 1, 102), buildProof(KEYSET, 1, 103));
+        assertArrayEquals(new byte[] { 61, 62, 63 }, three.getData(), "exactly full");
+        assertEquals(64, info()[3]);
+        // a full card says so whatever it is sent: a batch, one piece, and data that is not a piece at all
+        assertEquals(SW_NO_SPACE, loadBatch(buildProof(KEYSET, 1, 104), buildProof(KEYSET, 1, 105), buildProof(KEYSET, 1, 106)).getSW());
+        assertEquals(SW_NO_SPACE, load(buildProof(KEYSET, 1, 107)).getSW());
+        assertEquals(SW_NO_SPACE, loadRaw(new byte[80]).getSW(), "before the data is looked at");
+        assertEquals(SW_NO_SPACE, loadRaw(new byte[0]).getSW(), "even none");
+
+        // room for two of three
+        simulator = freshCard();
+        ready();
+        for (int i = 0; i < 62; i++) assertEquals(SW_OK, load(buildProof(KEYSET, 1, i + 1)).getSW());
+        byte[] x = buildProof(KEYSET, 1, 201), y = buildProof(KEYSET, 2, 202), z = buildProof(KEYSET, 4, 203);
+        ResponseAPDU two = loadBatch(x, y, z);
+        assertEquals(SW_OK, two.getSW());
+        assertArrayEquals(new byte[] { 62, 63 }, two.getData(), "two of three");
+        assertEquals(64, info()[3]);
+        assertEquals(SW_NO_SPACE, load(z).getSW(), "the third, alone, hears why");
+
+        // room for one of three
+        simulator = freshCard();
+        ready();
+        for (int i = 0; i < 63; i++) assertEquals(SW_OK, load(buildProof(KEYSET, 1, i + 1)).getSW());
+        ResponseAPDU one = loadBatch(x, y, z);
+        assertEquals(SW_OK, one.getSW());
+        assertArrayEquals(new byte[] { 63 }, one.getData(), "one of three");
+        assertArrayEquals(asSlot(x), slot(63));
+        assertEquals(SW_NO_SPACE, load(y).getSW());
+        // the refusal of a later piece for want of room is a piece's, not the command's: with a place freed, they go on
+        assertEquals(SW_OK, spend(0).getSW());
+        assertEquals(SW_OK, clearSpent());
+        ResponseAPDU again = loadBatch(y, z);
+        assertEquals(SW_OK, again.getSW());
+        assertArrayEquals(new byte[] { 0 }, again.getData(), "one place was freed: one of two");
+    }
+
+    @Test
+    @DisplayName("LOAD_PROOF takes 81, 162 or 243 bytes and nothing else: 0, 1, 80, 82, 161, 163, 242, 244 and 324 are 6700, and store nothing")
+    void testLoadLengths() {
+        ready();
+        for (int n : new int[] { 0, 1, 77, 80, 82, 161, 163, 242, 244, 324 }) {
+            ResponseAPDU r = loadRaw(new byte[n]);
+            assertEquals(SW_WRONG_LENGTH, r.getSW(), n + " bytes");
+            assertEquals(0, r.getData().length, n + " bytes");
+        }
+        // good pieces in a wrong total: 81 + 80, and four whole pieces
+        assertEquals(SW_WRONG_LENGTH, loadRaw(concat(buildProof(KEYSET, 1, 1), new byte[80])).getSW());
+        assertEquals(SW_WRONG_LENGTH, loadRaw(concat(buildProof(KEYSET, 1, 1), buildProof(KEYSET, 1, 2), buildProof(KEYSET, 1, 3), buildProof(KEYSET, 1, 4))).getSW(), "four pieces are 324 bytes");
+        assertEquals(0, info()[3], "none of them stored anything");
+        assertEquals(0, balance());
+        for (int n : new int[] { 81, 162, 243 }) {
+            byte[][] pieces = new byte[n / 81][];
+            for (int j = 0; j < pieces.length; j++) pieces[j] = buildProof(KEYSET, 1, 10 * n + j);
+            ResponseAPDU r = loadBatch(pieces);
+            assertEquals(SW_OK, r.getSW(), n + " bytes");
+            assertEquals(n / 81, r.getData().length);
+        }
+    }
+
+    @Test
+    @DisplayName("A batch meets the gates before its data is read, as one piece does: the PIN or the grant, an owner, a record, a time, a place free, and a locked card first of all; each answered whatever the length, and nothing stored")
+    void testABatchMeetsTheGatesFirst() {
+        byte[][] three = { buildProof(KEYSET, 4, 1), buildProof(KEYSET, 2, 2), buildProof(KEYSET, 1, 3) };
+        assertEquals(SW_OK, setPin(TEST_PIN));
+        assertEquals(SW_SECURITY_NOT_SATIS, loadBatch(three).getSW(), "the PIN, not verified");
+        assertEquals(SW_SECURITY_NOT_SATIS, loadRaw(new byte[80]).getSW(), "whatever the length");
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_NO_OWNER, loadBatch(three).getSW(), "no owner");
+        assertEquals(SW_NO_OWNER, loadRaw(new byte[80]).getSW());
+        assertEquals(SW_OK, setCard(MINT, REFUND));
+        assertEquals(SW_NO_OWNER, loadBatch(three).getSW(), "a record, and still no owner");
+        assertEquals(SW_OK, setOwner(OWNER));
+        assertEquals(SW_NO_TIME, loadBatch(three).getSW(), "an owner and a record, and no time");
+        assertEquals(SW_NO_TIME, loadRaw(new byte[80]).getSW());
+        assertEquals(0, info()[3], "nothing was loaded by any of them");
+        assertEquals(SW_OK, setTime(T0));
+        assertArrayEquals(new byte[] { 0, 1, 2 }, loadBatch(three).getData());
+
+        // no record at all
+        simulator = freshCard();
+        assertEquals(SW_OK, setPin(TEST_PIN));
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, setOwner(OWNER));
+        assertEquals(SW_NO_CARD_RECORD, loadBatch(three).getSW());
+        assertEquals(SW_NO_CARD_RECORD, loadRaw(new byte[80]).getSW());
+
+        // a new tap: the PIN is not verified, and the owner's grant opens it
+        simulator = freshCard();
+        ready();
+        reselect();
+        assertEquals(SW_SECURITY_NOT_SATIS, loadBatch(three).getSW(), "no PIN in this tap");
+        assertEquals(SW_OK, allowLoad());
+        ResponseAPDU granted = loadBatch(three);
+        assertEquals(SW_OK, granted.getSW(), "the owner's grant");
+        assertArrayEquals(new byte[] { 0, 1, 2 }, granted.getData());
+
+        // a locked card takes no writes, and says so before anything else, with the PIN verified or not
+        simulator = freshCard();
+        ready();
+        assertEquals(SW_OK, lock());
+        assertEquals(SW_NOT_ALLOWED, loadBatch(three).getSW(), "locked");
+        assertEquals(SW_NOT_ALLOWED, loadRaw(new byte[80]).getSW(), "locked, whatever the length");
+        reselect();
+        assertEquals(SW_NOT_ALLOWED, loadBatch(three).getSW(), "locked, and no PIN");
+        assertEquals(0, info()[3]);
+    }
+
+    /** A card that has paid: 16 and 8 loaded, the 16 spent, and a new tap begun with no PIN, so that the change may go on. */
+    private void paidCard() {
+        simulator = freshCard();
+        ready();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 16, 1)).getSW());
+        assertEquals(SW_OK, load(buildProof(KEYSET, 8, 2)).getSW());
+        assertEquals(SW_OK, spend(0).getSW());
+        reselect();
+        assertEquals(1, info()[29], "the tap after a payment may load");
+    }
+
+    @Test
+    @DisplayName("The change grant (the tap after a payment may load with no PIN) loads a batch and is used up as one piece uses it: by the first piece stored and not by one that is refused; a verified PIN or the owner's grant leaves it standing")
+    void testTheChangeGrantLoadsABatch() {
+        paidCard();
+        assertEquals(SW_OK, clearSpent(), "the burned place is freed, with no PIN");
+        ResponseAPDU change = loadBatch(buildProof(KEYSET, 4, 3), buildProof(KEYSET, 2, 4));
+        assertEquals(SW_OK, change.getSW(), "the change, two pieces to a command, with no PIN");
+        assertArrayEquals(new byte[] { 0, 2 }, change.getData());
+        assertEquals(1, info()[29], "the same tap may still load the rest of the change");
+        assertEquals(SW_OK, loadBatch(buildProof(KEYSET, 1, 5), buildProof(KEYSET, 1, 6), buildProof(KEYSET, 1, 7)).getSW(), "three more, still no PIN");
+        assertEquals(8 + 4 + 2 + 3, balance());
+        assertEquals(SW_SECURITY_NOT_SATIS, spend(1).getSW(), "and nothing else the PIN opens");
+        reselect();
+        assertEquals(0, info()[29], "the change landed: the next fresh tap has no grant");
+        assertEquals(SW_SECURITY_NOT_SATIS, loadBatch(buildProof(KEYSET, 1, 8), buildProof(KEYSET, 1, 9)).getSW(), "and loads nothing with no PIN");
+        assertEquals(SW_SECURITY_NOT_SATIS, loadRaw(new byte[80]).getSW());
+
+        // a batch whose first piece is refused leaves the note standing, as a refused piece alone does
+        paidCard();
+        assertEquals(SW_OK, clearSpent());
+        byte[] notPoint = buildProof(KEYSET, 4, 11);
+        notPoint[44] = 0x04;
+        assertEquals(SW_WRONG_DATA, loadBatch(notPoint, buildProof(KEYSET, 2, 12)).getSW());
+        assertEquals(1, info()[29], "still in this tap");
+        reselect();
+        assertEquals(1, info()[29], "and the next: nothing landed, so the note stands");
+        assertEquals(SW_OK, loadBatch(buildProof(KEYSET, 4, 11), buildProof(KEYSET, 2, 12)).getSW());
+        reselect();
+        assertEquals(0, info()[29], "the change landing used it up");
+
+        // a later piece refused: the first landed and used it up
+        paidCard();
+        assertEquals(SW_OK, clearSpent());
+        ResponseAPDU some = loadBatch(buildProof(KEYSET, 4, 21), notPoint, buildProof(KEYSET, 2, 22));
+        assertEquals(SW_OK, some.getSW());
+        assertArrayEquals(new byte[] { 0 }, some.getData());
+        reselect();
+        assertEquals(0, info()[29], "the first piece landed, and the note is gone");
+
+        // a verified PIN or the owner's grant is not the change grant: the note stays
+        paidCard();
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, loadBatch(buildProof(KEYSET, 4, 31), buildProof(KEYSET, 2, 32)).getSW());
+        reselect();
+        assertEquals(1, info()[29], "loaded with the PIN: the note is not used");
+        assertEquals(SW_OK, allowLoad());
+        assertEquals(SW_OK, loadBatch(buildProof(KEYSET, 1, 33), buildProof(KEYSET, 1, 34)).getSW());
+        reselect();
+        assertEquals(1, info()[29], "loaded with the owner's grant: nor is it");
+        assertEquals(SW_OK, loadBatch(buildProof(KEYSET, 1, 35), buildProof(KEYSET, 1, 36)).getSW(), "the change grant, then");
+        reselect();
+        assertEquals(0, info()[29]);
+    }
+
+    @Test
+    @DisplayName("The text kept beside a place is written once, in LOAD_PROOF's one-piece step, before that piece's data and long before its status byte, and is read only for a place named in a payment; SPEND_ALL_BEGIN converts nothing per piece")
+    void testTheKeptTextIsWrittenFirstAndReadByNothingElse() throws Exception {
+        String code = appletCode();
+        String loadOne = body(code, "private short loadOne(", "private void processClearSpent(");
+        int hexFirst = loadOne.indexOf("slotHex");
+        int hexLast = loadOne.lastIndexOf("slotHex");
+        int data = loadOne.indexOf("Util.arrayCopy(buf, in, proofStorage");
+        int status = loadOne.indexOf("STATUS_UNSPENT", data);
+        assertTrue(hexFirst > 0 && hexFirst < hexLast && hexLast < data && data < status,
+            "both halves of the text are written before the piece's data, and the status byte is last");
+        assertEquals(2, count(loadOne, "slotHex"), "two writes: the nonce's hex and the C's");
+        String secretInto = body(code, "private void secretInto(", "private void processAuth(");
+        assertEquals(2, count(secretInto, "slotHex"), "and read in two places, to the hash");
+        assertFalse(secretInto.contains("beginTransaction") || secretInto.contains("arrayCopy"), "reading it writes nothing");
+        // no other method names it: the declaration and the allocation are all that is left
+        String rest = code.replace(loadOne, "").replace(secretInto, "");
+        assertEquals(2, count(rest, "slotHex"), "the declaration and the allocation");
+        // a payment is begun without turning anything to hex per piece
+        String begin = body(code, "private void processSpendAllBegin(", "private void processSpendAllOutputs(");
+        assertFalse(begin.contains("toHex(") || begin.contains("toDecimal(") || begin.contains("hexInto("), "BEGIN converts nothing per piece");
+        assertEquals(1, count(begin, "secretTail("), "the part of the secret that is the same for every piece is built once");
+        assertTrue(begin.indexOf("secretTail(") < begin.indexOf("secretInto("), "before the pieces are hashed");
+        // the places read are unspent ones: BEGIN refuses an empty or a spent one first
+        assertTrue(begin.indexOf("SW_SLOT_EMPTY") < begin.indexOf("secretInto(") && begin.indexOf("SW_ALREADY_SPENT") < begin.indexOf("secretInto("),
+            "the text of a place is hashed only after it has been seen to be unspent");
+    }
+
+    // =========================================================================
+    // The limit on a payment hidden, the log's account of what was put on and of the clock, the receipts
+    // =========================================================================
+
+    /** What the applet answers for a P1 or a P2 it does not have: ISO7816.SW_INCORRECT_P1P2. (6B00 is SW_WRONG_P1P2, which it does not use.) */
+    static final int SW_INCORRECT_P1P2 = 0x6A86;
+    static final int RECEIPT_LEN = 73;
+
+    /** An answer as one run of bytes, its status word first: for comparing what two cards said. */
+    private static byte[] bytesOf(ResponseAPDU r) { return concat(new byte[] { (byte) (r.getSW() >> 8), (byte) r.getSW() }, r.getData()); }
+    private ResponseAPDU receipts(int back) { return transmit(new CommandAPDU(CLA, INS_GET_LOG, 1, back, 256)); }
+
+    /** What GET_LOG P1 = 1 holds: the count of payments ever, and the receipts, newest first, read three at a time. */
+    private static final class Held {
+        long count;
+        final java.util.List<byte[]> receipts = new java.util.ArrayList<>();
+    }
+
+    /** All the receipts the card holds, read with the owner's grant, which the caller has given in this tap. */
+    private Held heldReceipts() {
+        Held held = new Held();
+        for (int back = 0; ; back += 3) {
+            ResponseAPDU r = receipts(back);
+            assertEquals(SW_OK, r.getSW(), "receipts from " + back);
+            byte[] d = r.getData();
+            if (back == 0) held.count = readUint32(d, 0);
+            else assertEquals(held.count, readUint32(d, 0), "the count is the same on every page");
+            assertEquals(0, (d.length - 4) % RECEIPT_LEN, "whole receipts");
+            int n = (d.length - 4) / RECEIPT_LEN;
+            assertTrue(n <= 3, "three at most");
+            for (int k = 0; k < n; k++) held.receipts.add(Arrays.copyOfRange(d, 4 + RECEIPT_LEN * k, 4 + RECEIPT_LEN * (k + 1)));
+            if (n < 3) return held;
+        }
+    }
+
+    /**
+     * A receipt as it is to be: the clock when the payment was signed (4), what its pieces were worth (4), SHA-256 of the
+     * message that was signed, built here from the pieces and the outputs and not asked of the card (32), and the first
+     * output's blinded message as it was given (33), or zeros where there was no output.
+     */
+    private byte[] receiptFor(long clock, long worth, byte[][] slotData, byte[][] outputs) {
+        byte[] hash = sha256(allMessage(cardKey(), REFUND, slotData, outputs).getBytes(StandardCharsets.UTF_8));
+        byte[] first = outputs.length == 0 ? new byte[33] : Arrays.copyOfRange(outputs[0], 4, 37);
+        return concat(u32(clock), u32(worth), hash, first);
+    }
+
+    /** A payment of those places whose outputs are sent in commands of the sizes given (cycled): the signature, or whatever refused it. */
+    private ResponseAPDU payGrouped(int[] slots, byte[][] outputs, int... groups) {
+        waitAnswers.clear();
+        ResponseAPDU begun = transmit(beginCommand(slots));
+        if (begun.getSW() != SW_OK) return begun;
+        int at = 0, g = 0;
+        while (at < outputs.length) {
+            int n = Math.min(groups[g++ % groups.length], outputs.length - at);
+            ResponseAPDU r = transmit(new CommandAPDU(CLA, INS_SPEND_ALL_OUTPUTS, 0, 0, concat(Arrays.copyOfRange(outputs, at, at + n))));
+            if (r.getSW() != SW_OK) return r;
+            at += n;
+        }
+        return signAll();
+    }
+
+    // ---- 1: the limit on one payment is the holder's to read ------------------------------
+
+    @Test
+    @DisplayName("GET_INFO asked for with P1 = 1 says the limit on one payment (bytes 30..33) only with the owner's grant given in this tap: to everyone else, under a verified PIN too, those four bytes are zeros, which is what a card with no such limit says; bytes 34..41 are zeros whoever asks; a terminal cannot give itself the grant; and the limit holds for whoever pays")
+    void testTheLimitOnAPaymentIsSaidToTheGrantAlone() throws Exception {
+        // a card with no such limit, asked under the PIN, and with the grant
+        readyWithLimit(0);
+        byte[] noLimit = infoTap();
+        assertEquals(SW_OK, allowLoad());
+        assertArrayEquals(noLimit, infoTap(), "with the grant a card with no limit says zeros, which is true");
+        // a card with one
+        simulator = freshCard();
+        readyWithLimit(0);
+        assertEquals(SW_OK, setLimits(0, 100));
+        byte[] plain = info();
+        byte[] under = infoTap();
+        assertEquals(42, under.length);
+        assertArrayEquals(plain, Arrays.copyOf(under, 30), "the thirty bytes are as they were");
+        assertArrayEquals(new byte[12], Arrays.copyOfRange(under, 30, 42), "under the PIN, which a till has: the limit and the eight bytes after it are zeros");
+        assertArrayEquals(noLimit, under, "a terminal under the PIN cannot tell this card from one with no limit by asking");
+        // with the owner's grant, in this tap
+        assertEquals(SW_OK, allowLoad());
+        byte[] granted = infoTap();
+        assertEquals(100, readUint32(granted, 30), "the limit, to the owner");
+        assertArrayEquals(Arrays.copyOf(under, 30), Arrays.copyOf(granted, 30), "the thirty bytes are the same");
+        assertArrayEquals(new byte[8], Arrays.copyOfRange(granted, 34, 42), "and the eight bytes after it are zeros still");
+        assertArrayEquals(plain, info(), "asked for without P1 = 1 the answer is the thirty bytes it always was");
+        // the grant goes with the tap; the PIN is not the grant
+        reselect();
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(0, paymentLimitAsATerminalSeesIt(), "a new SELECT takes the grant away, and a verified PIN is not one");
+        assertEquals(SW_OK, allowLoad());
+        assertEquals(100, readUint32(infoTap(), 30));
+        simulator.reset();
+        reselect();
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(0, paymentLimitAsATerminalSeesIt(), "nor does it outlast the card's leaving the field");
+        reselect();
+        assertEquals(0, paymentLimitAsATerminalSeesIt(), "and with no PIN in this tap, nothing");
+        // a terminal cannot give itself the grant
+        assertEquals(SW_OWNER_PROOF, sw(allowLoadCommand(new byte[8])), "no nonce asked for");
+        assertEquals(SW_OWNER_PROOF, sw(allowLoadCommand(ownerProof(L_LOAD, OTHER_OWNER, nonceBytes(), new byte[0]))), "another key's proof");
+        assertEquals(SW_OWNER_PROOF, sw(allowLoadCommand(ownerProof(L_PIN, OWNER, nonceBytes(), new byte[0]))), "another command's proof");
+        assertEquals(0, paymentLimitAsATerminalSeesIt());
+        // and the limit holds for whoever pays, as it always did
+        assertEquals(SW_OK, verify(TEST_PIN));
+        long[] amounts = { 100, 100, 50 };
+        for (int i = 0; i < 3; i++) assertEquals(SW_OK, load(buildProof(KEYSET, amounts[i], i + 1)).getSW());
+        ResponseAPDU r = spendAll(new int[] { 0, 1, 2 }, new byte[0][]);
+        assertEquals(SW_OK, r.getSW());
+        assertEquals(2 * WAIT_SIGNS, waitsTaken(), "250 under a limit of 100, which the terminal was never told");
+    }
+
+    /** What a terminal under the PIN, with no grant, can read of a card with that limit on a payment, and how many waits a payment of 250 takes. */
+    private java.util.List<byte[]> whatATerminalSees(long limit, int[] waitsOut) {
+        simulator = freshCard();
+        readyWithLimit(0);
+        assertEquals(SW_OK, setLimits(0, limit));
+        long[] amounts = { 100, 100, 50 };
+        for (int i = 0; i < 3; i++) assertEquals(SW_OK, load(buildProof(KEYSET, amounts[i], i + 1)).getSW());
+        newTap();       // the PIN verified, and no grant
+        java.util.List<byte[]> seen = new java.util.ArrayList<>();
+        seen.add(bytesOf(transmit(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256))));
+        seen.add(bytesOf(transmit(new CommandAPDU(CLA, INS_GET_INFO, 1, 0, 256))));
+        seen.add(bytesOf(transmit(new CommandAPDU(CLA, INS_GET_CARD, 0, 0, 256))));
+        seen.add(bytesOf(transmit(new CommandAPDU(CLA, INS_GET_SLOT_STATUS, 0, 0, 256))));
+        seen.add(bytesOf(transmit(new CommandAPDU(CLA, INS_GET_PIECES, 0, 0, 256))));
+        seen.add(bytesOf(transmit(new CommandAPDU(CLA, INS_GET_PIECES, 0, 1, 256))));
+        seen.add(bytesOf(transmit(new CommandAPDU(CLA, INS_GET_PIECES, 0, 2, new byte[] { 0, 1, 2 }, 256))));
+        seen.add(bytesOf(transmit(new CommandAPDU(CLA, INS_GET_PROOF, 1, 0, 256))));
+        seen.add(bytesOf(transmit(new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4))));
+        seen.add(bytesOf(transmit(new CommandAPDU(CLA, INS_GET_PROOF_COUNT, 0, 0, 1))));
+        seen.add(bytesOf(transmit(new CommandAPDU(CLA, INS_GET_LOG, 0, 0, 256))));
+        seen.add(bytesOf(transmit(new CommandAPDU(CLA, INS_GET_LOG, 1, 0, 256))));
+        seen.add(bytesOf(transmit(beginCommand(0, 1, 2))));
+        ResponseAPDU first = transmit(SIGN_ALL);
+        seen.add(bytesOf(first));
+        assertNotYet(first, "250 is over both limits");
+        signAll();
+        waitsOut[0] = 1 + waitsTaken();
+        return seen;
+    }
+
+    @Test
+    @DisplayName("Nothing a terminal without the grant can read reveals the limit on a payment: two cards that differ only in that limit (100 and 150) and the same payment of 250 over both give every answer up to and including the first wait byte for byte alike; only the number of waits differs")
+    void testNothingATerminalCanReadRevealsTheLimit() {
+        int[] a = new int[1], b = new int[1];
+        java.util.List<byte[]> seenA = whatATerminalSees(100, a);
+        java.util.List<byte[]> seenB = whatATerminalSees(150, b);
+        String[] names = { "GET_INFO", "GET_INFO P1=1", "GET_CARD", "GET_SLOT_STATUS", "GET_PIECES", "GET_PIECES brief", "GET_PIECES some", "GET_PROOF", "GET_BALANCE",
+                           "GET_PROOF_COUNT", "GET_LOG", "GET_LOG receipts (refused under the PIN)", "SPEND_ALL_BEGIN's answer", "the first SPEND_ALL_SIGN's answer" };
+        assertEquals(names.length, seenA.size());
+        for (int i = 0; i < names.length; i++) {
+            assertArrayEquals(seenA.get(i), seenB.get(i), names[i] + " is the same for a limit of 100 and a limit of 150");
+        }
+        assertEquals(0x6982, ((seenA.get(11)[0] & 0xFF) << 8) | (seenA.get(11)[1] & 0xFF), "the receipts are refused under the PIN, to both");
+        assertEquals(8, a[0], "250 under 100: two limits past the first");
+        assertEquals(4, b[0], "250 under 150: one past the first");
+        // a card with no limit at all says the same of what it is asked before the payment; the wait is where a limit is found out, by trying
+        simulator = freshCard();
+        readyWithLimit(0);
+        long[] amounts = { 100, 100, 50 };
+        for (int i = 0; i < 3; i++) assertEquals(SW_OK, load(buildProof(KEYSET, amounts[i], i + 1)).getSW());
+        newTap();
+        assertArrayEquals(seenA.get(0), bytesOf(transmit(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256))), "GET_INFO, on a card with no limit at all");
+        assertArrayEquals(seenA.get(1), bytesOf(transmit(new CommandAPDU(CLA, INS_GET_INFO, 1, 0, 256))), "GET_INFO P1=1, on a card with no limit at all");
+        assertArrayEquals(seenA.get(2), bytesOf(transmit(new CommandAPDU(CLA, INS_GET_CARD, 0, 0, 256))), "GET_CARD, on a card with no limit at all");
+        ResponseAPDU none = spendAll(new int[] { 0, 1, 2 }, new byte[0][]);
+        assertEquals(SW_OK, none.getSW());
+        assertEquals(0, waitsTaken(), "and the payment goes at once");
+    }
+
+    @Test
+    @DisplayName("A payment that waits answers 00 01 every time it is asked, however many waits it has: 36 of them, and 1020, and never how many are left; the signature follows the last, and not before")
+    void testTheWaitNeverSaysHowManyAreLeft() throws Exception {
+        readyWithLimit(0);
+        assertEquals(SW_OK, setLimits(0, 100));
+        assertEquals(SW_OK, load(buildProof(KEYSET, 1000, 1)).getSW());
+        byte[] named = slot(0);
+        newTap();
+        // the whole count, from a beginning: 36 answers of 00 01 and then the signature
+        assertEquals(SW_OK, sw(beginCommand(0)));
+        for (int i = 1; i <= 36; i++) assertNotYet(transmit(SIGN_ALL), "wait " + i + " of 36");
+        ResponseAPDU sig = transmit(SIGN_ALL);
+        assertEquals(SW_OK, sig.getSW());
+        assertEquals(64, sig.getData().length, "after the 36th, the signature");
+        assertTrue(signedForAll(sig.getData(), new byte[][] { named }, new byte[0][], REFUND));
+        // the most it can be asked to wait: 1020, each of them the same
+        simulator = freshCard();
+        readyWithLimit(0);
+        assertEquals(SW_OK, setLimits(0, 1));
+        assertEquals(SW_OK, load(buildProof(KEYSET, 300, 1)).getSW());
+        newTap();
+        ResponseAPDU r = spend(0);
+        assertEquals(SW_OK, r.getSW());
+        assertEquals(WAITS_MOST, waitsTaken(), "all 1020 were 00 01: signAll checks each");
+        assertEquals(64, r.getData().length);
+    }
+
+    // ---- 3: the log's entries are sixteen bytes, and LOAD_PROOF writes them ------------------
+
+    @Test
+    @DisplayName("A log entry is sixteen bytes: the clock when the tap's first entry was made (4), sats signed for (4), pieces signed (1), refused (1), flags (1), pieces put on (1), sats put on (4); the answer is 16 bytes of counts and the entries, 144 at most; one entry holds a tap's loads and its payments")
+    void testTheLogEntryIsSixteenBytes() {
+        ready();        // the card's set-up writes nothing: the tap is put on by the first piece
+        assertEquals(16, log().length, "four counts and no taps");
+        ResponseAPDU put = loadBatch(buildProof(KEYSET, 10, 1), buildProof(KEYSET, 20, 2), buildProof(KEYSET, 30, 3));
+        assertArrayEquals(new byte[] { 0, 1, 2 }, put.getData());
+        assertEquals(SW_OK, spendAll(new int[] { 0, 1 }, new byte[0][]).getSW());
+        byte[] d = log();
+        assertEquals(16 + 16, d.length, "sixteen bytes of counts and one entry of sixteen");
+        assertEquals(1, readUint32(d, 0), "one tap, with a load and a payment in it");
+        assertEquals(30, readUint32(d, 4), "sats signed for, ever");
+        assertEquals(0, readUint32(d, 8), "refused");
+        assertEquals(0, readUint32(d, 12), "runs");
+        assertEquals(T0, readUint32(d, 16), "the entry: the clock");
+        assertEquals(30, readUint32(d, 20), "sats signed for in it");
+        assertEquals(2, d[24], "pieces signed");
+        assertEquals(0, d[25], "refused");
+        assertEquals(0, d[26], "flags");
+        assertEquals(3, d[27], "pieces put on");
+        assertEquals(60, readUint32(d, 28), "sats put on");
+        // a refusal in the same tap goes into the same entry
+        assertEquals(SW_OK, setLimits(20, 0));
+        assertEquals(SW_OVER_LIMIT, spend(2).getSW(), "30 is over a day of 20");
+        d = log();
+        assertEquals(32, d.length, "still one tap");
+        assertEquals(1, d[25], "one refused");
+        assertEquals(3, d[27], "the loads are as they were");
+        assertEquals(60, readUint32(d, 28));
+    }
+
+    @Test
+    @DisplayName("LOAD_PROOF writes the log once for a command, after the pieces are stored: the pieces and the sats of those that were stored, in this tap's entry, which it begins if the tap had none; one piece, a batch, a batch that stops, the change loaded with no PIN, and a load in a tap that paid are all in the entry; a command that stores nothing writes nothing")
+    void testLoadsAreInTheLog() throws Exception {
+        ready();
+        assertEquals(0, logTaps());
+        assertEquals(SW_OK, load(buildProof(KEYSET, 10, 1)).getSW());
+        assertEquals(1, logTaps(), "a tap in which anything was put on is a tap in the log");
+        assertArrayEquals(new long[] { T0, 0, 0, 0, 0 }, logTap(0));
+        assertArrayEquals(new long[] { 1, 10 }, logLoaded(0), "one piece, 10 sats");
+        // a second command and a batch, in the same tap: the same entry, the pieces and sats added up
+        assertEquals(SW_OK, load(buildProof(KEYSET, 20, 2)).getSW());
+        assertEquals(SW_OK, loadBatch(buildProof(KEYSET, 1, 3), buildProof(KEYSET, 2, 4), buildProof(KEYSET, 4, 5)).getSW());
+        assertEquals(1, logTaps(), "one tap, however many commands");
+        assertArrayEquals(new long[] { 5, 37 }, logLoaded(0), "five pieces, 10 + 20 + 1 + 2 + 4");
+        // a batch that stops: the pieces that were stored are counted and the one that was refused is not, nor those after it
+        byte[] notAPoint = buildProof(KEYSET, 4, 9);
+        notAPoint[44] = 0x04;
+        ResponseAPDU stopped = loadBatch(buildProof(KEYSET, 8, 6), notAPoint, buildProof(KEYSET, 16, 7));
+        assertArrayEquals(new byte[] { 5 }, stopped.getData());
+        assertArrayEquals(new long[] { 6, 45 }, logLoaded(0), "6 pieces; the 8 was stored and the 4 and the 16 were not");
+        // a command that stores nothing writes nothing: not an entry, not a tap, in a tap of its own
+        newTap();
+        byte[] before = log();
+        assertEquals(SW_WRONG_DATA, loadBatch(notAPoint, buildProof(KEYSET, 16, 7)).getSW());
+        assertEquals(SW_WRONG_DATA, load(notAPoint).getSW());
+        assertEquals(SW_PIECE_ON_CARD, load(buildProof(KEYSET, 1, 1)).getSW());
+        assertEquals(SW_WRONG_LENGTH, loadRaw(new byte[80]).getSW());
+        assertArrayEquals(before, log(), "none of them wrote the log");
+        reselect();     // no PIN: the gate refuses
+        assertEquals(SW_SECURITY_NOT_SATIS, loadBatch(buildProof(KEYSET, 16, 7), buildProof(KEYSET, 16, 8)).getSW());
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertArrayEquals(before, log(), "nor a load that was refused at the gate");
+        // a payment and a load in the same tap are one entry
+        assertEquals(SW_OK, spend(0).getSW());
+        assertEquals(SW_OK, load(buildProof(KEYSET, 7, 20)).getSW());
+        assertEquals(2, logTaps());
+        assertArrayEquals(new long[] { T0, 10, 1, 0, 0 }, logTap(0), "the payment");
+        assertArrayEquals(new long[] { 1, 7 }, logLoaded(0), "and the load, in the same entry");
+        assertArrayEquals(new long[] { 6, 45 }, logLoaded(1), "the tap before it is as it was");
+
+        // the change, loaded in the tap after a payment with no PIN, is a tap in the log
+        simulator = freshCard();
+        ready();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 16, 1)).getSW());
+        assertEquals(SW_OK, load(buildProof(KEYSET, 8, 2)).getSW());
+        assertEquals(SW_OK, spend(0).getSW());
+        simulator.reset();
+        reselect();
+        assertEquals(1, info()[29], "the tap after a payment may load with no PIN");
+        assertEquals(SW_OK, clearSpent());
+        ResponseAPDU change = loadBatch(buildProof(KEYSET, 4, 3), buildProof(KEYSET, 2, 4));
+        assertArrayEquals(new byte[] { 0, 2 }, change.getData());
+        assertEquals(SW_OK, verify(TEST_PIN), "the PIN, to read the log");
+        assertEquals(2, logTaps());
+        assertArrayEquals(new long[] { T0, 0, 0, 0, 0 }, logTap(0), "the tap of the change: nothing signed for");
+        assertArrayEquals(new long[] { 2, 6 }, logLoaded(0), "two pieces, 4 + 2");
+        assertArrayEquals(new long[] { T0, 16, 1, 0, 0 }, logTap(1), "after the tap that paid");
+        assertArrayEquals(new long[] { 2, 24 }, logLoaded(1), "which had put 16 and 8 on");
+
+        // what is put on stops at 255 pieces and at the top of four bytes of sats
+        simulator = freshCard();
+        ready();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 5, 1)).getSW());
+        int entryAt = 21 + (int) (((logTaps() - 1) & 7) * 16);
+        field("cardLog")[entryAt + 11] = (byte) 253;
+        Arrays.fill(field("cardLog"), entryAt + 12, entryAt + 16, (byte) 0xFF);
+        field("cardLog")[entryAt + 15] = (byte) 0xF0;
+        assertEquals(SW_OK, loadBatch(buildProof(KEYSET, 5, 2), buildProof(KEYSET, 4, 3)).getSW());
+        assertArrayEquals(new long[] { 255, 0xFFFFFFF0L + 9 }, logLoaded(0), "two pieces on 253 are 255 and 9 on the top less 15 is 4294967289");
+        assertEquals(SW_OK, load(buildProof(KEYSET, 100, 4)).getSW());
+        assertArrayEquals(new long[] { 255, 4294967295L }, logLoaded(0), "one more piece stops at 255 and the sats at the top of four bytes");
+        assertEquals(SW_OK, loadBatch(buildProof(KEYSET, 4294967295L, 5), buildProof(KEYSET, 5, 6)).getSW());
+        assertArrayEquals(new long[] { 255, 4294967295L }, logLoaded(0), "a batch worth more than four bytes holds is the top of them, and no wrap");
+    }
+
+    @Test
+    @DisplayName("The eight-entry ring is right with sixteen-byte entries: twenty taps of loads, a payment and now and then a marked clock, and after each the whole answer is the counts (the fourth counting the marks) and the last eight taps newest first, every field")
+    void testTheLogRingHoldsEightOfSixteenBytes() {
+        ready();
+        long taps = 0, sats = 0, marks = 0;
+        java.util.LinkedList<byte[]> entries = new java.util.LinkedList<>();     // newest first
+        java.util.LinkedList<long[]> unspent = new java.util.LinkedList<>();     // { place, amount }, oldest first
+        for (int i = 1; i <= 20; i++) {
+            newTap();
+            long time = T0 + 1000L * i;
+            assertEquals(SW_OK, setTime(time), "the first telling of the time in this power-up");
+            long flags = 0;
+            if (i % 5 == 0) {
+                assertEquals(SW_OK, setTime(time + 500), "a second, 500 seconds on: a mark, counted, and carried into the entry this tap gets");
+                time += 500;
+                flags = 4;
+                marks++;
+            }
+            int k = 1 + i % 3;
+            long amount = 5 + i;
+            byte[][] batch = new byte[k][];
+            for (int j = 0; j < k; j++) batch[j] = buildProof(KEYSET, amount, 100 * i + j);
+            ResponseAPDU put = loadBatch(batch);
+            assertEquals(SW_OK, put.getSW());
+            assertEquals(k, put.getData().length);
+            for (int j = 0; j < k; j++) unspent.add(new long[] { put.getData()[j] & 0xFF, amount });
+            long[] oldest = unspent.removeFirst();
+            assertEquals(SW_OK, spend((int) oldest[0]).getSW());
+            taps++;
+            sats += oldest[1];
+            byte[] entry = concat(u32(time), u32(oldest[1]), new byte[] { 1, 0, (byte) flags, (byte) k }, u32(k * amount));
+            assertEquals(16, entry.length);
+            entries.addFirst(entry);
+            while (entries.size() > 8) entries.removeLast();
+            byte[] expected = concat(u32(taps), u32(sats), u32(0), u32(marks), concat(entries.toArray(new byte[0][])));
+            assertArrayEquals(expected, log(), "the log after tap " + i);
+        }
+        assertEquals(16 + 8 * 16, log().length);
+    }
+
+    @Test
+    @DisplayName("GET_LOG with a P1 other than 0 or 1 is refused (the applet's word is 6A86, ISO7816.SW_INCORRECT_P1P2), before the PIN is looked at, and answers nothing")
+    void testGetLogRefusesAP1ItDoesNotHave() {
+        ready();
+        for (int p1 : new int[] { 2, 3, 0x10, 0x7f, 0x80, 0xff }) {
+            ResponseAPDU r = transmit(new CommandAPDU(CLA, INS_GET_LOG, p1, 0, 256));
+            assertEquals(SW_INCORRECT_P1P2, r.getSW(), "P1 = " + p1);
+            assertEquals(0, r.getData().length);
+        }
+        reselect();     // no PIN: the refusal is the same, and not a demand for the PIN
+        assertEquals(SW_INCORRECT_P1P2, sw(new CommandAPDU(CLA, INS_GET_LOG, 2, 0, 256)));
+        assertEquals(SW_SECURITY_NOT_SATIS, sw(new CommandAPDU(CLA, INS_GET_LOG, 0, 0, 256)), "P1 = 0 still wants the PIN or the grant");
+        assertEquals(SW_SECURITY_NOT_SATIS, sw(new CommandAPDU(CLA, INS_GET_LOG, 1, 0, 256)), "and so do the receipts");
+    }
+
+    @Test
+    @DisplayName("GET_PIECES with a P2 other than 0, 1 or 2 is refused (the applet's word is 6A86, ISO7816.SW_INCORRECT_P1P2) and not answered as the whole listing; 0, 1 and 2 are as they were")
+    void testGetPiecesRefusesAFormItDoesNotHave() {
+        ready();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 5, 1)).getSW());
+        for (int p2 : new int[] { 3, 4, 5, 0x10, 0x7f, 0x80, 0xff }) {
+            ResponseAPDU r = transmit(new CommandAPDU(CLA, INS_GET_PIECES, 0, p2, 256));
+            assertEquals(SW_INCORRECT_P1P2, r.getSW(), "P2 = " + p2);
+            assertEquals(0, r.getData().length);
+            assertEquals(SW_INCORRECT_P1P2, transmit(new CommandAPDU(CLA, INS_GET_PIECES, 0, p2, new byte[] { 0 }, 256)).getSW(), "P2 = " + p2 + " with data");
+        }
+        assertEquals(SW_OK, pieces(0).getSW());
+        assertEquals(SW_OK, briefPieces(0).getSW());
+        assertEquals(SW_OK, somePieces(new byte[] { 0 }).getSW());
+    }
+
+    // ---- 4: the clock moved on twice in a power-up is marked --------------------------------
+
+    /** A good SET_TIME by the time signer the card is set up with: the answer's status word. */
+    private int tell(long t) { return setTime(t); }
+
+    /** The same by the time signer the card has been given with a new record (OTHER_SIGNER). */
+    private int tellOther(long t) { return sw(setTimeCommand(t, timeSignature(OTHER_SIGNER, t))); }
+
+    @Test
+    @DisplayName("The first SET_TIME in a time in the field may move the clock any distance and is not marked; a later one more than 120 seconds past where that first telling left the clock raises the card's count of marked things by one, and is not refused: the clock moves; 120 exactly is not a mark; the mark begins no entry in the log, so the ring is as it was")
+    void testTheClockMovedOnTwiceInATapIsWrittenDown() {
+        ready();
+        newTap();
+        long t1 = T0 + 10 * DAY;
+        assertEquals(SW_OK, tell(t1));
+        assertEquals(t1, now(), "ten days on, in the first telling");
+        assertEquals(0, logTampers(), "free, and not marked");
+        assertEquals(0, logTaps());
+        // up to and including 120 seconds beyond where the first telling left the clock: not marked, whatever the clock then holds
+        assertEquals(SW_OK, tell(t1 + 60));
+        assertEquals(SW_OK, tell(t1 + 119));
+        assertEquals(SW_OK, tell(t1 + 120));
+        assertEquals(t1 + 120, now());
+        assertEquals(0, logTampers(), "60, 119 and 120 exactly past the first");
+        // 121
+        assertEquals(SW_OK, tell(t1 + 121));
+        assertEquals(t1 + 121, now(), "the clock moves: it is not refused");
+        assertEquals(1, logTampers(), "the count of marked things goes up by one");
+        assertEquals(0, logTaps(), "and no entry is begun for it: nothing is added to the ring");
+        assertEquals(16, log().length, "the answer is the four counts and no taps");
+        // only one count for a power-up, however many jumps
+        assertEquals(SW_OK, tell(t1 + 5000));
+        assertEquals(SW_OK, tell(t1 + 99999));
+        assertEquals(1, logTampers(), "once for this time in the field");
+        assertEquals(0, logTaps());
+        // a time that does not move the clock forward is not a mark: equal, older, as the first or as a later telling
+        newTap();
+        assertEquals(SW_OK, tell(t1 + 1));        // the first in this power-up, older than the clock: harmless; it leaves the clock where it was
+        assertEquals(SW_OK, tell(t1 + 1));
+        assertEquals(SW_OK, tell(t1 + 99999));    // equal to the clock, which is where the first telling left it
+        assertEquals(SW_OK, tell(t1 + 99999));
+        assertEquals(1, logTampers(), "none of those was a jump");
+        assertEquals(t1 + 99999, now());
+        // the first telling left the clock where it stood, so that is what a later one is judged against
+        assertEquals(SW_OK, tell(t1 + 99999 + 120));
+        assertEquals(1, logTampers(), "120 past it exactly");
+        assertEquals(SW_OK, tell(t1 + 99999 + 121));
+        assertEquals(2, logTampers(), "and 121");
+        // after a reset the first telling is free again, whatever the last power-up did
+        newTap();
+        assertEquals(SW_OK, tell(t1 + 99999 + 5 * DAY));
+        assertEquals(2, logTampers(), "after a reset: free");
+        assertEquals(0, logTaps(), "and the ring has never had an entry from a mark");
+    }
+
+    @Test
+    @DisplayName("Walked in small steps the clock is marked: thirty steps of 100 seconds are marked at the second, the step that passes 120 past where the first telling left the clock, and once only")
+    void testTheSmallStepsWalkIsMarked() {
+        ready();
+        newTap();
+        long t1 = T0 + DAY;
+        assertEquals(SW_OK, tell(t1));
+        long marked = 0;
+        for (int step = 1; step <= 30; step++) {
+            assertEquals(SW_OK, tell(t1 + 100L * step));
+            long count = logTampers();
+            if (step == 1) assertEquals(0, count, "100 past the first: not a mark");
+            else if (step == 2) assertEquals(1, count, "200 past the first: the mark, at the step that passes 120");
+            else assertEquals(1, count, "and no second count in this power-up, at step " + step);
+            marked = count;
+        }
+        assertEquals(1, marked);
+        assertEquals(t1 + 3000, now(), "the clock went all the way");
+        assertEquals(0, logTaps(), "and the ring is untouched");
+        // in steps of 119 seconds, the same: 238 past the first is a mark
+        newTap();
+        long base = now();
+        assertEquals(SW_OK, tell(base));
+        assertEquals(SW_OK, tell(base + 119));
+        assertEquals(1, logTampers(), "119 past the first: not yet, and no new count");
+        assertEquals(SW_OK, tell(base + 119 + 119));
+        assertEquals(2, logTampers(), "238 past it");
+    }
+
+    @Test
+    @DisplayName("What counts as 'told': a SELECT does not make the next telling free and a reset does; a SET_TIME with a bad signature changes nothing and is not a telling; where the first telling left the clock is what the rest are judged against, even when it was older than the clock")
+    void testWhatTheClockFlagCountsAsTold() {
+        ready();
+        // a bad signature is not a telling: the first good one after it is free
+        newTap();
+        assertEquals(SW_NOT_THE_TIME, sw(setTimeCommand(T0 + 10 * DAY, timeSignature(OTHER_SIGNER, T0 + 10 * DAY))));
+        assertEquals(T0, now(), "it changed nothing");
+        assertEquals(SW_OK, tell(T0 + 10 * DAY));
+        assertEquals(0, logTampers(), "the first good one, after a bad one, is free");
+        assertEquals(SW_NOT_THE_TIME, sw(setTimeCommand(T0 + 20 * DAY, timeSignature(OTHER_SIGNER, T0 + 20 * DAY))));
+        assertEquals(T0 + 10 * DAY, now());
+        assertEquals(0, logTampers(), "a bad signature far on is not marked either");
+        assertEquals(SW_OK, tell(T0 + 20 * DAY));
+        assertEquals(1, logTampers(), "the second good one is");
+        // a SELECT is not the card leaving the field: the next telling is the second
+        newTap();
+        assertEquals(SW_OK, tell(T0 + 21 * DAY));
+        assertEquals(1, logTampers());
+        reselect();
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, tell(T0 + 22 * DAY));
+        assertEquals(2, logTampers(), "after a SELECT the card has been told in this power-up already, and the first telling is what it is judged against");
+        // and a reset is: the first telling is free again
+        simulator.reset();
+        reselect();
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, tell(T0 + 40 * DAY));
+        assertEquals(2, logTampers(), "after a reset: free");
+        assertEquals(SW_OK, tell(T0 + 41 * DAY));
+        assertEquals(3, logTampers());
+        // a first telling that is older than the clock leaves the clock where it was, and that is what the rest are judged against
+        long clock = now();
+        newTap();
+        assertEquals(SW_OK, tell(clock - 5000));
+        assertEquals(clock, now());
+        assertEquals(SW_OK, tell(clock + 120));
+        assertEquals(3, logTampers(), "120 past where the clock stood");
+        assertEquals(SW_OK, tell(clock + 121));
+        assertEquals(4, logTampers(), "121 past it");
+        assertEquals(0, logTaps(), "none of it in the ring");
+    }
+
+    @Test
+    @DisplayName("A mark with no entry in the tap yet is carried into the entry the tap gets later in the same power-up, whether a payment, a load or a refusal begins it; it is not carried into the next power-up's entry; a mark after the entry exists flags that entry at once")
+    void testAMarkIsCarriedIntoTheEntryTheTapGetsLater() {
+        readyWithLimit(100);
+        byte[][] pieces = new byte[6][];
+        for (int i = 0; i < 6; i++) {
+            pieces[i] = buildProof(KEYSET, 100, i + 1);
+            assertEquals(SW_OK, load(pieces[i]).getSW());
+        }
+        long taps = logTaps();
+        assertEquals(1, taps);
+        // a payment follows the mark
+        newTap();
+        assertEquals(SW_OK, tell(T0 + 1000));
+        assertEquals(SW_OK, tell(T0 + 1500));
+        assertEquals(1, logTampers(), "marked");
+        assertEquals(taps, logTaps(), "and no entry");
+        assertEquals(SW_OK, spend(0).getSW());
+        assertEquals(taps + 1, logTaps());
+        assertArrayEquals(new long[] { T0 + 1500, 100, 1, 0, 4 }, logTap(0), "the entry the payment begins has the flag 04 already, at the clock as it was moved");
+        assertEquals(1, logTampers(), "the count is the same: the mark is counted once");
+        // a refusal follows the mark (the day is full)
+        newTap();
+        assertEquals(SW_OK, tell(T0 + 2000));
+        assertEquals(SW_OK, tell(T0 + 2500));
+        assertEquals(2, logTampers());
+        assertEquals(taps + 1, logTaps());
+        assertEquals(SW_OVER_LIMIT, spend(1).getSW());
+        assertEquals(taps + 2, logTaps());
+        assertArrayEquals(new long[] { T0 + 2500, 0, 0, 1, 4 }, logTap(0), "the entry a refusal begins has it too");
+        // not carried into the next power-up's entry: no mark in that one
+        newTap();
+        assertEquals(SW_OVER_LIMIT, spend(1).getSW());
+        assertArrayEquals(new long[] { T0 + 2500, 0, 0, 1, 0 }, logTap(0), "the next power-up, no mark in it: no flag");
+        assertEquals(2, logTampers());
+        // a load follows the mark (a day on, so the day does not matter to a load)
+        newTap();
+        assertEquals(SW_OK, tell(T0 + 3000));
+        assertEquals(SW_OK, tell(T0 + 3500));
+        assertEquals(3, logTampers());
+        assertEquals(SW_OK, load(buildProof(KEYSET, 7, 40)).getSW());
+        assertArrayEquals(new long[] { T0 + 3500, 0, 0, 0, 4 }, logTap(0), "the entry a load begins has it too");
+        assertArrayEquals(new long[] { 1, 7 }, logLoaded(0));
+        // the next power-up begins its entry with a payment, and has no flag
+        newTap();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 8, 41)).getSW());
+        assertArrayEquals(new long[] { T0 + 3500, 0, 0, 0, 0 }, logTap(0), "no flag");
+        assertEquals(3, logTampers());
+        // a mark after the entry exists flags that entry at once
+        newTap();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 9, 42)).getSW());
+        assertArrayEquals(new long[] { T0 + 3500, 0, 0, 0, 0 }, logTap(0));
+        long entries = logTaps();
+        assertEquals(SW_OK, tell(T0 + 4000));
+        assertEquals(SW_OK, tell(T0 + 4500));
+        assertArrayEquals(new long[] { T0 + 3500, 0, 0, 0, 4 }, logTap(0), "the entry that was there is flagged, and keeps its clock");
+        assertEquals(entries, logTaps(), "no new entry");
+        assertEquals(4, logTampers());
+        assertEquals(SW_OK, tell(T0 + 9000));
+        assertEquals(4, logTampers(), "once for the power-up");
+    }
+
+    @Test
+    @DisplayName("The mark joins the waited flag in the entry, whichever comes first (02 and 04 make 06), and a later command that asks for the entry again, a refusal, takes neither away")
+    void testTheMarkJoinsTheWaitedFlag() {
+        readyWithLimit(0);
+        assertEquals(SW_OK, setLimits(520, 100));
+        long[] amounts = { 100, 100, 50, 100, 100, 50, 100 };
+        for (int i = 0; i < amounts.length; i++) assertEquals(SW_OK, load(buildProof(KEYSET, amounts[i], i + 1)).getSW());
+        // the waited payment first, the mark after
+        newTap();
+        assertEquals(SW_OK, tell(T0 + 100));
+        assertEquals(SW_OK, spendAll(new int[] { 0, 1, 2 }, new byte[0][]).getSW());
+        assertEquals(2 * WAIT_SIGNS, waitsTaken(), "250 under a limit of 100");
+        assertArrayEquals(new long[] { T0 + 100, 250, 3, 0, 2 }, logTap(0));
+        assertEquals(SW_OK, tell(T0 + 700));
+        assertArrayEquals(new long[] { T0 + 100, 250, 3, 0, 6 }, logTap(0), "02 and 04 in the entry the payment began");
+        assertEquals(1, logTampers());
+        // the mark first, the waited payment after, and then a refusal that asks for the entry again
+        newTap();
+        assertEquals(SW_OK, tell(T0 + 1000));
+        assertEquals(SW_OK, tell(T0 + 1500));
+        assertEquals(SW_OK, spendAll(new int[] { 3, 4, 5 }, new byte[0][]).getSW());
+        assertArrayEquals(new long[] { T0 + 1500, 250, 3, 0, 6 }, logTap(0), "begun with 04, and the payment adds 02");
+        assertEquals(SW_OVER_LIMIT, spend(6).getSW(), "100 more would pass the day's 520");
+        assertArrayEquals(new long[] { T0 + 1500, 250, 3, 1, 6 }, logTap(0), "the refusal is counted and takes no flag away");
+        assertEquals(2, logTampers());
+    }
+
+    @Test
+    @DisplayName("The count of marked things is shared with the runs of three refusals: a run and a mark in one tap raise it by two, and the entry has 01 and 04, whichever comes first; the count stops at the top of four bytes")
+    void testTheMarkedCountIsSharedWithRunsOfRefusals() throws Exception {
+        for (int order = 0; order < 2; order++) {
+            readyWithLimit(100);
+            for (int i = 0; i < 6; i++) assertEquals(SW_OK, load(buildProof(KEYSET, 100, i + 1)).getSW());
+            newTap();
+            assertEquals(SW_OK, tell(T0 + 1000));
+            if (order == 0) assertEquals(SW_OK, tell(T0 + 1500), "the mark first, before the tap has an entry");
+            assertEquals(SW_OK, spend(0).getSW(), "the day's limit");
+            for (int k = 0; k < 3; k++) assertEquals(SW_OVER_LIMIT, spend(1).getSW());
+            if (order == 1) assertEquals(SW_OK, tell(T0 + 1500), "the mark last, with the entry there");
+            assertEquals(2, logTampers(), "a run of three refusals and a mark: two");
+            long begunAt = order == 0 ? T0 + 1500 : T0 + 1000;
+            assertArrayEquals(new long[] { begunAt, 100, 1, 3, 5 }, logTap(0), "both flags, 01 and 04");
+            simulator = freshCard();
+        }
+        // the count stops at the top of four bytes
+        readyWithLimit(0);
+        assertEquals(SW_OK, load(buildProof(KEYSET, 5, 1)).getSW());
+        byte[] cardLog = field("cardLog");
+        Arrays.fill(cardLog, 12, 16, (byte) 0xFF);
+        cardLog[15] = (byte) 0xFE;
+        assertEquals(4294967294L, logTampers());
+        newTap();
+        assertEquals(SW_OK, tell(T0 + 1000));
+        assertEquals(SW_OK, tell(T0 + 1500));
+        assertEquals(4294967295L, logTampers(), "one more is the top");
+        newTap();
+        assertEquals(SW_OK, tell(T0 + 2000));
+        assertEquals(SW_OK, tell(T0 + 2500));
+        assertEquals(4294967295L, logTampers(), "and no wrap");
+        assertEquals(SW_OK, spend(0).getSW());
+        assertArrayEquals(new long[] { T0 + 2500, 5, 1, 0, 4 }, logTap(0), "the flag is carried all the same");
+    }
+
+    @Test
+    @DisplayName("A terminal with no PIN cannot push the taps out of the ring with marks: twenty times, reset, SELECT, SET_TIME, SET_TIME 121 seconds on, and the eight entries are byte for byte what they were, the taps count is the same, the count of marked things is twenty more, and the clock has moved")
+    void testAStrangerCannotPushTheRingWithMarks() throws Exception {
+        readyWithLimit(0);
+        for (int i = 0; i < 3; i++) assertEquals(SW_OK, load(buildProof(KEYSET, 40 + i, i + 1)).getSW());
+        newTap();
+        assertEquals(SW_OK, spend(0).getSW());
+        assertEquals(SW_OK, load(buildProof(KEYSET, 9, 10)).getSW());
+        long taps = logTaps();
+        long sats = logSats();
+        byte[] before = field("cardLog").clone();
+        long marked = logTampers();
+        long clock = now();
+        assertEquals(2, taps, "a load and a payment with a load: two taps in the ring");
+        for (int round = 1; round <= 20; round++) {
+            simulator.reset();
+            reselect();                                                        // no PIN: none is needed
+            assertEquals(SW_OK, tell(clock), "the first telling: where the clock stands");
+            clock += 121;
+            assertEquals(SW_OK, tell(clock), "121 seconds on");
+        }
+        byte[] after = field("cardLog").clone();
+        // the head's fourth count is the only thing that moved
+        byte[] beforeNoCount = before.clone(), afterNoCount = after.clone();
+        Arrays.fill(beforeNoCount, 12, 16, (byte) 0);
+        Arrays.fill(afterNoCount, 12, 16, (byte) 0);
+        assertArrayEquals(beforeNoCount, afterNoCount, "the log is as it was, but for the count of marked things");
+        assertEquals(marked + 20, readUint32(after, 12), "twenty marks");
+        assertEquals(clock, T0 + 20 * 121L);
+        reselect();
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(clock, now(), "and the clock has moved the whole way");
+        assertEquals(taps, logTaps(), "the taps count is the same");
+        assertEquals(sats, logSats());
+        assertEquals(16 + 16 * 2, log().length, "the same two entries");
+        assertEquals(marked + 20, logTampers());
+    }
+
+    @Test
+    @DisplayName("The clock at 0 is never judged: signed time 0 leaves it at 0 and nothing in that power-up is judged; a new time key on an empty card clears the clock but not what the first telling of the power-up left, and the new signer's tellings are judged against that; the top of the range cannot be passed")
+    void testTheClockAtZeroIsNeverJudged() {
+        // a card never told the time: a good signature over the time 0 leaves the clock at 0, and the first telling's value is 0
+        assertEquals(SW_OK, setPin(TEST_PIN));
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, setCard(MINT, REFUND));
+        assertEquals(SW_OK, setOwner(OWNER));
+        assertEquals(0, now());
+        assertEquals(SW_OK, tell(0));
+        assertEquals(0, now(), "told the time 0: the clock is where it was");
+        assertEquals(SW_OK, tell(T0 + 5 * DAY));
+        assertEquals(T0 + 5 * DAY, now());
+        assertEquals(SW_OK, tell(T0 + 5 * DAY + 500));
+        assertEquals(SW_OK, tell(T0 + 50 * DAY));
+        assertEquals(0, logTampers(), "the first telling left the clock at 0: nothing in this power-up is ever judged");
+        // after a reset the first telling is whatever it is: the clock is not 0 now, and the next is judged against it
+        newTap();
+        assertEquals(SW_OK, tell(T0 + 50 * DAY));
+        assertEquals(SW_OK, tell(T0 + 50 * DAY + 121));
+        assertEquals(1, logTampers());
+
+        // a new time key on an empty card, in a power-up that has been told the time: the card's clock goes to 0 and the first telling's value stays,
+        // so the new signer's times are judged against where the first telling (by the old signer) left the clock
+        simulator = freshCard();
+        ready();                                                       // the first telling of this power-up: T0
+        assertEquals(SW_OK, ownerSetCard(MINT, REFUND, OTHER_SIGNER));
+        assertEquals(0, now(), "cleared");
+        assertEquals(SW_OK, tellOther(T0 + 120));
+        assertEquals(T0 + 120, now());
+        assertEquals(0, logTampers(), "120 past the old signer's first telling: not a mark");
+        assertEquals(SW_OK, tellOther(T0 + 121));
+        assertEquals(1, logTampers(), "121 past it: a mark, though the clock itself was 0 a moment ago");
+        assertEquals(SW_OK, tellOther(T0 + 3 * DAY));
+        assertEquals(1, logTampers(), "once");
+        // a new signer's first time far on is a mark at once, in a power-up the old signer had told
+        simulator = freshCard();
+        ready();
+        assertEquals(SW_OK, ownerSetCard(MINT, REFUND, OTHER_SIGNER));
+        assertEquals(SW_OK, tellOther(T0 + 3 * DAY));
+        assertEquals(1, logTampers(), "T0 + 3 days is far past the T0 the first telling left");
+        // in a power-up that had not been told the time before the key was changed, the new signer's first telling is the first
+        simulator = freshCard();
+        assertEquals(SW_OK, setPin(TEST_PIN));
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, setCard(MINT, REFUND));
+        assertEquals(SW_OK, setOwner(OWNER));
+        assertEquals(SW_OK, ownerSetCard(MINT, REFUND, OTHER_SIGNER));
+        assertEquals(SW_OK, tellOther(T0 + 3 * DAY));
+        assertEquals(SW_OK, tellOther(T0 + 3 * DAY + 120));
+        assertEquals(0, logTampers(), "free, then 120 past it");
+        assertEquals(SW_OK, tellOther(T0 + 3 * DAY + 121));
+        assertEquals(1, logTampers());
+
+        // the top of the range: a jump that fits is a mark; one whose 120 seconds would pass 2^32 cannot be a jump
+        simulator = freshCard();
+        ready();
+        newTap();
+        assertEquals(SW_OK, tell(4294967100L));
+        assertEquals(SW_OK, tell(4294967295L));
+        assertEquals(4294967295L, now());
+        assertEquals(1, logTampers(), "195 seconds on, short of the top: a mark");
+        simulator = freshCard();
+        ready();
+        newTap();
+        assertEquals(SW_OK, tell(4294967200L));
+        assertEquals(SW_OK, tell(4294967295L));
+        assertEquals(4294967295L, now());
+        assertEquals(0, logTampers(), "95 seconds on: not a jump");
+        assertEquals(SW_OK, tell(4294967295L));
+        assertEquals(0, logTampers(), "and nothing is later than the top");
+    }
+
+    @Test
+    @DisplayName("A terminal that walks the clock a day on to turn the day's window is not refused and is marked; one that cuts the field between the two is not seen (the first telling in a power-up is free)")
+    void testAClockWalkedForwardTurnsTheDayAndTheLogSaysSo() {
+        readyWithLimit(100);
+        for (int i = 0; i < 3; i++) assertEquals(SW_OK, load(buildProof(KEYSET, 100, i + 1)).getSW());
+        newTap();
+        assertEquals(SW_OK, tell(T0 + 10));
+        assertEquals(SW_OK, spend(0).getSW(), "the day's limit");
+        assertEquals(SW_OVER_LIMIT, spend(1).getSW(), "the day is full");
+        assertEquals(0, logTampers());
+        assertEquals(SW_OK, tell(T0 + 10 + DAY));
+        assertEquals(1, logTampers(), "the mark");
+        assertEquals(SW_OK, spend(1).getSW(), "a day on: the window turns, and the card does not refuse");
+        assertArrayEquals(new long[] { T0 + 10, 200, 2, 1, 4 }, logTap(0), "the entry that began with the first spend: two paid, one refused, and flagged when the clock was moved on");
+        // the field cut between the two: the second telling of a power-up is the first of its own
+        newTap();
+        assertEquals(SW_OK, tell(T0 + 10 + 2 * DAY));
+        assertEquals(SW_OK, spend(2).getSW(), "another day on, after a reset: the window turns");
+        assertArrayEquals(new long[] { T0 + 10 + 2 * DAY, 100, 1, 0, 0 }, logTap(0), "and nothing says the clock was moved");
+        assertEquals(1, logTampers(), "nor does the count");
+        // a terminal that moves the clock on a day and then asks for the pieces in the same power-up as a new tap: the mark is in the entry that tap gets
+        newTap();
+        assertEquals(SW_OK, tell(T0 + 10 + 2 * DAY));
+        assertEquals(SW_OK, tell(T0 + 10 + 4 * DAY));
+        assertEquals(SW_OK, load(buildProof(KEYSET, 5, 20)).getSW());
+        assertArrayEquals(new long[] { T0 + 10 + 4 * DAY, 0, 0, 0, 4 }, logTap(0), "carried into the entry a load begins");
+        assertEquals(2, logTampers());
+    }
+
+    @Test
+    @DisplayName("SET_TIME is judged after the signature is good and before the clock moves, against where the first telling of the power-up left the clock (kept in RAM beside the told flag, after the first telling's move); a mark counts once, adds nothing to the ring, flags the entry if the tap has one, and logEntry carries it into the one the tap gets; the jump is 120 seconds")
+    void testTheClockIsJudgedBeforeItMoves() throws Exception {
+        String code = appletCode();
+        String setTime = body(code, "private void processSetTime(", "private void processVerifyPin(");
+        int bad = setTime.indexOf("SW_NOT_THE_TIME");
+        int judged = setTime.indexOf("timeTold[0] == (byte) 1 && timeTold[1] != (byte) 1");
+        int moved = setTime.indexOf("cmpUint32(buf, at, cardRecord, CARD_NOW_OFFSET) > 0");
+        int told = setTime.indexOf("timeTold[0] != (byte) 1");
+        int kept = setTime.indexOf("Util.arrayCopyNonAtomic(cardRecord, CARD_NOW_OFFSET, timeTold, (short) 2, (short) 4)");
+        int mark = setTime.indexOf("if (jumped)");
+        assertTrue(bad > 0 && bad < judged && judged < moved && moved < told && told < kept && kept < mark,
+            "a bad signature is refused first; the jump is judged before the clock moves; the clock moves; the first telling is recorded with the clock after its move; and then the mark is made");
+        assertTrue(setTime.contains("!isZero(timeTold, (short) 2, (short) 4)"), "a first telling that left the clock at 0 judges nothing");
+        assertTrue(setTime.contains("Util.arrayCopyNonAtomic(timeTold, (short) 2, scratch, X_NUM, (short) 4)"), "against what the first telling left, and not the clock as it stands");
+        assertFalse(setTime.substring(judged, moved).contains("cardRecord"), "the clock as it stands is not read to judge it");
+        assertTrue(setTime.contains("cmpUint32(buf, at, scratch, X_NUM) > 0"), "more than that and 120, and not that many");
+        String markPart = setTime.substring(mark);
+        assertTrue(markPart.contains("timeTold[1] = (byte) 1"), "a mark stops a second one in the power-up");
+        assertTrue(markPart.indexOf("beginTransaction") < markPart.indexOf("LOG_TAMPERS_OFFSET") && markPart.indexOf("LOG_TAMPERS_OFFSET") < markPart.indexOf("commitTransaction"), "the count goes up in a transaction");
+        assertTrue(markPart.contains("addUint32Stop(cardLog, LOG_TAMPERS_OFFSET, ONE, (short) 0)"), "by one, and stopping at the top");
+        int open = markPart.indexOf("tapOpen[0] == (byte) 1");
+        int entry = markPart.indexOf("logEntry()");
+        assertTrue(open > 0 && open < entry && entry < markPart.indexOf("LOG_FLAG_CLOCK"), "an entry is asked for only if the tap has one, and flagged");
+        assertEquals(1, count(markPart, "logEntry()"));
+        String logEntry = body(code, "private short logEntry(", "private void refuseOverLimit(");
+        assertTrue(logEntry.indexOf("timeTold[1] == (byte) 1") > logEntry.indexOf("arrayFillNonAtomic(cardLog, at, LOG_ENTRY_LEN") && logEntry.contains("= LOG_FLAG_CLOCK"),
+            "an entry that is begun in a power-up that had a mark starts with the flag, after it is cleared");
+        assertTrue(logEntry.indexOf("timeTold[1]") > logEntry.indexOf("if (tapOpen[0] != (byte) 1) {", logEntry.indexOf("short at")), "and only an entry that is begun");
+        assertTrue(code.contains("timeTold        = JCSystem.makeTransientByteArray((short) 6, JCSystem.CLEAR_ON_RESET)"), "six bytes of RAM that go with the power: told, marked, and the clock the first telling left");
+        assertArrayEquals(u32(120), constant("CLOCK_JUMP"), "120 seconds");
+        assertEquals(0x04, CashuApplet.LOG_FLAG_CLOCK);
+    }
+
+    // ---- 5: the receipts ------------------------------------------------------------------
+
+    @Test
+    @DisplayName("A payment leaves a receipt: the clock when it was signed, what its pieces were worth, SHA-256 of the message that was signed (built here, independently), and the first output's blinded message as it was given; the signature verifies over that same digest; read with the owner's grant, count first")
+    void testAPaymentLeavesAReceipt() throws Exception {
+        readyWithLimit(0);
+        byte[][] sent = { buildProof(KEYSET, 40, 1), buildProof(KEYSET, 25, 2), buildProof(KEYSET, 8, 3, 1900000000L), buildProof(KEYSET, 8, 4, 1900000000L) };
+        for (byte[] p : sent) assertEquals(SW_OK, load(p).getSW());
+        assertEquals(SW_OK, allowLoad());
+        ResponseAPDU none = receipts(0);
+        assertEquals(SW_OK, none.getSW());
+        assertArrayEquals(new byte[4], none.getData(), "no payment yet: the count alone");
+        newTap();
+        assertEquals(SW_OK, setTime(T0 + 77));
+        byte[][] outputs = { output(60, blinded(11)), output(5, blinded(12)) };
+        ResponseAPDU first = spendAll(new int[] { 1, 0 }, outputs);
+        assertEquals(SW_OK, first.getSW());
+        // a payment of dated pieces, with no outputs
+        ResponseAPDU second = spendAll(new int[] { 3, 2 }, new byte[0][]);
+        assertEquals(SW_OK, second.getSW());
+        assertEquals(SW_OK, allowLoad());
+        Held held = heldReceipts();
+        assertEquals(2, held.count);
+        assertEquals(2, held.receipts.size());
+        byte[] expectedSecond = receiptFor(T0 + 77, 16, new byte[][] { asSlot(sent[3]), asSlot(sent[2]) }, new byte[0][]);
+        byte[] expectedFirst = receiptFor(T0 + 77, 65, new byte[][] { asSlot(sent[1]), asSlot(sent[0]) }, outputs);
+        assertArrayEquals(expectedSecond, held.receipts.get(0), "newest first: the payment of the dated pieces, with no outputs (33 zeros)");
+        assertArrayEquals(expectedFirst, held.receipts.get(1), "and the payment with outputs: its clock, 65 sats, the digest of its message, and the first output's blinded message");
+        assertArrayEquals(Arrays.copyOfRange(outputs[0], 4, 37), Arrays.copyOfRange(held.receipts.get(1), 40, 73), "the first output, as it was given");
+        assertArrayEquals(new byte[33], Arrays.copyOfRange(held.receipts.get(0), 40, 73), "and zeros where there were no outputs");
+        // the signature the terminal was given verifies over the digest in the receipt
+        byte[] pubX = extractPubkeyX(cardKey());
+        assertTrue(schnorrVerify(pubX, Arrays.copyOfRange(held.receipts.get(1), 8, 40), first.getData()), "the receipt's digest is what was signed");
+        assertTrue(schnorrVerify(pubX, Arrays.copyOfRange(held.receipts.get(0), 8, 40), second.getData()));
+        assertFalse(schnorrVerify(pubX, Arrays.copyOfRange(held.receipts.get(0), 8, 40), first.getData()), "and the other payment's digest is not");
+        // asking for the last signature again is not a payment
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_SPEND_ALL_AGAIN, 0, 0, 64)));
+        assertEquals(SW_OK, allowLoad());
+        assertEquals(2, heldReceipts().count, "SPEND_ALL_AGAIN writes no receipt");
+    }
+
+    @Test
+    @DisplayName("The receipts are the owner's grant's alone: a verified PIN is not enough (6982), nor is no PIN; the grant goes with the tap; a card with no PIN set has signed nothing and answers freely")
+    void testTheReceiptsAreTheGrantsAlone() {
+        // a card with no PIN has signed nothing: it answers anyone
+        ResponseAPDU free = receipts(0);
+        assertEquals(SW_OK, free.getSW());
+        assertArrayEquals(new byte[4], free.getData());
+        assertEquals(SW_OK, receipts(5).getSW());
+        assertEquals(SW_OK, setPin(TEST_PIN));
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_SECURITY_NOT_SATIS, receipts(0).getSW(), "a PIN set, and no owner to give the grant: nobody reads them");
+        // a card that has paid
+        simulator = freshCard();
+        readyWithLimit(0);
+        assertEquals(SW_OK, load(buildProof(KEYSET, 10, 1)).getSW());
+        assertEquals(SW_OK, spend(0).getSW());
+        for (int back : new int[] { 0, 1, 2, 15, 16, 200 }) {
+            ResponseAPDU r = receipts(back);
+            assertEquals(SW_SECURITY_NOT_SATIS, r.getSW(), "a verified PIN, P2 = " + back);
+            assertEquals(0, r.getData().length);
+        }
+        assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_GET_LOG, 0, 0, 256)), "the log itself is the PIN's, as it was");
+        reselect();
+        assertEquals(SW_SECURITY_NOT_SATIS, receipts(0).getSW(), "no PIN either");
+        assertEquals(SW_OK, allowLoad());
+        ResponseAPDU granted = receipts(0);
+        assertEquals(SW_OK, granted.getSW(), "the owner's grant");
+        assertEquals(4 + RECEIPT_LEN, granted.getData().length);
+        assertEquals(1, readUint32(granted.getData(), 0));
+        reselect();
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_SECURITY_NOT_SATIS, receipts(0).getSW(), "the grant went with the tap, and the PIN again is not it");
+        // a terminal cannot give itself the grant
+        assertEquals(SW_OWNER_PROOF, sw(allowLoadCommand(ownerProof(L_LOAD, OTHER_OWNER, nonceBytes(), new byte[0]))));
+        assertEquals(SW_SECURITY_NOT_SATIS, receipts(0).getSW());
+    }
+
+    @Test
+    @DisplayName("The receipt's first output is the first of the first SPEND_ALL_OUTPUTS command of the payment, however the outputs are split between commands, and is not carried to the next payment")
+    void testTheFirstOutputIsTheFirstOfTheFirstCommand() throws Exception {
+        readyWithLimit(0);
+        int[][] splits = { { 1, 6 }, { 6, 1 }, { 2, 1, 4 }, { 3, 4 }, { 5, 2 }, { 1 } };
+        byte[][] sent = new byte[splits.length + 1][];
+        for (int i = 0; i < sent.length; i++) {
+            sent[i] = buildProof(KEYSET, 10 + i, i + 1);
+            assertEquals(SW_OK, load(sent[i]).getSW());
+        }
+        for (int i = 0; i < splits.length; i++) {
+            byte[][] outputs = new byte[7][];
+            for (int k = 0; k < 7; k++) outputs[k] = output(1 + k, blinded(50 * i + k + 1));
+            assertEquals(SW_OK, payGrouped(new int[] { i }, outputs, splits[i]).getSW(), "split " + Arrays.toString(splits[i]));
+            assertEquals(SW_OK, allowLoad());
+            Held held = heldReceipts();
+            assertEquals(i + 1, held.count);
+            assertArrayEquals(receiptFor(T0, 10 + i, new byte[][] { asSlot(sent[i]) }, outputs), held.receipts.get(0), "split " + Arrays.toString(splits[i]));
+            assertArrayEquals(Arrays.copyOfRange(outputs[0], 4, 37), Arrays.copyOfRange(held.receipts.get(0), 40, 73), "the first output of the first command");
+            assertFalse(Arrays.equals(Arrays.copyOfRange(outputs[splits[i][0]], 4, 37), Arrays.copyOfRange(held.receipts.get(0), 40, 73)), "and not the first of the second command");
+        }
+        // a payment with no outputs after payments that had them: zeros, and not the last one's
+        int last = splits.length;
+        assertEquals(SW_OK, spend(last).getSW());
+        assertEquals(SW_OK, allowLoad());
+        Held held = heldReceipts();
+        assertArrayEquals(receiptFor(T0, 10 + last, new byte[][] { asSlot(sent[last]) }, new byte[0][]), held.receipts.get(0));
+        assertArrayEquals(new byte[33], Arrays.copyOfRange(held.receipts.get(0), 40, 73), "zeros: the first output of an earlier payment is not carried over");
+    }
+
+    /** `n` payments on a card of its own, one piece and one or two outputs each, the clock 100 seconds on for each: what the receipts should then be, newest first. */
+    private java.util.List<byte[]> payAndExpect(int n) throws Exception {
+        simulator = freshCard();
+        readyWithLimit(0);
+        byte[][] sent = new byte[n][];
+        for (int i = 0; i < n; i++) sent[i] = buildProof(KEYSET, 3 + i, 1000 + i);
+        for (int at = 0; at < n; at += 3) assertEquals(SW_OK, loadBatch(Arrays.copyOfRange(sent, at, Math.min(n, at + 3))).getSW());
+        assertEquals(SW_OK, allowLoad());
+        java.util.LinkedList<byte[]> expected = new java.util.LinkedList<>();
+        for (int j = 1; j <= n; j++) {
+            assertEquals(SW_OK, setTime(T0 + 100L * j), "100 seconds on, which is not a jump");
+            byte[][] outputs = j % 2 == 0 ? new byte[][] { output(2, blinded(j)), output(1, blinded(j + 100)) } : new byte[][] { output(3 + j - 1, blinded(j)) };
+            ResponseAPDU r = spendAll(new int[] { j - 1 }, outputs);
+            assertEquals(SW_OK, r.getSW(), "payment " + j);
+            expected.addFirst(receiptFor(T0 + 100L * j, 3 + j - 1, new byte[][] { asSlot(sent[j - 1]) }, outputs));
+        }
+        return expected;
+    }
+
+    @Test
+    @DisplayName("The receipts ring holds the last 16 payments and the count of all of them: after 1, 16, 17, 18 and 33 payments the count is right, the receipts are the newest, in order, newest first, and the older ones are gone")
+    void testTheReceiptsRingWraps() throws Exception {
+        for (int n : new int[] { 1, 15, 16, 17, 18, 33 }) {
+            java.util.List<byte[]> expected = payAndExpect(n);
+            assertEquals(SW_OK, allowLoad());
+            Held held = heldReceipts();
+            assertEquals(n, held.count, "after " + n + " payments");
+            int kept = Math.min(n, 16);
+            assertEquals(kept, held.receipts.size(), "after " + n + " payments, the ring holds " + kept);
+            for (int k = 0; k < kept; k++) {
+                assertArrayEquals(expected.get(k), held.receipts.get(k), "after " + n + " payments, " + k + " back (payment " + (n - k) + ")");
+            }
+            if (n > 16) {
+                for (int j = 1; j <= n - 16; j++) {
+                    byte[] gone = expected.get(n - j);
+                    for (byte[] h : held.receipts) assertFalse(Arrays.equals(gone, h), "payment " + j + " is gone");
+                }
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("GET_LOG P1 = 1 pages by P2: P2 = 0 is the newest, three receipts at most to an answer, and a P2 at or past what the ring holds answers the count alone: P2 = 0, 1, 2, 3, 13, 15, 16 and 200 on a full ring, on five receipts, and on none")
+    void testReceiptPaging() throws Exception {
+        int[] backs = { 0, 1, 2, 3, 13, 15, 16, 200 };
+        for (int n : new int[] { 20, 5, 0 }) {
+            java.util.List<byte[]> expected = n == 0 ? new java.util.ArrayList<>() : payAndExpect(n);
+            if (n == 0) { simulator = freshCard(); readyWithLimit(0); }
+            int kept = Math.min(n, 16);
+            for (int back : backs) {
+                assertEquals(SW_OK, allowLoad());
+                ResponseAPDU r = receipts(back);
+                assertEquals(SW_OK, r.getSW(), n + " payments, P2 = " + back);
+                byte[] d = r.getData();
+                int returned = Math.max(0, Math.min(3, kept - back));
+                assertEquals(4 + RECEIPT_LEN * returned, d.length, n + " payments held " + kept + ", P2 = " + back);
+                assertEquals(n, readUint32(d, 0), "the count first");
+                for (int k = 0; k < returned; k++) {
+                    assertArrayEquals(expected.get(back + k), Arrays.copyOfRange(d, 4 + RECEIPT_LEN * k, 4 + RECEIPT_LEN * (k + 1)), n + " payments, P2 = " + back + ", receipt " + k);
+                }
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("A payment that waited leaves one receipt, once it is signed; one given up in the wait, one refused (over the day, with no time, a place spent or empty), and asking for the last signature again leave none; nothing in the wait writes the receipts")
+    void testAWaitedPaymentLeavesOneReceiptAndOthersLeaveNone() throws Exception {
+        readyWithLimit(0);
+        assertEquals(SW_OK, setLimits(250, 100));
+        byte[][] sent = { buildProof(KEYSET, 300, 1), buildProof(KEYSET, 200, 2), buildProof(KEYSET, 120, 3), buildProof(KEYSET, 120, 4) };
+        for (byte[] p : sent) assertEquals(SW_OK, load(p).getSW());
+        newTap();
+        assertEquals(SW_OVER_LIMIT, sw(beginCommand(0)), "300 is over the day");
+        assertEquals(0, readUint32(field("cardReceipts"), 0), "refused: no receipt");
+        // a payment given up in its wait: 200 under 100 is four waits
+        assertEquals(SW_OK, sw(beginCommand(1)));
+        byte[] receiptsBefore = field("cardReceipts").clone();
+        for (int i = 1; i <= WAIT_SIGNS; i++) {
+            assertNotYet(transmit(SIGN_ALL), "wait " + i);
+            assertArrayEquals(receiptsBefore, field("cardReceipts"), "nothing is written while it waits");
+        }
+        assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4)));
+        assertEquals(SW_CONDITIONS_NOT_SATIS, sw(SIGN_ALL));
+        assertArrayEquals(receiptsBefore, field("cardReceipts"), "given up, with every wait done: no receipt");
+        // a place that is empty
+        assertEquals(SW_SLOT_EMPTY, sw(beginCommand(9)));
+        assertArrayEquals(receiptsBefore, field("cardReceipts"));
+        // paid, whole
+        ResponseAPDU paid = spend(1);
+        assertEquals(SW_OK, paid.getSW());
+        assertEquals(WAIT_SIGNS, waitsTaken(), "200 under 100: one limit past the first");
+        assertEquals(1, readUint32(field("cardReceipts"), 0), "one receipt, once it is signed");
+        // a place that is spent, a payment over what is left of the day, and no time
+        assertEquals(SW_CONDITIONS_NOT_SATIS, sw(beginCommand(1)), "spent");
+        assertEquals(SW_OVER_LIMIT, sw(beginCommand(2, 3)), "240 more is over what the day has left of 250");
+        putRecord(CashuApplet.CARD_NOW_OFFSET, new byte[4]);
+        assertEquals(SW_NO_TIME, sw(beginCommand(2)), "no time");
+        assertEquals(SW_OK, setTime(T0));
+        assertEquals(SW_OK, allowLoad());
+        Held held = heldReceipts();
+        assertEquals(1, held.count, "one payment was made, and none of the others left anything");
+        assertArrayEquals(receiptFor(T0, 200, new byte[][] { asSlot(sent[1]) }, new byte[0][]), held.receipts.get(0));
+        assertTrue(schnorrVerify(extractPubkeyX(cardKey()), Arrays.copyOfRange(held.receipts.get(0), 8, 40), paid.getData()), "and its digest is what was signed");
+        // asking for the last signature again is not another payment
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_SPEND_ALL_AGAIN, 0, 0, 64)));
+        assertEquals(1, readUint32(field("cardReceipts"), 0));
+    }
+
+    @Test
+    @DisplayName("Nothing clears the receipts: not CLEAR_SPENT, not SET_CARD with a new time key, not a new owner, not a new PIN, not a limit, not the lock; they are read afterwards as they were")
+    void testNothingClearsTheReceipts() throws Exception {
+        readyWithLimit(0);
+        for (int i = 0; i < 3; i++) assertEquals(SW_OK, load(buildProof(KEYSET, 5 + i, 1 + i)).getSW());
+        assertEquals(SW_OK, spendAll(new int[] { 0, 1 }, new byte[][] { output(9, blinded(1)) }).getSW());
+        assertEquals(SW_OK, spend(2).getSW());
+        byte[] kept = field("cardReceipts").clone();
+        assertEquals(2, readUint32(kept, 0));
+        assertEquals(SW_OK, clearSpent());
+        assertArrayEquals(kept, field("cardReceipts"), "CLEAR_SPENT");
+        assertEquals(SW_OK, ownerSetCard(MINT, REFUND, OTHER_SIGNER));
+        assertArrayEquals(kept, field("cardReceipts"), "SET_CARD with another time key");
+        assertEquals(SW_OK, changePin(NEW_PIN));
+        assertArrayEquals(kept, field("cardReceipts"), "CHANGE_PIN");
+        assertEquals(SW_OK, setLimits(0, 50));
+        assertArrayEquals(kept, field("cardReceipts"), "SET_LIMIT");
+        assertEquals(SW_OK, sw(setOwnerCommand(ownerProof(L_OWNER, OWNER, nonceBytes(), OTHER_OWNER.pub), OTHER_OWNER)));
+        assertArrayEquals(kept, field("cardReceipts"), "SET_OWNER");
+        // and they are read, by the new owner's grant, as they were
+        reselect();
+        assertEquals(SW_OK, sw(allowLoadCommand(ownerProof(L_LOAD, OTHER_OWNER, nonceBytes(), new byte[0]))));
+        Held held = heldReceipts();
+        assertEquals(2, held.count);
+        assertEquals(2, held.receipts.size());
+        assertEquals(SW_OK, verify(NEW_PIN));
+        assertEquals(SW_OK, sw(lockCommand(ownerProof(L_LOCK, OTHER_OWNER, nonceBytes(), new byte[0]))));
+        assertArrayEquals(kept, field("cardReceipts"), "LOCK_CARD");
+    }
+
+    @Test
+    @DisplayName("A withdrawal with the limits lifted by the owner: a payment that was to wait 16 times goes at once once the owner has set (0, 0), is one signature of everything, and leaves one receipt of its whole worth")
+    void testAWithdrawalWithTheLimitsLifted() throws Exception {
+        readyWithLimit(0);
+        assertEquals(SW_OK, setLimits(1000, 100));
+        byte[][] sent = new byte[10][];
+        for (int i = 0; i < 10; i++) {
+            sent[i] = buildProof(KEYSET, 50, 1 + i);
+            assertEquals(SW_OK, load(sent[i]).getSW());
+        }
+        int[] all = new int[10];
+        for (int i = 0; i < 10; i++) all[i] = i;
+        byte[][] slots = new byte[10][];
+        for (int i = 0; i < 10; i++) slots[i] = asSlot(sent[i]);
+        newTap();
+        // under the limits, 500 is 4 limits past the first: 16 waits; the terminal gives it up
+        assertEquals(SW_OK, sw(beginCommand(all)));
+        assertNotYet(transmit(SIGN_ALL), "the first of sixteen");
+        // the owner sets both to none
+        assertEquals(SW_OK, setLimits(0, 0));
+        assertEquals(SW_OK, verify(TEST_PIN));
+        byte[][] outputs = { output(500, blinded(77)) };
+        ResponseAPDU r = spendAll(all, outputs);
+        assertEquals(SW_OK, r.getSW());
+        assertEquals(0, waitsTaken(), "no limit on a payment: no wait");
+        assertTrue(signedForAll(r.getData(), slots, outputs, REFUND));
+        assertEquals(0, balance());
+        assertEquals(0, spentToday(), "no limit on the day: nothing counted");
+        assertArrayEquals(new long[] { T0, 500, 10, 0, 0 }, logTap(0), "ten pieces, 500 sats, nothing waited for");
+        assertEquals(SW_OK, allowLoad());
+        Held held = heldReceipts();
+        assertEquals(1, held.count);
+        assertArrayEquals(receiptFor(T0, 500, slots, outputs), held.receipts.get(0));
+    }
+
+    @Test
+    @DisplayName("A payment whose pieces add up past 2^32: under a day's limit BEGIN refuses it (6A8F) and leaves no receipt; with no day limit it is signed, and its receipt says the worth the card saturates to, 4294967295")
+    void testAPaymentPastTwoToTheThirtyTwoHasNoReceiptWhereItIsRefused() throws Exception {
+        readyWithLimit(4294967295L);
+        assertEquals(SW_OK, load(buildProof(KEYSET, 4294967295L, 1)).getSW());
+        assertEquals(SW_OK, load(buildProof(KEYSET, 5, 2)).getSW());
+        assertEquals(SW_OVER_LIMIT, sw(beginCommand(0, 1)), "the sum wraps: past any limit");
+        assertEquals(0, readUint32(field("cardReceipts"), 0), "refused: no receipt");
+        // with no limit on the day nothing refuses it
+        simulator = freshCard();
+        ready();
+        byte[] big = buildProof(KEYSET, 4294967295L, 1), five = buildProof(KEYSET, 5, 2);
+        assertEquals(SW_OK, load(big).getSW());
+        assertEquals(SW_OK, load(five).getSW());
+        ResponseAPDU r = spendAll(new int[] { 0, 1 }, new byte[0][]);
+        assertEquals(SW_OK, r.getSW(), "nothing refuses a sum that wraps where there is no limit on the day");
+        assertEquals(SW_OK, allowLoad());
+        Held held = heldReceipts();
+        assertEquals(1, held.count);
+        assertArrayEquals(receiptFor(T0, 4294967295L, new byte[][] { asSlot(big), asSlot(five) }, new byte[0][]), held.receipts.get(0), "the worth is the top of four bytes, and not the true sum, which they cannot hold");
     }
 
     // =========================================================================
@@ -2010,7 +3938,7 @@ class CashuAppletTest {
             assertEquals(SW_OK, sw(beginCommand(0, 1, 2)));
             ResponseAPDU first = transmit(SIGN_ALL);
             assertTrue(isWait(first), "begun, 150 is over a limit of 100, and the card says so");
-            assertEquals(3, waitsLeft(first), "the first of four waits: three to come, whatever came before");
+            assertNotYet(first, "the first of four waits: not yet, and not how many are left");
             tricks[t].run();
             assertEquals(SW_CONDITIONS_NOT_SATIS, sw(SIGN_ALL), names[t] + " gave the payment up");
             assertEquals(450, balance(), "and burned nothing");
@@ -2164,11 +4092,13 @@ class CashuAppletTest {
         assertEquals(SW_OK, setCard(MINT, REFUND));
         assertEquals(0, now());
         assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(0), u32(100)))), "by the PIN: none on the day and 100 on a payment, with no time");
-        assertEquals(100, paymentLimit());
+        // a card with no owner can give nobody the grant that GET_INFO wants for it, so it is read from the record itself
+        assertEquals(100, paymentLimitInTheRecord());
+        assertEquals(0, paymentLimitAsATerminalSeesIt(), "and a terminal under the PIN is told nothing of it");
         assertEquals(SW_NO_TIME, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(50), u32(100)))), "a limit on the day needs the time");
         assertEquals(SW_NO_TIME, sw(setLimitByPinCommand(50)), "in four bytes as well");
         assertEquals(0, limit(), "none was set");
-        assertEquals(100, paymentLimit(), "and the limit on a payment is as it was");
+        assertEquals(100, paymentLimitInTheRecord(), "and the limit on a payment is as it was");
         // and the owner's
         assertEquals(SW_OK, setOwner(OWNER));
         assertEquals(SW_OK, setLimits(0, 250), "by the owner, with no time");
@@ -2302,8 +4232,7 @@ class CashuAppletTest {
         byte[] storage = field("proofStorage").clone();
         for (int left = 7; left >= 0; left--) {
             ResponseAPDU r = transmit(SIGN_ALL);
-            assertEquals(SW_OK, r.getSW());
-            assertArrayEquals(new byte[] { 0, (byte) left }, r.getData(), "a wait: " + left + " still to come, in two bytes");
+            assertNotYet(r, "wait " + (8 - left) + " of 8: 00 01 every time, whatever is left");
             assertArrayEquals(storage, field("proofStorage"), "and it burned nothing");
         }
         ResponseAPDU sig = transmit(SIGN_ALL);
@@ -2338,8 +4267,7 @@ class CashuAppletTest {
         assertEquals(SW_OK, sw(beginCommand(0, 1, 2, 3)));
         for (int left = 7; left >= 0; left--) {
             ResponseAPDU r = transmit(SIGN_ALL);
-            assertTrue(isWait(r), "a wait");
-            assertEquals(left, waitsLeft(r));
+            assertNotYet(r, "a wait");
             assertArrayEquals(storage, field("proofStorage"), "the slots, with " + left + " waits still to come");
             assertArrayEquals(record, field("cardRecord"), "the record: the day's count, window and clock, with " + left + " still to come");
             assertArrayEquals(cardLog, field("cardLog"), "the log, with " + left + " still to come");
@@ -2362,9 +4290,11 @@ class CashuAppletTest {
         assertEquals(2 * WAIT_SIGNS, waitsTaken());
         assertTrue(signedForAll(r.getData(), named, new byte[0][], REFUND));
         assertEquals(285, spentToday(), "now it is counted: 275 more");
-        assertEquals(2, logTaps());
+        assertEquals(3, logTaps(), "the tap that put the four on, the one that paid 10, and this one");
         assertArrayEquals(new long[] { T0, 275, 4, 0, 2 }, logTap(0), "and written down, with the mark that it was waited for");
         assertArrayEquals(new long[] { T0, 10, 1, 0, 0 }, logTap(1), "beside the tap before it, untouched");
+        assertArrayEquals(new long[] { 1, 10 }, logLoaded(1), "which put one piece on");
+        assertArrayEquals(new long[] { 4, 275 }, logLoaded(2), "and the tap before that, which put four on, as it was");
     }
 
     @Test
@@ -2399,42 +4329,40 @@ class CashuAppletTest {
             assertEquals(SW_OK, sw(beginCommand(0, 1, 2)), what);
             ResponseAPDU first = transmit(SIGN_ALL);
             assertTrue(isWait(first), "begun, 150 is over a limit of 100, and the card says so");
-            assertEquals(3, waitsLeft(first), "the first of four waits");
+            assertNotYet(first, "the first of four waits");
             transmit(c);
             assertEquals(SW_CONDITIONS_NOT_SATIS, sw(SIGN_ALL), "the payment is given up by " + what);
             assertArrayEquals(storage, field("proofStorage"), "and " + what + " burned nothing");
         }
         // a SELECT, with the PIN presented again after it
         assertEquals(SW_OK, sw(beginCommand(0, 1, 2)));
-        assertEquals(3, waitsLeft(transmit(SIGN_ALL)));
+        assertNotYet(transmit(SIGN_ALL), "a wait");
         reselect();
         assertEquals(SW_OK, verify(TEST_PIN));
         assertEquals(SW_CONDITIONS_NOT_SATIS, sw(SIGN_ALL), "a new SELECT");
         // the card leaving the field
         assertEquals(SW_OK, sw(beginCommand(0, 1, 2)));
-        assertEquals(3, waitsLeft(transmit(SIGN_ALL)));
+        assertNotYet(transmit(SIGN_ALL), "a wait");
         simulator.reset();
         reselect();
         assertEquals(SW_OK, verify(TEST_PIN));
         assertEquals(SW_CONDITIONS_NOT_SATIS, sw(SIGN_ALL), "the card leaving the field");
         // even when every wait is done and nothing is left but the signature
         assertEquals(SW_OK, sw(beginCommand(0, 1, 2)));
-        for (int left = 3; left >= 0; left--) assertEquals(left, waitsLeft(transmit(SIGN_ALL)));
+        for (int i = 1; i <= 4; i++) assertNotYet(transmit(SIGN_ALL), "wait " + i + " of 4");
         assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4)));
         assertEquals(SW_CONDITIONS_NOT_SATIS, sw(SIGN_ALL), "even with the last wait done: the signature is not given");
         assertArrayEquals(storage, field("proofStorage"), "and nothing was burned by any of it");
-        // a beginning again is the whole wait again, however far the one before had got
+        // a beginning again is the whole wait again, however far the one before had got: four more answers before the signature
         assertEquals(SW_OK, sw(beginCommand(0, 1, 2)));
-        assertEquals(3, waitsLeft(transmit(SIGN_ALL)));
-        assertEquals(2, waitsLeft(transmit(SIGN_ALL)));
+        assertNotYet(transmit(SIGN_ALL), "wait 1");
+        assertNotYet(transmit(SIGN_ALL), "wait 2");
         assertEquals(SW_OK, sw(beginCommand(0, 1, 2)));
-        ResponseAPDU again = transmit(SIGN_ALL);
-        assertTrue(isWait(again));
-        assertEquals(3, waitsLeft(again), "begun again, it starts from the first wait: 3 to come, and not 1");
         // and the payment, given up and begun again, is paid whole and once
-        ResponseAPDU r = spendAll(new int[] { 0, 1, 2 }, new byte[0][]);
+        ResponseAPDU r = signAll();
         assertEquals(SW_OK, r.getSW());
-        assertEquals(WAIT_SIGNS, waitsTaken());
+        assertEquals(64, r.getData().length);
+        assertEquals(WAIT_SIGNS, waitsTaken(), "begun again, it waits all four again, and not the two that were left");
         assertEquals(0, balance());
     }
 
@@ -2606,21 +4534,21 @@ class CashuAppletTest {
         newTap();
         assertEquals(SW_OK, setTime(T0 + 90));
         assertEquals(SW_OK, sw(beginCommand(4)));
-        assertEquals(7, waitsLeft(transmit(SIGN_ALL)));
+        assertNotYet(transmit(SIGN_ALL), "the first of eight waits");
         newTap();
-        assertEquals(2, logTaps(), "a payment given up in its wait is not a tap in the log");
+        assertEquals(3, logTaps(), "a payment given up in its wait is not a tap in the log: the tap that put the pieces on and two that paid");
         assertArrayEquals(new long[] { T0 + 60, 100, 1, 0, 0 }, logTap(0));
         assertEquals(450, logSats(), "450 signed for in all, and not the 300 that was begun and given up");
     }
 
     @Test
-    @DisplayName("GET_INFO: byte 1 is 5 and byte 6 is 0F, and bytes 34..41 asked for with P1 = 1 are zero, as is the record behind them, however the limit on a payment has been used; nothing ever answers 6A95")
+    @DisplayName("GET_INFO: byte 1 is 6 and byte 6 is 1F, and bytes 34..41 asked for with P1 = 1 are zero, as is the record behind them, however the limit on a payment has been used; nothing ever answers 6A95")
     void testTheCardRemembersNothingOfThePaymentLimit() throws Exception {
         readyWithLimit(0);
         byte[] more = infoTap();
         assertEquals(1, more[0]);
-        assertEquals(5, more[1], "version 1.5");
-        assertEquals(0x0F, more[6], "capabilities 0F: the limit on one payment is waited for, not refused");
+        assertEquals(6, more[1], "version 1.6");
+        assertEquals(0x1F, more[6], "capabilities 1F: the limit on one payment is waited for, not refused, and the 1.6 forms are there");
         assertEquals(SW_OK, setLimits(1000, 100));
         assertEquals(100, paymentLimit());
         assertNothingRemembered("a limit set");
@@ -2642,7 +4570,7 @@ class CashuAppletTest {
         // a payment given up in its wait, a reset, and a day on
         assertEquals(SW_OK, setTime(T0 + DAY));
         assertEquals(SW_OK, sw(beginCommand(4)));
-        assertEquals(23, waitsLeft(transmit(SIGN_ALL)), "700 under 100: six past the first, 24 waits, 23 still to come after the first");
+        assertNotYet(transmit(SIGN_ALL), "700 under 100: six past the first, 24 waits, and 00 01 is all the first says");
         assertNothingRemembered("after a payment given up");
         simulator.reset();
         reselect();
@@ -2656,14 +4584,14 @@ class CashuAppletTest {
     }
 
     @Test
-    @DisplayName("A payment is counted for 255 limits past the first at most: it never waits more than 1020 times, however large, and the count it starts from is two bytes, big-endian")
+    @DisplayName("A payment is counted for 255 limits past the first at most: it never waits more than 1020 times, however large, and every wait says only 00 01")
     void testTheWaitHasAMost() throws Exception {
         assertEquals(254 * WAIT_SIGNS, payWaits(1, 255), "254 limits past the first");
         assertEquals(WAITS_MOST, payWaits(1, 256), "255 past the first is the most");
         assertEquals(WAITS_MOST, payWaits(1, 257), "256 would be one more, and is not counted");
         assertEquals(WAITS_MOST, payWaits(1, 1_000_000), "nor is a million");
         assertEquals(WAITS_MOST, payWaits(4294967295L, 4294967295L, 5), "a sum that wraps is past any limit, the largest included, and waits the most");
-        // the count that starts a wait of 1020 is 1019, in two bytes: 03 FB
+        // and the first of the 1020 says no more than the first of four: 00 01
         simulator = freshCard();
         readyWithLimit(0);
         assertEquals(SW_OK, setLimits(0, 1));
@@ -2672,7 +4600,7 @@ class CashuAppletTest {
         assertEquals(SW_OK, sw(beginCommand(0)));
         ResponseAPDU first = transmit(SIGN_ALL);
         assertEquals(SW_OK, first.getSW());
-        assertArrayEquals(new byte[] { 0x03, (byte) 0xFB }, first.getData(), "1019 still to come, big-endian");
+        assertArrayEquals(NOT_YET, first.getData(), "not yet: 1019 still to come is not said");
         assertEquals(1, slot(0)[0], "and nothing burned");
     }
 
@@ -2698,12 +4626,11 @@ class CashuAppletTest {
         // the outputs among the waits: OUTPUTS is a next step, as SIGN is, and does not give the payment up
         byte[][] later = { output(300, blinded(3)) };
         assertEquals(SW_OK, sw(beginCommand(3, 4, 5)));
-        assertEquals(7, waitsLeft(transmit(SIGN_ALL)));
+        assertNotYet(transmit(SIGN_ALL), "the first of eight waits");
         assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_SPEND_ALL_OUTPUTS, 0, 0, later[0])));
         for (int left = 6; left >= 0; left--) {
             ResponseAPDU r = transmit(SIGN_ALL);
-            assertTrue(isWait(r), "still waiting");
-            assertEquals(left, waitsLeft(r));
+            assertNotYet(r, "still waiting");
         }
         ResponseAPDU b = transmit(SIGN_ALL);
         assertEquals(SW_OK, b.getSW());
@@ -2711,7 +4638,7 @@ class CashuAppletTest {
         assertTrue(signedForAll(b.getData(), new byte[][] { before[3], before[4], before[5] }, later, REFUND), "over the outputs that came in the middle of the wait");
         // a payment given up in its wait leaves the last signature as it was
         assertEquals(SW_OK, sw(beginCommand(6, 7, 8)));
-        assertEquals(7, waitsLeft(transmit(SIGN_ALL)));
+        assertNotYet(transmit(SIGN_ALL), "the first of eight waits");
         assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4)));
         assertEquals(SW_CONDITIONS_NOT_SATIS, sw(SIGN_ALL));
         ResponseAPDU last = transmit(new CommandAPDU(CLA, INS_SPEND_ALL_AGAIN, 0, 0, 64));
@@ -2931,30 +4858,36 @@ class CashuAppletTest {
         assertArrayEquals(new byte[16], log(), "a new card: four counts of nothing, and no taps");
         ready();
         for (int i = 0; i < 4; i++) assertEquals(SW_OK, load(buildProof(KEYSET, new long[] { 100, 50, 25, 7 }[i], i + 1)).getSW());
-        assertEquals(0, logTaps(), "loading is not written down: the log is of what leaves");
+        assertEquals(1, logTaps(), "loading is written down: a tap in which anything was put on is a tap in the log");
+        assertEquals(0, logSats(), "though nothing was signed for");
+        assertArrayEquals(new long[] { T0, 0, 0, 0, 0 }, logTap(0), "the clock, and nothing signed for, refused or marked");
+        assertArrayEquals(new long[] { 4, 182 }, logLoaded(0), "four pieces and 182 sats put on");
         newTap();
         assertEquals(SW_OK, setTime(T0 + 5));
         assertEquals(SW_OK, spend(0).getSW());
         assertEquals(SW_OK, spend(1).getSW());
-        assertEquals(1, logTaps());
+        assertEquals(2, logTaps());
         assertEquals(150, logSats());
         assertArrayEquals(new long[] { T0 + 5, 150, 2, 0, 0 }, logTap(0), "one tap: the clock, 150 sats, two pieces, nothing refused, no mark");
+        assertArrayEquals(new long[] { 0, 0 }, logLoaded(0), "nothing put on in it");
+        assertArrayEquals(new long[] { 4, 182 }, logLoaded(1), "and the tap before it is as it was");
         // the applet selected again and the PIN again, in the same time in the field: the same tap
         reselect();
         assertEquals(SW_OK, verify(TEST_PIN));
         assertEquals(SW_OK, spend(2).getSW());
-        assertEquals(1, logTaps(), "a new SELECT is not a new tap");
+        assertEquals(2, logTaps(), "a new SELECT is not a new tap");
         assertArrayEquals(new long[] { T0 + 5, 175, 3, 0, 0 }, logTap(0));
         // taken away and brought back: the next tap
         newTap();
         assertEquals(SW_OK, setTime(T0 + 60));
-        assertEquals(1, logTaps(), "a tap in which nothing is signed for or refused is not written down");
+        assertEquals(2, logTaps(), "a tap in which nothing is signed for, refused or put on is not written down");
         assertEquals(SW_OK, spend(3).getSW());
-        assertEquals(2, logTaps());
+        assertEquals(3, logTaps());
         assertEquals(182, logSats());
-        assertEquals(2, logHeld());
+        assertEquals(3, logHeld());
         assertArrayEquals(new long[] { T0 + 60, 7, 1, 0, 0 }, logTap(0), "newest first");
         assertArrayEquals(new long[] { T0 + 5, 175, 3, 0, 0 }, logTap(1));
+        assertArrayEquals(new long[] { T0, 0, 0, 0, 0 }, logTap(2), "and the tap that put the pieces on, the oldest");
         assertEquals(0, logRefused());
         assertEquals(0, logTampers());
     }
@@ -3009,7 +4942,7 @@ class CashuAppletTest {
         newTap();
         assertEquals(SW_OK, setTime(T0 + 9));
         assertEquals(SW_OVER_LIMIT, spend(1).getSW());
-        assertEquals(2, logTaps());
+        assertEquals(3, logTaps(), "the tap that put the pieces on, the one that paid and was refused, and this one");
         assertArrayEquals(new long[] { T0 + 9, 0, 0, 1, 1 }, logTap(0), "a tap of refusals alone is written down too, and marked: the run reached three before it");
         assertEquals(1, logTampers());
         // ten seconds on from the run's first refusal: a refusal begins a new run, and is not marked
@@ -3049,18 +4982,23 @@ class CashuAppletTest {
         ready();
         long total = 0;
         for (int i = 0; i < 11; i++) assertEquals(SW_OK, load(buildProof(KEYSET, 10 + i, i + 1)).getSW());
+        // the tap that put the eleven pieces on is the first of the taps in the log
+        assertEquals(1, logTaps());
         for (int i = 0; i < 11; i++) {
             newTap();
             assertEquals(SW_OK, setTime(T0 + 100 * (i + 1)));
             assertEquals(SW_OK, spend(i).getSW());
             total += 10 + i;
-            assertEquals(i + 1, logTaps());
-            assertEquals(Math.min(i + 1, 8), logHeld());
+            assertEquals(i + 2, logTaps());
+            assertEquals(Math.min(i + 2, 8), logHeld());
             assertEquals(total, logSats());
+            if (i == 0) assertArrayEquals(new long[] { 11, 165 }, logLoaded(1), "the tap before it, which put on eleven pieces worth 165");
         }
         for (int k = 0; k < 8; k++) {
             assertArrayEquals(new long[] { T0 + 100 * (11 - k), 10 + (10 - k), 1, 0, 0 }, logTap(k), "tap " + k + " back");
+            assertArrayEquals(new long[] { 0, 0 }, logLoaded(k), "tap " + k + " back put nothing on");
         }
+        assertEquals(8 * 16 + 16, log().length, "sixteen bytes of counts and eight entries of sixteen: 144 at most");
     }
 
     // =========================================================================
@@ -3325,7 +5263,7 @@ class CashuAppletTest {
     }
 
     @Test
-    @DisplayName("The spend marks the slot and counts the day in one transaction, refuses before anything is changed, and signs only after it commits; the wait before it burns, counts and writes nothing")
+    @DisplayName("The spend marks the slot and counts the day in one transaction, refuses before anything is changed, and signs only after it commits; the wait before it burns, counts and writes nothing; the receipt is a second transaction, after the burn's and before the answer")
     void testSpendIsOneTransaction() throws Exception {
         String code = appletCode();
         String body = body(code, "private void processSpendAllSign(", "private void processSpendAllAgain(");
@@ -3343,7 +5281,9 @@ class CashuAppletTest {
         int waitEnd = body.indexOf("return;", waiting);
         assertTrue(waiting > 0 && waitEnd > waiting, "the wait is a branch of its own, and it returns");
         String wait = body.substring(waiting, waitEnd);
-        assertTrue(wait.contains("schnorrHW.sign") && wait.contains("setOutgoingAndSend"), "it is a signature's work, and it answers with the count");
+        assertTrue(wait.contains("schnorrHW.sign") && wait.contains("setOutgoingAndSend"), "it is a signature's work, and it answers 'not yet'");
+        assertTrue(wait.contains("Util.setShort(buf, (short) 0, (short) 1)"), "with the two bytes 00 01 and not how many are left");
+        assertFalse(wait.contains("Util.setShort(buf, (short) 0, waits)"), "the count is not what it answers");
         assertFalse(wait.contains("beginTransaction") || wait.contains("STATUS_SPENT") || wait.contains("cardLog") || wait.contains("cardRecord")
             || wait.contains("lastSig") || wait.contains("changeDue") || wait.contains("tapOpen") || wait.contains("proofStorage") || wait.contains("logEntry"),
             "a wait burns nothing, counts nothing, writes no log and keeps no signature");
@@ -3363,9 +5303,37 @@ class CashuAppletTest {
          * first, a pull-away in that time lost the piece with no signature anywhere. */
         assertTrue(sign > 0 && sign < begin && begin < window && window < charge && charge < burn && burn < commit && commit < send,
             "signed first; the window, what the day has signed for and the slot change between begin and commit; and only then the answer");
-        assertEquals(2, count(body, "setOutgoingAndSend"), "the count leaves the card in one place, in the wait, and the signature in one place, after the commit");
+        assertEquals(2, count(body, "setOutgoingAndSend"), "'not yet' leaves the card in one place, in the wait, and the signature in one place, after both commits");
         assertEquals(send, body.lastIndexOf("setOutgoingAndSend"), "and the last is the signature's");
-        assertEquals(1, count(body, "Util.arrayCopy(cardRecord"), "a spend begins the day's window by copying the clock, in the transaction, and writes no other part of the record");
+
+        /* The receipt (6c): a second transaction, begun after the burn's has committed and committed before the signature is
+         * answered. What it says is true only of a payment that was made, and it is kept out of the burn's own transaction,
+         * which has to hold thirty-two places. */
+        assertEquals(2, count(body, "beginTransaction"), "two transactions: the burn's and the receipt's");
+        assertEquals(2, count(body, "commitTransaction"));
+        int receiptBegin = body.indexOf("beginTransaction", commit);
+        int receiptCommit = body.indexOf("commitTransaction", receiptBegin);
+        assertTrue(receiptBegin > commit && receiptCommit > receiptBegin && receiptCommit < send, "the receipt is written after the burn commits and before the signature is answered");
+        assertFalse(body.substring(commit, receiptBegin).contains("setOutgoingAndSend"), "and nothing is answered between them");
+        String burnPart = body.substring(0, receiptBegin);
+        String receipt = body.substring(receiptBegin, receiptCommit);
+        assertEquals(1, count(burnPart, "Util.arrayCopy(cardRecord"), "a spend begins the day's window by copying the clock, in the burn's transaction, and writes no other part of the record");
+        assertFalse(receipt.contains("proofStorage") || receipt.contains("STATUS_SPENT") || receipt.contains("cardLog") || receipt.contains("lastSig")
+            || receipt.contains("changeDue") || receipt.contains("CARD_SPENT_OFFSET") || receipt.contains("CARD_WINDOW_OFFSET"), "the receipt's transaction burns and counts nothing");
+        java.util.regex.Matcher writes = java.util.regex.Pattern.compile("Util\\.arrayCopy(?:NonAtomic)?\\([^,]*,[^,]*,\\s*([A-Za-z]+)|Util\\.arrayFillNonAtomic\\(([A-Za-z]+),|addUint32Stop\\(([A-Za-z]+),").matcher(receipt);
+        int found = 0;
+        while (writes.find()) {
+            String destination = writes.group(1) != null ? writes.group(1) : writes.group(2) != null ? writes.group(2) : writes.group(3);
+            assertEquals("cardReceipts", destination, "every write in the receipt's transaction is to the receipts: " + writes.group());
+            found++;
+        }
+        assertTrue(found >= 5, "the clock, the worth, the hash, the first output and the count: " + found);
+        assertTrue(receipt.contains("cardRecord, CARD_NOW_OFFSET, cardReceipts") && receipt.contains("allSum, (short) 0, cardReceipts"), "the clock and what the pieces were worth");
+        // the hash in the receipt is the one the signature was made over: the same place in scratch
+        assertTrue(body.contains("shaAll.doFinal(buf, (short) 0, (short) 0, scratch, X_MSG)") && body.contains("schnorrHW.sign(cardPrivKey, cardPubKey, scratch, X_MSG, buf, (short) 0)")
+            && receipt.contains("scratch, X_MSG, cardReceipts"), "the hash that is signed is the hash that is kept");
+        assertTrue(receipt.contains("allOut") && receipt.contains("allState[5]"), "and the first output, as it was given, if there was one");
+        assertTrue(burnPart.indexOf("cardReceipts[3]") > sign, "the place in the ring is found after the signature is made");
     }
 
     @Test
@@ -3411,14 +5379,36 @@ class CashuAppletTest {
         assertFalse(verify.contains("scratch"));
         assertFalse(verify.contains("loadGrant"));
         int uses = count(code, "loadGrant[0]");
-        // set once in ALLOW_LOAD, read in the load authority, in CLEAR_SPENT, in LOAD_PROOF (where a change-grant load clears the note), and
-        // in GET_LOG (the owner's phone may read the card's log with no PIN), and nowhere else
-        assertEquals(5, uses, "loadGrant is set by ALLOW_LOAD and read by requireLoadAuthority, CLEAR_SPENT, LOAD_PROOF and GET_LOG: " + uses);
-        String getLog = body(code, "private void processGetLog(", "private boolean dayIsOver(");
-        assertTrue(getLog.contains("loadGrant[0]") && !getLog.contains("cardLog[") || !getLog.contains("cardLog[(short)(LOG_TAPS_OFFSET + 3)] ="), "GET_LOG reads the grant, and writes nothing to the log");
-        // the log is written in two places, and they are the spend and the refusal of one
+        // set once in ALLOW_LOAD; read in GET_INFO (the limit on one payment, asked for with P1 = 1, is said to the owner's grant and nobody else),
+        // in the load authority, in CLEAR_SPENT, in LOAD_PROOF (where a load with no PIN and no grant clears the change note), in GET_LOG
+        // (the owner's phone may read the card's log with no PIN) and in GET_LOG's receipts (which are the grant's alone); and nowhere else
+        assertEquals(7, uses, "loadGrant is set by ALLOW_LOAD and read by GET_INFO, requireLoadAuthority, CLEAR_SPENT, loadOne, GET_LOG and its receipts: " + uses);
+        String getInfo = body(code, "private void processGetInfo(", "private void processGetPubkey(");
+        assertEquals(1, count(getInfo, "loadGrant[0]"), "GET_INFO reads the grant once: for the limit on one payment");
+        assertFalse(getInfo.contains("pinVerifiedFlag"), "and not the PIN: a till has that");
+        assertEquals(1, count(getInfo, "CARD_TAP_LIMIT_OFFSET"), "the limit is copied out in one place");
+        assertTrue(getInfo.indexOf("loadGrant[0]") < getInfo.indexOf("CARD_TAP_LIMIT_OFFSET"), "and only under the grant");
+        assertTrue(getInfo.contains("arrayFillNonAtomic(buf, (short) 30, (short) 4, (byte) 0)"), "to anyone else those four bytes are zeros");
+        String getLog = body(code, "private void processGetLog(", "private void processGetReceipts(");
+        assertTrue(getLog.contains("loadGrant[0]") && !getLog.contains("cardLog[(short)(LOG_TAPS_OFFSET + 3)] ="), "GET_LOG reads the grant, and writes nothing to the log");
+        String getReceipts = body(code, "private void processGetReceipts(", "private boolean dayIsOver(");
+        assertTrue(getReceipts.contains("loadGrant[0]") && !getReceipts.contains("pinVerifiedFlag"), "the receipts are read with the owner's grant and not with the PIN");
+        assertFalse(getReceipts.contains("beginTransaction") || getReceipts.contains("cardReceipts[") && getReceipts.contains("cardReceipts[3] ="), "and reading them writes nothing");
+        // the log is written in four places: the spend, the refusal of one, the putting on of pieces, and a clock moved on twice in a tap
         assertEquals(1, count(code, "private short logEntry("));
-        assertEquals(3, count(code, "logEntry()"), "the log's entry is asked for by the spend and by the refusal, and nowhere else");
+        assertEquals(5, count(code, "logEntry()"), "its declaration, and the four that ask for it: the spend, the refusal, LOAD_PROOF and SET_TIME, and nowhere else");
+        assertTrue(body(code, "private void processSpendAllSign(", "private void processSpendAllAgain(").contains("logEntry()"));
+        assertTrue(body(code, "private void refuseOverLimit(", "private void processGetLog(").contains("logEntry()"));
+        assertTrue(body(code, "private void processLoadProof(", "private short emptySlot(").contains("logEntry()"));
+        assertTrue(body(code, "private void processSetTime(", "private void processVerifyPin(").contains("logEntry()"));
+        // the receipts are written by the spend and read by GET_LOG's receipts, and nothing else names them: nothing clears them
+        String withoutThose = code.replace(body(code, "private void processSpendAllSign(", "private void processSpendAllAgain("), "").replace(getReceipts, "");
+        assertEquals(2, count(withoutThose, "cardReceipts"), "outside those two, the declaration and the allocation are all there is: CLEAR_SPENT, SET_CARD, SET_OWNER and CHANGE_PIN do not touch them");
+        // the first time of the tap's telling the time is RAM that a reset clears and a SELECT does not, set and read only by SET_TIME
+        assertTrue(code.contains("timeTold        = JCSystem.makeTransientByteArray((short) 6, JCSystem.CLEAR_ON_RESET)"), "timeTold goes with the power and not with a SELECT: told, marked, and where the first telling left the clock");
+        String withoutSetTimeAndEntry = code.replace(body(code, "private void processSetTime(", "private void processVerifyPin("), "").replace(body(code, "private short logEntry(", "private void refuseOverLimit("), "");
+        assertEquals(2, count(withoutSetTimeAndEntry, "timeTold"), "outside SET_TIME and logEntry, the declaration and the allocation");
+        assertEquals(1, count(body(code, "private short logEntry(", "private void refuseOverLimit("), "timeTold"), "and logEntry reads the mark, once");
         assertFalse(code.contains("arrayFillNonAtomic(cardLog, (short) 0") || code.contains("cardLog = new byte[LOG_LEN];\n        cardLog"), "nothing clears the log");
         assertTrue(body(code, "private void processAllowLoad(", "private short requireOwnerProof(").contains("loadGrant[0] = (byte) 1"));
         assertTrue(body(code, "private void requireLoadAuthority(", "private void requireNothingUnspent(").contains("loadGrant[0]"));
@@ -3640,17 +5630,36 @@ class CashuAppletTest {
 
     /**
      * A payment of those places, written down: SPEND_ALL_BEGIN, then SPEND_ALL_SIGN as many times as the payment waits,
-     * each two-byte answer (how many are still to come) an `exact` one, and then the signature, which is `sigall`.
+     * each two-byte answer ("not yet", 00 01) an `exact` one, and then the signature, which is `sigall`.
      * `waits` is what the card is expected to make it wait; where the payment is refused at the beginning there is
      * no SIGN.
      */
     private void sayPay(StringBuilder out, String name, int expected, int waits, int... slots) {
         say(out, expected == SW_OK ? name + ": the places named" : name, "exact", expected, beginCommand(slots));
         if (expected != SW_OK) return;
-        for (int left = waits - 1; left >= 0; left--) {
-            ResponseAPDU r = say(out, name + ": a wait, " + left + " still to come", "exact", SW_OK, SIGN_ALL);
-            assertTrue(isWait(r), name + ": the answer is the count, in two bytes");
-            assertEquals(left, waitsLeft(r), name);
+        for (int k = 1; k <= waits; k++) {
+            ResponseAPDU r = say(out, name + ": wait " + k + " of " + waits + ": not yet", "exact", SW_OK, SIGN_ALL);
+            assertNotYet(r, name + ": the answer is 00 01 every time, and never how many are left");
+        }
+        ResponseAPDU signed = say(out, name, "sigall", SW_OK, SIGN_ALL);
+        assertEquals(64, signed.getData().length, name + ": and then the signature");
+    }
+
+    /**
+     * A payment with outputs, written down: SPEND_ALL_BEGIN, the outputs in commands of the sizes given (cycled), SPEND_ALL_SIGN
+     * as many times as the payment waits ("not yet" each time, `exact`), and the signature, which is `sigall`.
+     */
+    private void sayPayWith(StringBuilder out, String name, int waits, int[] slots, byte[][] outputs, int... groups) {
+        say(out, name + ": the places named", "exact", SW_OK, beginCommand(slots));
+        int at = 0, g = 0;
+        while (at < outputs.length) {
+            int n = Math.min(groups[g++ % groups.length], outputs.length - at);
+            say(out, name + ": outputs " + (at + 1) + " to " + (at + n), "exact", SW_OK,
+                new CommandAPDU(CLA, INS_SPEND_ALL_OUTPUTS, 0, 0, concat(Arrays.copyOfRange(outputs, at, at + n))));
+            at += n;
+        }
+        for (int k = 1; k <= waits; k++) {
+            assertNotYet(say(out, name + ": wait " + k + " of " + waits + ": not yet", "exact", SW_OK, SIGN_ALL), name);
         }
         ResponseAPDU signed = say(out, name, "sigall", SW_OK, SIGN_ALL);
         assertEquals(64, signed.getData().length, name + ": and then the signature");
@@ -3919,8 +5928,8 @@ class CashuAppletTest {
         say(out, "the info: nothing of it is remembered", "exact", SW_OK, infoTap);
         time(out, "ten seconds on", SW_OK, OTHER_SIGNER, T0 + 110);
         say(out, "a payment begun: three places, 150 together", "exact", SW_OK, beginCommand(6, 7, 8));
-        ResponseAPDU firstWait = say(out, "its first wait: three still to come", "exact", SW_OK, SIGN_ALL);
-        assertArrayEquals(new byte[] { 0, 3 }, firstWait.getData(), "four waits, the first saying three to come");
+        ResponseAPDU firstWait = say(out, "its first wait: not yet", "exact", SW_OK, SIGN_ALL);
+        assertNotYet(firstWait, "four waits, and the first says no more than the last");
         say(out, "a command that is not its next step", "exact", SW_OK, info);
         say(out, "gives the payment and the waiting up: no signature", "exact", 0x6985, SIGN_ALL);
         say(out, "and the pieces are on the card", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4));
@@ -3982,6 +5991,70 @@ class CashuAppletTest {
         saySpend(out, "spend the fourth", SW_OK, 3);
         say(out, "CLEAR_SPENT", "exact", SW_OK, clear);
 
+        /* version 1.6: several pieces to a LOAD_PROOF, and GET_PIECES' two short forms. The card is empty and the PIN is in
+         * force here. Everything put on is paid and freed again at the end of this section, so that no answer after it is
+         * different from what it was before the section was written. */
+        byte[] batch0 = edgeProof(0, 0), batch1 = edgeProof(3, 1900000000L), batch2 = buildProof(KEYSET, 32, 51);
+        byte[] notAPoint = buildProof(KEYSET, 4, 52); notAPoint[44] = 0x04;
+        say(out, "three pieces in one LOAD_PROOF: a place for each", "exact", SW_OK, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, concat(batch0, batch1, batch2), 3));
+        say(out, "a batch whose second piece is not a point: the first is stored, and the answer is its place alone", "exact", SW_OK,
+            new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, concat(buildProof(KEYSET, 16, 53), notAPoint, buildProof(KEYSET, 2, 54)), 3));
+        say(out, "the piece that was refused, sent alone, gives its own word", "exact", SW_WRONG_DATA, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, notAPoint, 1));
+        say(out, "a batch whose first piece is refused is refused with that word, and stores nothing", "exact", SW_WRONG_DATA,
+            new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, concat(notAPoint, buildProof(KEYSET, 2, 54)), 3));
+        say(out, "a batch of 82 bytes is not pieces", "exact", SW_WRONG_LENGTH, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, new byte[82], 3));
+        say(out, "the brief listing: a tag, then the keyset, the amount and the date of each unspent place", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PIECES, 0, 1, 256));
+        say(out, "the brief listing from the second place", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PIECES, 1, 1, 256));
+        say(out, "the brief listing from a place there is not", "exact", SW_SLOT_OUT_OF_RANGE, new CommandAPDU(CLA, INS_GET_PIECES, 64, 1, 256));
+        say(out, "two places, whole, in the order asked: the second and the first", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PIECES, 0, 2, new byte[] { 1, 0 }, 256));
+        say(out, "four places are too many", "exact", SW_WRONG_LENGTH, new CommandAPDU(CLA, INS_GET_PIECES, 0, 2, new byte[] { 0, 1, 2, 3 }, 256));
+        say(out, "a place there is not", "exact", SW_SLOT_OUT_OF_RANGE, new CommandAPDU(CLA, INS_GET_PIECES, 0, 2, new byte[] { 0, 64 }, 256));
+        sayPay(out, "pay the undated pieces together", SW_OK, 0, 0, 2, 3);
+        saySpend(out, "and the dated one alone", SW_OK, 1);
+        say(out, "CLEAR_SPENT: the card is empty again", "exact", SW_OK, clear);
+        say(out, "and the brief listing is one byte", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PIECES, 0, 1, 256));
+
+        /* the limit on one payment is the holder's to read, the log counts what is put on, and the card keeps a receipt of every
+         * payment (version 1.6). The card is empty and the PIN is in force. What is done here is undone at its end: the limit is set
+         * and taken off, the pieces are paid and freed, and the card is selected again, so that no grant goes on to what follows. */
+        CommandAPDU receiptsAsked = new CommandAPDU(CLA, INS_GET_LOG, 1, 0, 256);
+        owner(out, "a limit of 100 on one payment, by the owner", SW_OK, L_LIMIT, OWNER, concat(u32(0), u32(100)), p -> setLimitsCommand(p, 0, 100));
+        say(out, "the info asked for the limit on one payment, under the PIN alone: zeros, as on a card with none", "exact", SW_OK, infoTap);
+        say(out, "the receipts are not for the PIN", "exact", SW_SECURITY_NOT_SATIS, receiptsAsked);
+        say(out, "a form of GET_LOG there is not", "exact", SW_INCORRECT_P1P2, new CommandAPDU(CLA, INS_GET_LOG, 2, 0, 256));
+        say(out, "a form of GET_PIECES there is not", "exact", SW_INCORRECT_P1P2, new CommandAPDU(CLA, INS_GET_PIECES, 0, 3, 256));
+        owner(out, "the owner's grant, for this tap", SW_OK, L_LOAD, OWNER, new byte[0], p -> allowLoadCommand(p));
+        say(out, "the info with the grant: the limit on one payment", "exact", SW_OK, infoTap);
+        say(out, "the receipts with the grant, asked for from 16 back, which is past what the ring holds: the count of every payment ever, alone", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_LOG, 1, 16, 256));
+        byte[] r0 = buildProof(KEYSET, 60, 61), r1 = buildProof(KEYSET, 60, 62), r2 = buildProof(KEYSET, 30, 63);
+        say(out, "three pieces put on in one command", "exact", SW_OK, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, concat(r0, r1, r2), 3));
+        sayPayWith(out, "150 over a limit of 100, with three outputs in two commands", 4, new int[] { 0, 1, 2 },
+            new byte[][] { output(100, blinded(61)), output(40, blinded(62)), output(10, blinded(63)) }, 2, 1);
+        say(out, "the receipts: the count, and the three newest receipts, that payment's first (each its clock, its worth, the digest of what was signed, and the first output given)", "receipt", SW_OK, receiptsAsked);
+        say(out, "from 16 back: the count alone, one more than before", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_LOG, 1, 16, 256));
+        say(out, "the log: what was put on and what was paid, in one entry, and the payment marked as waited for", "exact", SW_OK, getLog);
+        say(out, "a new SELECT takes the grant away", "exact", SW_OK, select);
+        say(out, "the PIN", "exact", SW_OK, verifyOk);
+        say(out, "the receipts are refused again under the PIN", "exact", SW_SECURITY_NOT_SATIS, receiptsAsked);
+        say(out, "and so is the limit on one payment: zeros", "exact", SW_OK, infoTap);
+        owner(out, "the owner takes the limit off", SW_OK, L_LIMIT, OWNER, concat(u32(0), u32(0)), p -> setLimitsCommand(p, 0, 0));
+        say(out, "CLEAR_SPENT: the card is empty again", "exact", SW_OK, clear);
+
+        /* a mark: the clock told twice in one time in the field, the second more than 120 seconds past where the first left it. It adds no
+         * entry to the log; it raises the fourth count; and if the tap gets an entry later in the same time in the field, the entry
+         * begins with the flag 04. (The card is not locked yet, so a piece can be put on here.) */
+        sayReset(out, "taken away and put back: a new time in the field, for a mark that is carried into an entry");
+        say(out, "select", "exact", SW_OK, select);
+        say(out, "the PIN", "exact", SW_OK, verifyOk);
+        say(out, "the log, before: the ring and the four counts", "exact", SW_OK, getLog);
+        time(out, "the first telling in this time in the field: any distance", SW_OK, OTHER_SIGNER, T0 + 87_000);
+        time(out, "121 seconds past it: a mark", SW_OK, OTHER_SIGNER, T0 + 87_121);
+        say(out, "the log: the ring as it was, and the fourth count one more; a mark begins no entry", "exact", SW_OK, getLog);
+        say(out, "one piece put on: the first thing this tap writes", "exact", SW_OK, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 5, 71), 1));
+        say(out, "the log: the entry the load begins has the flag 04, at the clock as it was moved", "exact", SW_OK, getLog);
+        saySpend(out, "pay it, so that the card is empty again", SW_OK, 0);
+        say(out, "CLEAR_SPENT", "exact", SW_OK, clear);
+
         // the owner replaces itself, and locks
         say(out, "SET_OWNER with no proof", "exact", SW_OWNER_PROOF, setOwnerOpenCommand(OTHER_OWNER));
         say(out, "LOCK_CARD with no proof asked for", "exact", SW_OWNER_PROOF, lockCommand(new byte[8]));
@@ -3999,6 +6072,24 @@ class CashuAppletTest {
         say(out, "a CLEAR_SPENT", "exact", SW_NOT_ALLOWED, clear);
         time(out, "but the time", SW_OK, OTHER_SIGNER, T0 + 200);
         say(out, "and proves it is the card", "auth", SW_OK, new CommandAPDU(CLA, INS_AUTH, 0, 0, new byte[16], 80));
+
+        /* the clock told twice in one time in the field. A locked card takes the time, and gives its log to the PIN. The first telling in a
+         * time in the field may move the clock any distance; a later one more than 120 seconds past where that first telling left the clock
+         * is a mark, once for the time in the field: it adds no entry to the log, it raises the fourth count, and it is not refused. */
+        sayReset(out, "taken away and put back: a new time in the field");
+        say(out, "select", "exact", SW_OK, select);
+        say(out, "the PIN", "exact", SW_OK, verifyOk);
+        time(out, "the first time told in this time in the field: any distance", SW_OK, OTHER_SIGNER, T0 + 90_000);
+        time(out, "120 seconds past it is not a mark", SW_OK, OTHER_SIGNER, T0 + 90_120);
+        say(out, "the log: nothing marked", "exact", SW_OK, getLog);
+        time(out, "121 seconds past the first telling is a mark, though it is one second past the clock", SW_OK, OTHER_SIGNER, T0 + 90_121);
+        say(out, "the log: the ring is the same, and the fourth count is one more", "exact", SW_OK, getLog);
+        time(out, "a day on: the clock moves, and it is not marked again", SW_OK, OTHER_SIGNER, T0 + 90_121 + DAY);
+        time(out, "a time that does not move the clock forward changes nothing", SW_OK, OTHER_SIGNER, T0 + 90_000);
+        say(out, "select", "exact", SW_OK, select);
+        say(out, "the PIN", "exact", SW_OK, verifyOk);
+        time(out, "after a SELECT, which is not the card leaving the field, a jump is not counted again", SW_OK, OTHER_SIGNER, T0 + 90_121 + 3 * DAY);
+        say(out, "the log: the count is as it was", "exact", SW_OK, getLog);
 
         String text = out.toString();
         text = text.substring(0, text.lastIndexOf(",\n")) + "\n]\n";
