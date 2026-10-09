@@ -96,6 +96,37 @@ So a drawer of about 100 pieces takes about 7 s to write through this
 reader, and the listing reads around it cost as much again. A phone over
 NFC is a different path and is measured there.
 
+## The field's arithmetic, measured on the chip
+
+A change output (software 1.12, `SPEND_ALL_CHANGE`) needs arithmetic in
+secp256k1's field: a cube and a square root for NUT-00's hash to the curve,
+and a point addition for the blinding. A probe applet installed beside the
+card's for the length of one run measured what the chip offers (times are a
+command's whole round trip through a contact reader, so about 15 ms of each is
+the wire):
+
+| | On the chip |
+|---|---|
+| RSA, `ALG_RSA_NOPAD`, a private key with modulus p·p (512 bits) and any exponent | works; 70–80 ms an operation, whether the exponent is 3, p − 2, or 256 bits; even exponents (2) as well |
+| the same with modulus p·q (q any odd 256-bit number) or a 1024-bit multiple of p | works, 70–105 ms |
+| a 256-bit modulus padded to 64 bytes with leading zeros | works (the simulator refuses it: "not composite"); a 32-byte modulus is refused (`ILLEGAL_VALUE`) |
+| the answer's length | the modulus' length, leading zeros included (the simulator's drops them) |
+| `KeyAgreement.ALG_EC_PACE_GM` | [s]G + H in one operation, 85–100 ms, 65 bytes `04 ‖ x ‖ y`; with the key's G set to another point, an addition of any two points |
+| `ALG_EC_SVDP_DH_PLAIN_XY` | 83 ms |
+| a point off the curve, to either | refused, `ILLEGAL_VALUE`: the chip checks its input points |
+| `Signature.verifyPreComputedHash` (ECDSA, P-256) | works, 41 ms; `verify` 42 ms |
+| a 256 × 256-bit multiply in bytecode (`SchnorrHW.mul256x256`) | 242 ms |
+| SHA-256 over 100 bytes | 4 ms |
+| free memory with the card's applet installed | over 32 KB permanent; 2.5 KB clear-on-reset, 3.7 KB clear-on-deselect |
+
+So the card's own change is made with the chip's RSA (a private key over p·p
+with odd exponents, which the simulator also takes; each answer reduced mod p
+by the applet, about 50 ms a reduction in bytecode) and the chip's generic
+mapping for the point addition; one change output comes to roughly half a
+second to a second, most of it the two or three rounds of the hash to the
+curve, and none of it a bytecode multiply, which at 242 ms apiece is what rules
+out doing the field's arithmetic in software.
+
 ## The reader, when the card goes mute
 
 The ACR39U's block waiting time is about 1.4 s. A card that stops
