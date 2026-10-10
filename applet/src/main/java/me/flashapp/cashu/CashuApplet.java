@@ -129,7 +129,7 @@ public class CashuApplet extends Applet {
     // seconds over it, and two more for every further limit's worth (`waitsFor`). The work of making the
     // change counts toward it. And one payment a tap at full speed: a second one in the same time in the
     // field is slowed as one over the limit, unless the owner's grant is in the tap.
-    static final byte VERSION_MINOR = (byte) 0x0D;
+    static final byte VERSION_MINOR = (byte) 0x0E;
     static final byte FORMAT        = (byte) 0x04;
 
     // -------------------------------------------------------------------------
@@ -2073,7 +2073,7 @@ public class CashuApplet extends Applet {
      * for the first limit's worth over (about five seconds) and
      * WAIT_MORE_SIGNS for every further one, whole or in part (two seconds
      * each). The change outputs the card made (`made`), about 0.4 s of its
-     * work each, count as that many signatures done already.
+     * work each, count for what they cost: two signatures for every three.
      *
      * One payment a tap at full speed: a second payment signed in the same
      * time in the field (`second`: one was, and the owner's grant is not in
@@ -2129,8 +2129,15 @@ public class CashuApplet extends Applet {
             if (units <= 1) return (short) 0;
             waits = (short)(WAIT_OVER_SIGNS + WAIT_MORE_SIGNS * (units - 2));
         }
-        // the change already made is work done
-        waits -= made;
+        /* The change already made is work done, and counts for what it cost:
+         * an output is about two thirds of a signature's work (0.4 s to 0.6 s
+         * on the chip), so two waits come off for every three outputs. One
+         * for each, as 1.13 had it, was more than an output costs, and a
+         * terminal could buy a payment's wait down with outputs of a sat;
+         * at two for three, outputs buy it nothing, and a payment over the
+         * limit takes the same time with change as without, so what is felt
+         * says how far over it was. */
+        waits -= (short)((short)(made * 2) / 3);
         return waits > 0 ? waits : (short) 0;
     }
     /** a -= b, four bytes each, big-endian; a is not less than b. */

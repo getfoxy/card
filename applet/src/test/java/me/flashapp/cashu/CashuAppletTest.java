@@ -97,19 +97,22 @@ class CashuAppletTest {
     /** The most limits' worth a payment is counted for: the applet's WAIT_UNITS_MOST. */
     static final int WAIT_UNITS_MOST = 255;
     /**
-     * The rule of 1.13: what a payment of which `net` sats leave the card waits under a limit of `limit`, having made `made`
+     * The rule of 1.14: what a payment of which `net` sats leave the card waits under a limit of `limit`, having made `made`
      * change outputs. Within the limit, or within a thirty-second over it (a price pegged in another money), change or no
      * change: nothing; over it, WAIT_OVER_SIGNS and WAIT_MORE_SIGNS for every further limit's worth, whole or in part, 255
-     * limits' worth at most; less one for every change output made, never below 0.
+     * limits' worth at most; less the time the change outputs took, two waits for every three of them (1.13 took one off for
+     * each, which was more than an output costs, and a terminal could buy the wait down with outputs of a sat), never below 0.
      */
     static int waitsRule(long limit, long net, int made) { return waitsRule(limit, net, made, false); }
+    /** What `made` change outputs count for against the wait: an output is about two thirds of a signature's work. */
+    static int changeCredit(int made) { return (2 * made) / 3; }
     /** The same, for a payment that is the `second` (or later) signed in its tap without the owner's grant: at least one over the limit, limit or no limit. */
     static int waitsRule(long limit, long net, int made, boolean second) {
-        if (limit <= 0) return second ? Math.max(0, WAIT_OVER_SIGNS - made) : 0;
+        if (limit <= 0) return second ? Math.max(0, WAIT_OVER_SIGNS - changeCredit(made)) : 0;
         long units = net <= limit + limit / 32 ? 1 : Math.min(WAIT_UNITS_MOST, (net + limit - 1) / limit);
         if (second && units <= 1) units = 2;
         if (units <= 1) return 0;
-        return Math.max(0, WAIT_OVER_SIGNS + WAIT_MORE_SIGNS * (int)(units - 2) - made);
+        return Math.max(0, WAIT_OVER_SIGNS + WAIT_MORE_SIGNS * (int)(units - 2) - changeCredit(made));
     }
     /** So the most a payment waits: 1020 answers before the signature. */
     static final int WAITS_MOST = WAIT_OVER_SIGNS + WAIT_MORE_SIGNS * (WAIT_UNITS_MOST - 2);
@@ -558,7 +561,7 @@ class CashuAppletTest {
         // what a phone sends: iOS chooses by the name in the app's Info.plist, and Foxy by the same ten bytes
         ResponseAPDU whole = transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_HEX), 256));
         assertEquals(SW_OK, whole.getSW());
-        assertArrayEquals(new byte[] { 0x01, 0x0D }, whole.getData(), "the same answer either way: version 1.13");
+        assertArrayEquals(new byte[] { 0x01, 0x0E }, whole.getData(), "the same answer either way: version 1.14");
         assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)), "and its instructions follow");
     }
 
@@ -567,17 +570,17 @@ class CashuAppletTest {
     void testSelect() {
         ResponseAPDU resp = transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR)));
         assertEquals(SW_OK, resp.getSW());
-        assertArrayEquals(new byte[] { 0x01, 0x0D }, resp.getData(), "version 1.13: the wait is shaped by the kind of payment");
+        assertArrayEquals(new byte[] { 0x01, 0x0E }, resp.getData(), "version 1.14: the wait is shaped by the kind of payment, and change counts for what it cost");
         assertNotEquals(SW_OK, sw(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(UPSTREAM_AID))),
             "an upstream reader must not find this applet under upstream's AID: the wire is not the same");
     }
 
     @Test
-    @DisplayName("GET_INFO on a new card: 30 bytes: version 1.13, 128 empty slots, no PIN, three tries, format 4, capabilities FF, no record, no limit, no owner, no time, no change due")
+    @DisplayName("GET_INFO on a new card: 30 bytes: version 1.14, 128 empty slots, no PIN, three tries, format 4, capabilities FF, no record, no limit, no owner, no time, no change due")
     void testInfoFresh() {
         byte[] d = info();
         assertEquals(30, d.length);
-        assertEquals(1, d[0]); assertEquals(13, d[1]);
+        assertEquals(1, d[0]); assertEquals(14, d[1]);
         assertEquals(MAX_PROOFS, d[2] & 0xFF);
         assertEquals(0, d[3]); assertEquals(0, d[4]);
         assertEquals(MAX_PROOFS, d[5] & 0xFF);
@@ -2473,7 +2476,7 @@ class CashuAppletTest {
                 // and the answer says what the marked places make it say
                 byte[] d = torn.getData();
                 if (name.equals("SELECT")) {
-                    assertArrayEquals(new byte[] { 0x01, 0x0D }, d, what);
+                    assertArrayEquals(new byte[] { 0x01, 0x0E }, d, what);
                 } else if (name.equals("GET_INFO")) {
                     assertEquals(others, d[3] & 0xFF, what + ": unspent");
                     assertEquals(n + others, d[4] & 0xFF, what + ": spent");
@@ -6340,7 +6343,7 @@ class CashuAppletTest {
         readyWithLimit(0);
         byte[] more = infoTap();
         assertEquals(1, more[0]);
-        assertEquals(13, more[1], "version 1.13");
+        assertEquals(14, more[1], "version 1.14");
         assertEquals((byte) 0xFF, more[6], "capabilities FF: the limit on one payment is waited for, not refused, the 1.6 forms are there, so are 128 places with the short listing, a payment burned outside its transaction, and the PIN taken sealed");
         assertEquals(SW_OK, setLimits(1000, 100));
         assertEquals(100, paymentLimit());

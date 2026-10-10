@@ -347,10 +347,16 @@ the limit:
     S ≤ L                waits = 0                                                (change or no change)
     S > L                waits = WAIT_OVER_SIGNS + WAIT_MORE_SIGNS × (ceil(S / L) − 2)   (7 + 3 for each further limit's worth: about five seconds, then two each)
 
-less one for every change output the card made in this payment, which is work
-of about the same size done already; never below 0. That change is coming is
-the phone's to say, not the card's: the till's phone buzzes three times as the
-first tap ends with change owed. "Within `L`" is `S ≤ L +
+less the time the change outputs the card made in this payment took, two
+waits for every three outputs (software 1.14; an output is about two thirds of
+a signature's work: 0.4 s against 0.6 s on the chip), never below 0. So a
+payment over the limit takes the same time in the hand with change as without,
+and what is felt says how far over the limit it was, which a terminal cannot
+shorten by asking for change outputs: each costs the holder's hand what it
+takes off. (1.13 took one wait off for every output, more than an output costs,
+and a terminal could buy the wait down with outputs of a sat.) That change is
+coming is the phone's to say, not the card's: the till's phone buzzes three
+times as the first tap ends with change owed. "Within `L`" is `S ≤ L +
 L/32`: a limit set in another money is so many sats at one moment and a price
 in that money so many at another, so a payment of exactly the limit lands a
 few sats over, and that is not "over the limit". So a payment within the
