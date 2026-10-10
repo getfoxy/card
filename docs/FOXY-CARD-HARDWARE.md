@@ -122,9 +122,11 @@ the wire):
 So the card's own change is made with the chip's RSA (a private key over p·p
 with odd exponents, which the simulator also takes; each answer reduced mod p
 by the applet, about 50 ms a reduction in bytecode) and the chip's generic
-mapping for the point addition; one change output comes to roughly half a
-second to a second, most of it the two or three rounds of the hash to the
-curve, and none of it a bytecode multiply, which at 242 ms apiece is what rules
+mapping for the point addition. Measured through the contact reader with the
+live suite: a change output (`SPEND_ALL_CHANGE`) takes 300 ms when the first
+x is on the curve and about 110 ms more for each further round of the hash to
+the curve — 410 ms on average, 860 at the worst seen; `GET_CHANGE` 110 ms a
+page. None of it is a bytecode multiply, which at 242 ms apiece is what rules
 out doing the field's arithmetic in software.
 
 ## The reader, when the card goes mute
