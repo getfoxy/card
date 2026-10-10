@@ -19,7 +19,7 @@ import zipfile
 OPENER = bytes.fromhex('F0464F5859434152444D')
 LOADED = ['Header', 'Directory', 'Import', 'Applet', 'Class', 'Method',
           'StaticField', 'Export', 'ConstantPool', 'RefLocation']
-LARGEST_KNOWN = 14760
+LARGEST_KNOWN = 17486
 
 
 def components(path):

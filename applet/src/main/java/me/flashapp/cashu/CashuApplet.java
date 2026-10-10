@@ -124,7 +124,10 @@ public class CashuApplet extends Applet {
     // built by the card, so that nothing a terminal names can take them; the limits and the wait are
     // held to what leaves the card for good, the pieces less that change; and the openings of change
     // not yet handed back can be read (GET_CHANGE) by any phone that would finish the pieces.
-    static final byte VERSION_MINOR = (byte) 0x0C;
+    // 1.13 shapes the wait so that a payer can tell the three cases apart by feel: nothing within the
+    // limit with no change; about two seconds within it with change; about five seconds over it, and two
+    // more for every further limit's worth (`waitsFor`). The work of making the change counts toward it.
+    static final byte VERSION_MINOR = (byte) 0x0D;
     static final byte FORMAT        = (byte) 0x04;
 
     // -------------------------------------------------------------------------
@@ -235,7 +238,7 @@ public class CashuApplet extends Applet {
     // wait, sats, big-endian; 0 is NO limit. It is not counted against a clock
     // and nothing is remembered of it from one payment to the next: a payment
     // is judged by its own size, and every limit's worth past the first costs
-    // WAIT_SIGNS signatures of the card's own work before it signs (6a). The
+    // signatures of the card's own work before it signs (6a, `waitsFor`). The
     // two fields after it held a ten-second window and its count, when this
     // was a limit a clock turned; they are kept as zeros, so the record and
     // GET_INFO are the lengths they were.
@@ -604,9 +607,16 @@ public class CashuApplet extends Applet {
     private static final byte[] ONE = { (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x01 };
 
     /** What one limit's worth past the first costs a payment: this many signatures of work, about three seconds on the chip. */
-    static final short WAIT_SIGNS = (short) 4;
-    /** The most a payment is counted over its limit: past this it waits as long as this does (a quarter of an hour). */
+    // The wait (6a), in signatures of the card's own work (about 0.6 s each on the chip, 0.7 over NFC):
+    // for a payment within the limit that makes change; for the first limit's worth over it; and for
+    // every further limit's worth. Each change output made (about 0.4 s) counts as one of them done.
+    static final short WAIT_CHANGE_SIGNS = (short) 3;
+    static final short WAIT_OVER_SIGNS   = (short) 7;
+    static final short WAIT_MORE_SIGNS   = (short) 3;
+    /** The most limits' worth a payment is counted as: past this it waits as 255 do (about eight minutes). */
     static final short WAIT_UNITS_MOST = (short) 255;
+    /** What 255 limits' worth waits: the most any payment does. */
+    static final short WAIT_SIGNS_MOST = (short)(WAIT_OVER_SIGNS + WAIT_MORE_SIGNS * (WAIT_UNITS_MOST - 2));
     /** 10 seconds, big-endian: how close together refusals are one run of them, in the card's own log (6b). */
     private static final byte[] TAP_SECONDS = { (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x0A };
 
@@ -1715,6 +1725,16 @@ public class CashuApplet extends Applet {
         }
     }
 
+    /** The four big-endian bytes at off, divided by 32. */
+    private static void div32Uint32(byte[] a, short off) {
+        short carry = 0;
+        for (short i = 0; i < 4; i++) {
+            short v = (short)(a[(short)(off + i)] & 0xFF);
+            a[(short)(off + i)] = (byte)(((carry << 3) | (v >> 5)) & 0xFF);
+            carry = (short)(v & 0x1F);
+        }
+    }
+
     /** v[off..off+64) -= p, as one 64-byte number. */
     private static void subP64(byte[] v, short off) {
         short borrow = 0;
@@ -1865,7 +1885,7 @@ public class CashuApplet extends Applet {
                 allState[0] = (byte) 0;
                 throw e;
             }
-            waits = waitsFor(allNet, (short) 0, allState[6] != (byte) 0, allState[7] != (byte) 0);
+            waits = waitsFor(allNet, (short) 0, (short)(allState[6] & 0xFF), allState[7] != (byte) 0);
             Util.setShort(allState, (short) 2, waits);
             allState[4] = (byte)(waits > 0 ? 1 : 0);
         }
@@ -2051,35 +2071,52 @@ public class CashuApplet extends Applet {
 
     /**
      * What the payment costs in time: the signatures of work to be done at
-     * SPEND_ALL_SIGN before it is signed (6a).
+     * SPEND_ALL_SIGN before it is signed (6a), shaped so that a payer can
+     * tell by feel what kind of payment it was.
      *
      * With a limit on one payment of L and S leaving the card (`sum`: the
-     * pieces less the card's own change), a payment within L that makes no
-     * change costs nothing; otherwise every L of S, whole or in part, is
-     * WAIT_SIGNS signatures: ceil(S / L) * WAIT_SIGNS, and one L's worth for
-     * a payment within L that makes change. Nothing is remembered from one
-     * payment to the next and no clock is asked, so there is nothing a
-     * terminal can replay or reset to make it less: a payment of ten limits
-     * waits for ten, today and at any other time. What a terminal can do is
-     * take the money a limit at a time, each a signature of its own, which is
-     * the rate this limit holds it to. No limit: 0. A sum that wrapped
-     * (`carry`) waits the most.
+     * pieces less the card's own change): within L (or within a thirty-second
+     * over it, see below) and no change, nothing; within L with change,
+     * WAIT_CHANGE_SIGNS (about two seconds); over L,
+     * WAIT_OVER_SIGNS for the first limit's worth over (about five seconds)
+     * and WAIT_MORE_SIGNS for every further one, whole or in part (two
+     * seconds each). The change outputs the card made (`made`), about 0.4 s
+     * of its work each, count as that many signatures done already. Nothing
+     * is remembered from one payment to the next and no clock is asked, so
+     * there is nothing a terminal can replay or reset to make it less; what a
+     * terminal can do is take the money a limit at a time, each a signature
+     * of its own, which is the rate this limit holds it to. No limit: 0. A
+     * sum that wrapped (`carry`) waits the most.
      */
-    private short waitsFor(byte[] sum, short sumOff, boolean change, boolean carry) {
+    private short waitsFor(byte[] sum, short sumOff, short made, boolean carry) {
         if (isZero(cardRecord, CARD_TAP_LIMIT_OFFSET, (short) 4)) return (short) 0;
-        if (carry) return (short)(WAIT_UNITS_MOST * WAIT_SIGNS);
+        if (carry) return WAIT_SIGNS_MOST;
         Util.arrayCopyNonAtomic(sum, sumOff, scratch, X_TAP, (short) 4);
-        short units = 0;
-        // every whole limit's worth is a unit...
-        while (units < WAIT_UNITS_MOST && cmpUint32(scratch, X_TAP, cardRecord, CARD_TAP_LIMIT_OFFSET) > 0) {
-            subUint32(scratch, X_TAP, cardRecord, CARD_TAP_LIMIT_OFFSET);
-            units++;
+        /* Within the limit, or within a thirty-second over it: a limit set in
+         * another money is so many sats at one moment and a price in that
+         * money so many at another, and a payment of exactly the limit lands
+         * a few sats over. That is one limit's worth, not two. */
+        Util.arrayCopyNonAtomic(cardRecord, CARD_TAP_LIMIT_OFFSET, scratch, X_NUM, (short) 4);
+        div32Uint32(scratch, X_NUM);
+        short units;
+        if (addUint32Carry(scratch, X_NUM, cardRecord, CARD_TAP_LIMIT_OFFSET) != 0 || cmpUint32(scratch, X_TAP, scratch, X_NUM) <= 0) {
+            units = 1;
+        } else {
+            // how many limits' worth leave the card, a part counting as one: the whole ones taken off, then the part
+            units = 0;
+            while (units < WAIT_UNITS_MOST && cmpUint32(scratch, X_TAP, cardRecord, CARD_TAP_LIMIT_OFFSET) > 0) {
+                subUint32(scratch, X_TAP, cardRecord, CARD_TAP_LIMIT_OFFSET);
+                units++;
+            }
+            if (units < WAIT_UNITS_MOST && !isZero(scratch, X_TAP, (short) 4)) units++;
         }
-        // ...and so is what is left over one, and so is a payment within the limit that makes change
-        if (units < WAIT_UNITS_MOST && (change || (units > 0 && !isZero(scratch, X_TAP, (short) 4)))) units++;
-        return (short)(units * WAIT_SIGNS);
+        short waits;
+        if (units <= 1) waits = made > 0 ? WAIT_CHANGE_SIGNS : (short) 0;
+        else waits = (short)(WAIT_OVER_SIGNS + WAIT_MORE_SIGNS * (units - 2));
+        // the change already made is work done
+        waits -= made;
+        return waits > 0 ? waits : (short) 0;
     }
-
     /** a -= b, four bytes each, big-endian; a is not less than b. */
     private static void subUint32(byte[] a, short aOff, byte[] b, short bOff) {
         short borrow = 0;

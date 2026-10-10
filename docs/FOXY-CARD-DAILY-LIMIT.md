@@ -340,18 +340,26 @@ has nothing to replay.
 **The rule.** With a limit of `L` sats and a payment of which `S` sats leave
 the card for good — the pieces named at `SPEND_ALL_BEGIN`, less the change the
 card makes for itself (`SPEND_ALL_CHANGE`, software 1.12; section 6d) — worked
-out at the first `SPEND_ALL_SIGN`, when the change is known:
+out at the first `SPEND_ALL_SIGN`, when the change is known, and shaped
+(software 1.13) so that whoever holds the card can tell the three kinds of
+payment apart by feel:
 
-    waits = 0                          when S ≤ L and the payment makes no change
-    waits = ceil(S / L) × WAIT_SIGNS   otherwise
+    S ≤ L, no change     waits = 0
+    S ≤ L, with change   waits = WAIT_CHANGE_SIGNS                                  (3: about two seconds)
+    S > L                waits = WAIT_OVER_SIGNS + WAIT_MORE_SIGNS × (ceil(S / L) − 2)   (7 + 3 for each further limit's worth: about five seconds, then two each)
 
-A payment within the limit that makes no change goes at once. Otherwise every
-`L` of what leaves the card, whole or in part, costs `WAIT_SIGNS` (four)
-*signatures of work*, about three seconds on the chip: within the limit but
-with change, three seconds; over it and up to twice it, six; up to three
-times, nine; and so on. `L` of 0 is no limit. Past 255 limits a payment waits
-as 255 do, which is a quarter of an hour and so never. (Before 1.12 the first
-`L` was free and the pieces were counted whole: `(ceil(S / L) − 1) × WAIT_SIGNS`.)
+less one for every change output the card made in this payment, which is work
+of about the same size done already; never below 0. "Within `L`" is `S ≤ L +
+L/32`: a limit set in another money is so many sats at one moment and a price
+in that money so many at another, so a payment of exactly the limit lands a
+few sats over, and that is not "over the limit". So a payment within the
+limit that makes no change goes at once (about two seconds in the hand, all of
+it reading and signing); one with change holds the card about two seconds
+longer; one over the limit about five seconds longer, and two more for every
+further limit's worth. `L` of 0 is no limit. Past 255 limits a payment waits
+as 255 do, which is about eight minutes and so never. (Before 1.13, 1.12
+counted four signatures for every limit's worth, a part counting as one;
+before 1.12 the first `L` was free and the pieces were counted whole.)
 
 **What a wait is.** The card cannot sleep and has no timer. The one thing on it
 whose duration is the chip's own, and that no terminal can shorten, is a
