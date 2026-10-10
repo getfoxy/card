@@ -98,7 +98,7 @@ capability bit 6 asks it for 8 pieces a signature at most.
 ## Working memory
 
 The ISD reports about 2,486 bytes of free volatile memory on a clean card.
-The applet asks for 931 bytes cleared on deselect and 7 cleared on reset,
+The applet asks for 941 bytes cleared on deselect and 6 cleared on reset,
 and a unit test keeps it there. The first build of 1.9 asked for 1,030
 and was refused at INSTALL with `6F00`; it was also the package's first
 applet (above), so the two were never separated.
@@ -123,12 +123,22 @@ Measured with the card in an ACS ACR39U, one command at a time:
 | AUTH | 0.7 s |
 | LOAD_PROOF, three pieces in one command | 0.19 s |
 | GET_PIECES, the whole list | 0.1 s |
-| SET_TIME | 0.07 s |
+| SET_HEADER (a real header accepted, the clock moved) | 0.05 s |
+| TELL_TIME | 0.01 s |
 | SELECT, GET_INFO, GET_BALANCE | 0.02 to 0.03 s |
 
 So a drawer of about 100 pieces takes about 7 s to write through this
 reader, and the listing reads around it cost as much again. A phone over
 NFC is a different path and is measured there.
+
+`SET_HEADER` (software 1.15) took the place of `SET_TIME` (0.07 s when it was
+measured), which verified an ECDSA signature. It verifies none: the card hashes
+the header's 80 bytes and then the 32-byte hash, as Bitcoin does, turns the
+result round, and compares it with three numbers of 32 bytes (the header's own
+target, the floor and four times the hardest target taken). SHA-256 over 100 bytes is measured further down this page
+(4 ms); the byte loops around it, which the chip runs in bytecode, are not. The
+figure in the table is an expectation, to be replaced by a measurement.
+`TELL_TIME` copies four bytes.
 
 ## The field's arithmetic, measured on the chip
 

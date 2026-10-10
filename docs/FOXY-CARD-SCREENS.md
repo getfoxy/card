@@ -128,9 +128,9 @@ on this screen.
   own, the owner is the friend's phone that sets the card up
 - No limit is asked for and none is suggested: a new card has none. A limit is
   set later from CHANGE LIMIT (B7)
-- A tap, which writes the card's PIN, its record (with the time key) and, last,
-  its owner key. The owner goes in last so that no step needs a proof: a set-up
-  cut off anywhere is finished by the next set-up tap
+- A tap, which writes the card's PIN, its record and, last, its owner key. The
+  owner goes in last so that no step needs a proof: a set-up cut off anywhere is
+  finished by the next set-up tap
 - `THE CARD IS READY`: that it is cash, that whoever has the card and its PIN
   has the money, and that if the card is lost the money on it is gone. ADD
   FUNDS, LATER
@@ -151,7 +151,7 @@ on this screen.
   anything: "You need to withdraw all funds on the card before you can switch
   mints." and CLOSE. If it holds nothing, on its owner's phone: `SWITCH TO <MINT>`,
   which goes straight to SET AMOUNT; the card is told its new mint with the owner's
-  proof, in the same tap that writes the funds (its PIN, owner, limit and time key
+  proof, in the same tap that writes the funds (its PIN, owner, limit and clock
   stay as they are), and `ON THE CARD` says the card is now at the new mint. On any
   other phone, the card says only the phone that set it up can switch it
 
@@ -202,14 +202,16 @@ Set-up (B3) does not ask for a limit and does not suggest one: a new card has
 none. No screen suggests a figure.
 
 What the card does behind these words (specification 5.7): it spends no more
-than the limit in a day, and starts the day again by itself. A terminal that has
-been handed the PIN can take one day's limit per visit, and no more, once the
-time the card is told is real. Today that time is the receiving phone's own
-clock, signed by a key inside the app, so the limit bounds an honest terminal
-and the holder's own spending, and does not stop a terminal built to cheat; no
-screen says otherwise. If the seed phrase is lost, the PIN and the limit can
-never be changed, and a blocked card can never be unblocked. A phone that does
-not hold the card's seed phrase cannot change the limit, and says so.
+than the limit in a day, and starts the day again by itself. Its day is counted
+by the Bitcoin block headers it is shown, and not by anyone's word, so a
+terminal that has been handed the PIN can take one day's limit per visit, and no
+more, honest or not (up to two across the edge of a day). The card starts a new
+day when it is shown a block a day on from the day's start, which the phone does
+at the tap when the card is behind; a card that is shown none does not start it,
+and the time on the card's screen is the earliest it can. No screen says more of
+the limit than that. If the seed phrase is lost, the PIN and the limit can never
+be changed, and a blocked card can never be unblocked. A phone that does not hold
+the card's seed phrase cannot change the limit, and says so.
 
 ### B8. A card's history
 - The app's HISTORY screen, titled `CARD HISTORY`, with only the entries that

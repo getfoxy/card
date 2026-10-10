@@ -26,7 +26,7 @@ import javacardx.crypto.*;
  *   0x13  GET_PROOF        — full proof data at slot index, with its date
  *   0x14  GET_SLOT_STATUS  — bulk 1-byte status for all slots
  *   0x15  AUTH             — prove this is the card: sign the reader's nonce and its own
- *   0x16  GET_CARD         — the card record: mint, unit, refund key, limit, time key
+ *   0x16  GET_CARD         — the card record: mint, unit, refund key, limit, the clock's block header (its bits and hash)
  *   0x17  GET_PIECES       — every slot's state and every unspent piece, a page at a time (P1 = the first slot)
  *   0x18  GET_LOG          — the card's own account of its taps: what it signed for, what it refused
  *   0x19  GET_CHANGE       — the change the card made for itself and has not been handed: the openings, a page at a time
@@ -40,7 +40,9 @@ import javacardx.crypto.*;
  *   0x32  SET_CARD         — write the card record (open card: PIN; owned card: the owner's proof; only with nothing unspent)
  *   0x33  SET_LIMIT        — the daily limit, by PIN: an open card only (no owner, nothing unspent)
  *   0x34  SET_LIMIT        — the daily limit, by the owner's proof; with eight bytes, the limit on one payment as well
- *   0x35  SET_TIME         — tell the card the time, under the time key's signature
+ *   0x35  (was SET_TIME, a time under a key's signature: gone in 1.15, answers 6D00)
+ *   0x36  SET_HEADER       — a Bitcoin block header: its proof of work moves the card's clock forward
+ *   0x37  TELL_TIME        — the terminal's own clock, a note for receipts and the log, trusted for nothing
  *   0x40  VERIFY_PIN       — verify the PIN
  *   0x41  SET_PIN          — set or replace the PIN: an open card only (no owner, nothing unspent)
  *   0x42  CHANGE_PIN       — the owner's proof and the new PIN: no old PIN, any state
@@ -64,12 +66,13 @@ import javacardx.crypto.*;
  *     takes the amount on the terminal's word, so a copy with a smaller
  *     amount would have been signed for at the smaller price.
  *   - The card keeps a DAILY LIMIT in permanent memory, and a clock of its own
- *     (`now`) that only moves forward, told to it under a signature by a time
- *     key kept in its record. A spend is counted against the day it falls in.
- *     A terminal that was handed the PIN can sign for one day's limit and no
- *     more. The PIN, a new SELECT or a reset change nothing about it. The time
- *     key is P-256, and who holds its private half decides how far that
- *     holds: see the spec's section 5.2.
+ *     (`now`) that only moves forward: the time written in the newest Bitcoin
+ *     block header it has been shown (SET_HEADER), which it believes for the
+ *     work in it and not for who brought it. A spend is counted against the
+ *     day it falls in. A terminal that was handed the PIN can sign for one
+ *     day's limit and no more, and can end the day only by bringing a real
+ *     block dated a day on, which exists only once the world has mined it.
+ *     The PIN, a new SELECT or a reset change nothing about it.
  *   - A card with an OWNER (a P-256 public key) is its owner's, empty or not:
  *     changing the PIN, the limit, the owner or the card record, adding funds
  *     without the PIN, and locking the card each need the owner's proof, an
@@ -129,7 +132,7 @@ public class CashuApplet extends Applet {
     // seconds over it, and two more for every further limit's worth (`waitsFor`). The work of making the
     // change counts toward it. And one payment a tap at full speed: a second one in the same time in the
     // field is slowed as one over the limit, unless the owner's grant is in the tap.
-    static final byte VERSION_MINOR = (byte) 0x0E;
+    static final byte VERSION_MINOR = (byte) 0x0F;
     static final byte FORMAT        = (byte) 0x04;
 
     // -------------------------------------------------------------------------
@@ -163,7 +166,10 @@ public class CashuApplet extends Applet {
     // only (no owner): the owner's form is 0x34.
     static final byte INS_SET_LIMIT        = (byte) 0x33;
     static final byte INS_SET_LIMIT_OWNER  = (byte) 0x34;
-    static final byte INS_SET_TIME         = (byte) 0x35;
+    // 0x35 was SET_TIME, a time under the signature of a key that lived in the app: gone in
+    // 1.15 (the key could be copied out of any phone), it answers 6D00 and stays unassigned.
+    static final byte INS_SET_HEADER       = (byte) 0x36;
+    static final byte INS_TELL_TIME        = (byte) 0x37;
     static final byte INS_VERIFY_PIN       = (byte) 0x40;
     static final byte INS_SET_PIN          = (byte) 0x41;
     static final byte INS_CHANGE_PIN       = (byte) 0x42;
@@ -212,7 +218,7 @@ public class CashuApplet extends Applet {
 
     // -------------------------------------------------------------------------
     // The card record (persistent): which mint, which unit, who may take the
-    // pieces back, the daily limit, the time key and the day.
+    // pieces back, the daily limit, the clock's block header and the day.
     // -------------------------------------------------------------------------
     static final short CARD_SET_OFFSET     = (short) 0;   // 1 once SET_CARD has run
     static final short CARD_UNIT_OFFSET    = (short) 1;   // 0 = sat
@@ -226,12 +232,16 @@ public class CashuApplet extends Applet {
     // bytes and its length, 100 bytes of record and the mint, in one short
     // APDU of 255 data bytes.
     static final short CARD_MINT_MAX       = (short) 77;   // 80 before the design: a short APDU holds the proof, the record, the mint and it (1 + 72 + 100 + 77 + 3 = 253)
-    // The time signer's public key, uncompressed (04 || X || Y). Written by
-    // SET_CARD. The card's own copy of what it checks a time against.
-    static final short CARD_TIMEKEY_OFFSET = (short) 120;
-    // The latest signed time the card has accepted, seconds, big-endian, 0
-    // until it has been told one. SET_TIME writes it, and SET_CARD clears it
-    // in exactly one case: a time key different from the one it holds.
+    // The clock's own proof. The hardest difficulty of any block header the card
+    // has accepted, as the header carries it (4 bytes, `bits`, little-endian;
+    // zeros until one has): a later header must show at least a quarter of that
+    // work. Then the hash of the last header taken (32 bytes, as Bitcoin shows a
+    // block hash), for the owner's screen. The 29 bytes after are zeros. These
+    // 65 bytes held a time signer's key until 1.15.
+    static final short CARD_BITS_OFFSET    = (short) 120;
+    static final short CARD_HEADER_OFFSET  = (short) 124;
+    // The latest block time the card has accepted, seconds, big-endian, 0 until
+    // it has seen a header. SET_HEADER writes it; nothing lowers it.
     static final short CARD_NOW_OFFSET     = (short) 185;
     // When the current day began, and what has been signed for since.
     static final short CARD_WINDOW_OFFSET  = (short) 189;
@@ -251,9 +261,8 @@ public class CashuApplet extends Applet {
     static final short CARD_DESIGN_OFFSET  = (short) 209;
     static final short CARD_DESIGN_LEN     = (short) 3;
     static final short CARD_RECORD_LEN     = (short) 212;
-    // SET_CARD's data: unit (1), refund key (33), time key (65), mint length (1), then the mint
+    // SET_CARD's data: unit (1), refund key (33), 65 bytes that held a time key until 1.15 and are not read, mint length (1), then the mint
     static final short SET_CARD_FIXED      = (short) 100;
-    static final short SET_CARD_TIMEKEY_AT = (short) 34;
     static final short SET_CARD_MINTLEN_AT = (short) 99;
     static final short EC_POINT_LEN        = (short) 65;
 
@@ -328,7 +337,7 @@ public class CashuApplet extends Applet {
     static final short LOG_HEAD_LEN         = (short) 21;
     // the last eight taps, in a ring: the tap numbered n is at (n - 1) mod 8
     static final short LOG_ENTRIES          = (short) 8;
-    static final short LOG_ENTRY_LEN        = (short) 16;
+    static final short LOG_ENTRY_LEN        = (short) 20;
     static final short LOG_E_TIME           = (short) 0;   // the clock when the tap's first entry was made (4)
     static final short LOG_E_SATS           = (short) 4;   // sats signed for in it (4)
     static final short LOG_E_PIECES         = (short) 8;   // pieces signed (1, stops at 255)
@@ -336,10 +345,11 @@ public class CashuApplet extends Applet {
     static final short LOG_E_FLAGS          = (short) 10;  // bit 0: the third refusal of a run, or one after it, was in this tap; bit 1: a payment in it waited (6a)
     static final byte  LOG_FLAG_TAMPER      = (byte) 0x01;
     static final byte  LOG_FLAG_WAITED      = (byte) 0x02; // a payment in this tap was over the limit on one payment, and was waited for
-    static final byte  LOG_FLAG_CLOCK       = (byte) 0x04; // the clock was moved on a second time in this tap, by more than CLOCK_JUMP (5.3)
+    static final byte  LOG_FLAG_CLOCK       = (byte) 0x04; // set by software before 1.15, when a signed clock was moved on twice in one tap; never set since (the clock is block headers)
     static final short LOG_E_LOADS          = (short) 11;  // pieces put on in it (1, stops at 255)
     static final short LOG_E_LOADED         = (short) 12;  // sats put on in it (4)
-    static final short LOG_LEN              = (short) 149; // LOG_HEAD_LEN + LOG_ENTRIES * LOG_ENTRY_LEN
+    static final short LOG_E_TOLD           = (short) 16;  // the time the terminal told at the tap (TELL_TIME, 4; zeros if it told none): a note, trusted for nothing
+    static final short LOG_LEN              = (short) 181; // LOG_HEAD_LEN + LOG_ENTRIES * LOG_ENTRY_LEN
 
     /* ---- receipts -----------------------------------------------------------
      * For each payment the card signs, kept after the pieces are burned: the
@@ -359,11 +369,9 @@ public class CashuApplet extends Applet {
      * owner's grant and nothing less: a terminal that has the PIN cannot read
      * it, and no command clears it. */
     static final short RECEIPTS             = (short) 16;
-    static final short RECEIPT_LEN          = (short) 73;
+    static final short RECEIPT_LEN          = (short) 77;
     static final short RECEIPTS_HEAD        = (short) 4;
-    static final short RECEIPTS_LEN         = (short) 1172; // RECEIPTS_HEAD + RECEIPTS * RECEIPT_LEN
-    /** Seconds: the clock moved on by more than this for a second time in one tap is written down (5.3). */
-    private static final byte[] CLOCK_JUMP = { (byte) 0x00, (byte) 0x00, (byte) 0x00, (byte) 0x78 };
+    static final short RECEIPTS_LEN         = (short) 1236; // RECEIPTS_HEAD + RECEIPTS * RECEIPT_LEN
     // GET_LOG's answer: the four counts, then the taps the ring holds, newest first
     static final short LOG_ANSWER_HEAD      = (short) 16;
     // a run of this many refusals inside one tap's ten seconds is a terminal trying the limit, and is marked
@@ -396,8 +404,8 @@ public class CashuApplet extends Applet {
     static final short SW_OVER_LIMIT            = (short) 0x6A8F; // the piece would take today past the daily limit
     static final short SW_NO_OWNER              = (short) 0x6A90; // a command that needs the owner, or a load, on a card with none
     static final short SW_OWNER_PROOF           = (short) 0x6A91; // no nonce given, or the proof is not the owner's, or the form is not open to an owned card
-    static final short SW_NO_TIME               = (short) 0x6A92; // the card has never been told the time, and this needs one
-    static final short SW_NOT_THE_TIME          = (short) 0x6A93; // SET_TIME whose signature is not the time key's
+    // 0x6A92 was "never told the time": since 1.15 a card spends its first day on trust, and nothing answers it.
+    static final short SW_LITTLE_WORK           = (short) 0x6A93; // SET_HEADER whose work is not enough: not its own difficulty's, under the floor, or under a quarter of the best seen
     static final short SW_PIECE_ON_CARD         = (short) 0x6A94; // LOAD_PROOF of a piece whose nonce is already in a slot, spent or not
     // 6A95 was "over the limit on one tap", when that was refused; it is now waited for (6a) and the word is unused
     static final short SW_TOO_MANY              = (short) 0x6A96; // more pieces than one signature can burn at once
@@ -455,7 +463,7 @@ public class CashuApplet extends Applet {
     };
 
     // -------------------------------------------------------------------------
-    // NIST P-256 (secp256r1) parameters, for the owner key and the time key.
+    // NIST P-256 (secp256r1) parameters, for the owner key.
     // They have nothing to do with the card's own secp256k1 key. Set on each
     // key object explicitly; no default curve is relied on.
     // -------------------------------------------------------------------------
@@ -598,10 +606,18 @@ public class CashuApplet extends Applet {
         'F','o','x','y','C','a','r','d','/','l','o','a','d' };
     private static final byte[] LABEL_LOCK = {   // FoxyCard/lock
         'F','o','x','y','C','a','r','d','/','l','o','c','k' };
-    // The time signer's: not an owner's label. Signed by the time key over
-    // label || the time (4 bytes, big-endian).
-    private static final byte[] LABEL_TIME = {   // FoxyCard/time
-        'F','o','x','y','C','a','r','d','/','t','i','m','e' };
+    /* The least work a block header must show to be taken, as a header carries
+     * its difficulty (`bits`, little-endian): 0x17087BC0, four times the
+     * target of the network's blocks when this version was made (0x17021EF0),
+     * so a quarter of their work: a difficulty of about 3.3e13, 2^77 hashes a
+     * block. Only the first header a card ever takes is held to this alone;
+     * from then on it is held to a quarter of the hardest it has taken
+     * (SET_HEADER), which climbs with the network, so this is the same bound
+     * for a new card as the ratchet is for a used one. Set in each version to a
+     * quarter of its own time's, so that a card set up years from now starts
+     * from its own era; the network's difficulty has never fallen by three
+     * quarters, and a fall that deep would stall every card's ratchet alike. */
+    private static final byte[] FLOOR_BITS = { (byte) 0xC0, (byte) 0x7B, (byte) 0x08, (byte) 0x17 };
 
     /** 86 400 seconds, big-endian: how long a day is. */
     private static final byte[] DAY_SECONDS = { (byte) 0x00, (byte) 0x01, (byte) 0x51, (byte) 0x80 };
@@ -678,13 +694,7 @@ public class CashuApplet extends Applet {
      */
     private byte[] changeDue;
 
-    /**
-     * The time key, as the verifier takes it. The record holds the key's
-     * bytes, which are the truth: this object is set from them before each use.
-     */
-    private ECPublicKey timeKey;
-
-    /** The one ECDSA verifier (SHA-256, DER signatures), for the owner's proofs and the time. */
+    /** The one ECDSA verifier (SHA-256, DER signatures), for the owner's proofs. */
     private Signature ecdsa;
 
     // -------------------------------------------------------------------------
@@ -762,12 +772,13 @@ public class CashuApplet extends Applet {
     /** The first output of the payment in hand, for its receipt (RAM). */
     private byte[] allOut;
     /**
-     * What the card knows of the time it has been told in this time in the
-     * field (RAM, gone with the power): [0] whether it has been told, [1]
-     * whether the clock has since been moved on past CLOCK_JUMP from where
-     * that first telling left it, [2..5] where that was.
+     * The time the terminal told in this time in the field (TELL_TIME; RAM,
+     * gone with the power): four bytes, big-endian seconds, zeros until told.
+     * A note for the receipts and the log, so that the owner's screen can show
+     * when a payment was made to the second; the card trusts it for nothing,
+     * and its day is counted by block headers alone (SET_HEADER).
      */
-    private byte[] timeTold;
+    private byte[] tapTime;
     /**
      * This time in the field (gone with the power, not with a SELECT): [0]
      * whether it has an entry in the log yet; [1] whether a payment has been
@@ -853,7 +864,6 @@ public class CashuApplet extends Applet {
         ownerSet        = new byte[1];
         changeDue       = new byte[1];
         ownerKey        = newP256Key();
-        timeKey         = newP256Key();
         ecdsa           = Signature.getInstance(Signature.ALG_ECDSA_SHA_256, false);
         pinVerifiedFlag = JCSystem.makeTransientByteArray((short) 1, JCSystem.CLEAR_ON_DESELECT);
         ownerNonce      = JCSystem.makeTransientByteArray(OWNER_NONCE_LEN, JCSystem.CLEAR_ON_DESELECT);
@@ -864,7 +874,7 @@ public class CashuApplet extends Applet {
         cardLog         = new byte[LOG_LEN];
         cardReceipts    = new byte[RECEIPTS_LEN];
         allOut          = JCSystem.makeTransientByteArray((short) 33, JCSystem.CLEAR_ON_DESELECT);
-        timeTold        = JCSystem.makeTransientByteArray((short) 6, JCSystem.CLEAR_ON_RESET);
+        tapTime         = JCSystem.makeTransientByteArray((short) 4, JCSystem.CLEAR_ON_RESET);
         tapOpen         = JCSystem.makeTransientByteArray((short) 2, JCSystem.CLEAR_ON_RESET);
         sha             = MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
         shaAll          = MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
@@ -941,9 +951,9 @@ public class CashuApplet extends Applet {
 
     /**
      * A public key on NIST P-256, with the curve's parameters set explicitly
-     * (field, a, b, generator, order, cofactor 1). For the owner key and the
-     * time key, which verify ECDSA signatures and have nothing to do with the
-     * card's own secp256k1 key. Its point (W) is set when one is given.
+     * (field, a, b, generator, order, cofactor 1). For the owner key, which
+     * verifies ECDSA signatures and has nothing to do with the card's own
+     * secp256k1 key. Its point (W) is set when one is given.
      */
     private static ECPublicKey newP256Key() {
         ECPublicKey key = (ECPublicKey) KeyBuilder.buildKey(KeyBuilder.TYPE_EC_FP_PUBLIC, KeyBuilder.LENGTH_EC_FP_256, false);
@@ -1037,7 +1047,8 @@ public class CashuApplet extends Applet {
             case INS_SET_CARD:         processSetCard(apdu);        break;
             case INS_SET_LIMIT:        processSetLimit(apdu);       break;
             case INS_SET_LIMIT_OWNER:  processSetLimitOwner(apdu);  break;
-            case INS_SET_TIME:         processSetTime(apdu);        break;
+            case INS_SET_HEADER:       processSetHeader(apdu);      break;
+            case INS_TELL_TIME:        processTellTime(apdu);       break;
             case INS_VERIFY_PIN:       processVerifyPin(apdu);      break;
             case INS_SET_PIN:          processSetPin(apdu);         break;
             case INS_CHANGE_PIN:       processChangePin(apdu);      break;
@@ -1960,13 +1971,15 @@ public class CashuApplet extends Applet {
          * the two has the payment in its log and no receipt. */
         short slot = (short)((cardReceipts[3] & 0x0F) * RECEIPT_LEN + RECEIPTS_HEAD);
         JCSystem.beginTransaction();
+        // the card's own clock (the last block header's time), then the time the terminal told at this tap (a note), the sats, the message, the output
         Util.arrayCopy(cardRecord, CARD_NOW_OFFSET, cardReceipts, slot, (short) 4);
-        Util.arrayCopy(allNet, (short) 0, cardReceipts, (short)(slot + 4), (short) 4);
-        Util.arrayCopy(scratch, X_MSG, cardReceipts, (short)(slot + 8), (short) 32);
+        Util.arrayCopy(tapTime, (short) 0, cardReceipts, (short)(slot + 4), (short) 4);
+        Util.arrayCopy(allNet, (short) 0, cardReceipts, (short)(slot + 8), (short) 4);
+        Util.arrayCopy(scratch, X_MSG, cardReceipts, (short)(slot + 12), (short) 32);
         if (allState[5] == (byte) 1) {
-            Util.arrayCopy(allOut, (short) 0, cardReceipts, (short)(slot + 40), (short) 33);
+            Util.arrayCopy(allOut, (short) 0, cardReceipts, (short)(slot + 44), (short) 33);
         } else {
-            Util.arrayFillNonAtomic(cardReceipts, (short)(slot + 40), (short) 33, (byte) 0);
+            Util.arrayFillNonAtomic(cardReceipts, (short)(slot + 44), (short) 33, (byte) 0);
         }
         addUint32Stop(cardReceipts, (short) 0, ONE, (short) 0);
         JCSystem.commitTransaction();
@@ -2046,8 +2059,10 @@ public class CashuApplet extends Applet {
      */
     private void requireUnderLimits(byte[] sum, short sumOff, short carry) {
         boolean limited = !isZero(cardRecord, CARD_LIMIT_OFFSET, (short) 4);
-        // never been told the time: a card that cannot know the day does not spend under a daily limit
-        if (limited && isZero(cardRecord, CARD_NOW_OFFSET, (short) 4)) ISOException.throwIt(SW_NO_TIME);
+        /* A card that has seen no block header yet (now = 0) spends its first
+         * day on trust: its window has no start and cannot end, so what it
+         * signs for counts up to the limit and then stops, until a header
+         * arrives and the window is anchored at that block's time. */
         if (limited) {
             if (dayIsOver()) {
                 Util.arrayFillNonAtomic(scratch, X_SUM, (short) 4, (byte) 0);
@@ -2227,7 +2242,7 @@ public class CashuApplet extends Applet {
         apdu.setOutgoingAndSend((short) 0, (short)(AUTH_NONCE_LEN + sigLen));
     }
 
-    /** GET_CARD: format, whether the record is set, unit, limit, refund key, time key, mint. */
+    /** GET_CARD: format, whether the record is set, unit, limit, refund key, the clock's block header (its bits and hash), mint. */
     private void processGetCard(APDU apdu) {
         byte[] buf = apdu.getBuffer();
         short mintLen = (short)(cardRecord[CARD_MINTLEN_OFFSET] & 0xFF);
@@ -2236,7 +2251,8 @@ public class CashuApplet extends Applet {
         buf[2] = cardRecord[CARD_UNIT_OFFSET];
         Util.arrayCopyNonAtomic(cardRecord, CARD_LIMIT_OFFSET, buf, (short) 3, (short) 4);
         Util.arrayCopyNonAtomic(cardRecord, CARD_REFUND_OFFSET, buf, (short) 7, (short) 33);
-        Util.arrayCopyNonAtomic(cardRecord, CARD_TIMEKEY_OFFSET, buf, (short) 40, EC_POINT_LEN);
+        // where the time key was: the hardest header's bits (4), the last header's hash (32), zeros (29)
+        Util.arrayCopyNonAtomic(cardRecord, CARD_BITS_OFFSET, buf, (short) 40, (short) 65);
         buf[105] = (byte) mintLen;
         Util.arrayCopyNonAtomic(cardRecord, CARD_MINT_OFFSET, buf, (short) 106, mintLen);
         // and, after the mint, the card's design: three characters, or zeros for none (1.10)
@@ -2259,10 +2275,6 @@ public class CashuApplet extends Applet {
         // corrected.
         if (ownerSet[0] != (byte) 1) ISOException.throwIt(SW_NO_OWNER);
         if (cardRecord[CARD_SET_OFFSET] != (byte) 1) ISOException.throwIt(SW_NO_CARD_RECORD);
-        // Nor onto a card that has never been told the time: so the earliest
-        // `now` a funded card can hold is its own loading, and (it only moves
-        // forward) no older time can ever get in after it.
-        if (isZero(cardRecord, CARD_NOW_OFFSET, (short) 4)) ISOException.throwIt(SW_NO_TIME);
 
         // a full card says so whatever it is sent
         if (emptySlot() < 0) ISOException.throwIt(SW_NO_SPACE);
@@ -2407,14 +2419,15 @@ public class CashuApplet extends Applet {
     }
 
     /**
-     * SET_CARD: unit (1), refund key (33, zeros for none), time key (65, 04 ||
-     * X || Y), mint length (1), mint. On a card with an owner the owner's proof
+     * SET_CARD: unit (1), refund key (33, zeros for none), 65 bytes that held
+     * a time key until 1.15 and are not read (a phone of a later software sends
+     * zeros), mint length (1), mint. On a card with an owner the owner's proof
      * comes first: its length (1) and the proof (DER).
      *
      * Only with nothing unspent on the card. The refund key is part of every
      * dated piece's secret and the mint is where every piece is, so changing
      * either under pieces already loaded would leave them unspendable or
-     * unfindable; and the time key decides what the card believes the day is.
+     * unfindable.
      *
      * Who may: on a card with NO owner, a verified PIN; on a card WITH an
      * owner, the owner's proof over everything sent, whether or not the card
@@ -2422,10 +2435,10 @@ public class CashuApplet extends Applet {
      * not be able to set its own record then). The proof replaces the PIN: the
      * owner's phone does not know it.
      *
-     * A time key different from the one the card holds clears the card's clock
-     * (`now`) and the window with it, and nothing else does: it is the way out
-     * of a signer's fault. The limit stays. One transaction: the record is
-     * whole or as it was.
+     * The clock (`now`), its window and the day's spending are kept through a
+     * new record: the clock is block headers' (SET_HEADER), and no record can
+     * be wrong about it. The limit stays. One transaction: the record is whole
+     * or as it was.
      */
     private void processSetCard(APDU apdu) {
         requireNotLocked();
@@ -2463,31 +2476,23 @@ public class CashuApplet extends Applet {
         } else if (r0 != (byte) 0x02 && r0 != (byte) 0x03) {
             ISOException.throwIt(ISO7816.SW_WRONG_DATA);
         }
-        // the time key is an uncompressed point, and one the verifier takes
-        short keyAt = (short)(at + SET_CARD_TIMEKEY_AT);
-        if (buf[keyAt] != (byte) 0x04) ISOException.throwIt(ISO7816.SW_WRONG_DATA);
-        try {
-            timeKey.setW(buf, keyAt, EC_POINT_LEN);
-        } catch (CryptoException e) {
-            ISOException.throwIt(ISO7816.SW_WRONG_DATA);
-        }
-        boolean newKey = !sameBytes(cardRecord, CARD_TIMEKEY_OFFSET, buf, keyAt, EC_POINT_LEN);
+        /* Bytes 34 to 98 of the record held a time signer's key until 1.15, and
+         * are not read: a phone of an earlier software still sends one, a later
+         * one sends zeros, and the card's clock, which is block headers' now
+         * (SET_HEADER), keeps its reading through a new record. */
         JCSystem.beginTransaction();
         cardRecord[CARD_UNIT_OFFSET] = buf[at];
         Util.arrayCopy(buf, (short)(at + 1), cardRecord, CARD_REFUND_OFFSET, (short) 33);
         cardRecord[CARD_MINTLEN_OFFSET] = (byte) mintLen;
         Util.arrayCopy(buf, (short)(at + SET_CARD_FIXED), cardRecord, CARD_MINT_OFFSET, mintLen);
-        Util.arrayCopy(buf, keyAt, cardRecord, CARD_TIMEKEY_OFFSET, EC_POINT_LEN);
         if (designGiven) Util.arrayCopy(buf, designAt, cardRecord, CARD_DESIGN_OFFSET, CARD_DESIGN_LEN);
         else Util.arrayFillNonAtomic(cardRecord, CARD_DESIGN_OFFSET, CARD_DESIGN_LEN, (byte) 0);
-        if (newKey) {
-            // the clock is the old key's signer's to have set; the window is in its units
-            Util.arrayFillNonAtomic(cardRecord, CARD_NOW_OFFSET, (short) 4, (byte) 0);
-            Util.arrayFillNonAtomic(cardRecord, CARD_WINDOW_OFFSET, (short) 4, (byte) 0);
-            Util.arrayFillNonAtomic(cardRecord, CARD_SPENT_OFFSET, (short) 4, (byte) 0);
-            Util.arrayFillNonAtomic(cardRecord, CARD_TAP_WINDOW_OFFSET, (short) 4, (byte) 0);
-            Util.arrayFillNonAtomic(cardRecord, CARD_TAP_SPENT_OFFSET, (short) 4, (byte) 0);
-        }
+        /* The ratchet is let go: the hardest difficulty the card has taken is
+         * set to nothing, and the next header sets it afresh. The one way out
+         * for a card whose network has fallen under a quarter of its best and
+         * would otherwise take no real header again; in the owner's or the
+         * PIN's hands only, as the record is. The clock itself stays. */
+        Util.arrayFillNonAtomic(cardRecord, CARD_BITS_OFFSET, (short) 4, (byte) 0);
         cardRecord[CARD_SET_OFFSET] = (byte) 1;
         JCSystem.commitTransaction();
     }
@@ -2531,7 +2536,8 @@ public class CashuApplet extends Applet {
 
     /**
      * The limit written, and a window begun at `now` with nothing spent in it.
-     * A limit needs a time to start from (`6A92`); a limit of 0 (none) does not.
+     * A limit set before the card has seen a block header begins its window at
+     * the first header that arrives; until then the card spends on trust.
      * One transaction: the limit and its window are all new or all old.
      */
     /*
@@ -2545,10 +2551,9 @@ public class CashuApplet extends Applet {
      */
     private void writeLimit(byte[] src, short at, short len) {
         boolean both = len == (short) 8;
-        // the day's limit is counted against the clock, and needs one; the limit on one payment asks no clock
-        if (!isZero(src, at, (short) 4) && isZero(cardRecord, CARD_NOW_OFFSET, (short) 4)) {
-            ISOException.throwIt(SW_NO_TIME);
-        }
+        /* A day's limit set before the card has seen a block header begins a
+         * window with no start (now = 0): the first header anchors it. Until
+         * then the card spends its first day on trust (`requireUnderLimits`). */
         boolean dayChanged = !both || !sameBytes(src, at, cardRecord, CARD_LIMIT_OFFSET, (short) 4);
         boolean tapChanged = both && !sameBytes(src, (short)(at + 4), cardRecord, CARD_TAP_LIMIT_OFFSET, (short) 4);
         JCSystem.beginTransaction();
@@ -2564,81 +2569,119 @@ public class CashuApplet extends Applet {
     }
 
     /**
-     * SET_TIME: a time (4, big-endian seconds), the signature's length (1), and
-     * the signature (DER) by the time key over "FoxyCard/time" || the time.
+     * SET_HEADER: a Bitcoin block header, the 80 bytes as the network carries
+     * them (version, the previous block's hash, the merkle root, the time, the
+     * difficulty as `bits`, the nonce; every number little-endian). The card's
+     * clock is the time written in the newest header it has taken.
      *
-     * No PIN, no owner, and no state of the card refuses it: a blocked or locked
-     * card still takes the time. A time can only move the clock forward. An old
-     * or repeated one changes nothing and is answered `9000`, so a terminal
-     * that sends the time it has is never in the wrong; a signature that is not
-     * the time key's changes nothing and is `6A93`. Answers the card's `now`.
+     * The card believes the header for what it would cost to make, not for who
+     * brings it: it hashes the 80 bytes twice and the hash, read as a number,
+     * must be at or under the target the header's own `bits` name, which is
+     * the proof of the network's ten minutes of work. Then the work must be
+     * enough to be anybody's: the target at or under the floor built in
+     * (FLOOR_BITS) and at or under four times the target of the hardest header
+     * the card has taken, that is, a quarter of its work (`6A93` otherwise;
+     * `6A80` for a difficulty no header could carry). No key, no PIN, no owner,
+     * and no state of the card refuses a good header: a blocked or locked card
+     * takes it. Nobody can bring a header dated tomorrow without tomorrow's
+     * work, and an old header changes nothing and is answered `9000`, so a
+     * terminal that brings the header it has is never in the wrong.
      *
-     * There is no nonce and no freshness: a stale time cannot help anybody, and
-     * a fresh one is the truth, so a signed time is a public broadcast.
+     * A header later than the clock moves it forward, anchors the window of a
+     * day's limit set before any header arrived (6), and is remembered: its
+     * difficulty where it is the hardest yet, and its hash, as Bitcoin shows
+     * one, for the owner's screen. Answers the card's `now`.
      */
-    private void processSetTime(APDU apdu) {
+    private void processSetHeader(APDU apdu) {
         short dataLen = apdu.setIncomingAndReceive();
         byte[] buf = apdu.getBuffer();
         short at = ISO7816.OFFSET_CDATA;
-        if (dataLen < (short) 6) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-        short sigLen = (short)(buf[(short)(at + 4)] & 0xFF);
-        if (sigLen < 1 || sigLen > SIG_DER_MAX || dataLen != (short)(5 + sigLen)) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-        // the time key lives in the record, so a card with no record has none to check against
-        if (cardRecord[CARD_SET_OFFSET] != (byte) 1) ISOException.throwIt(SW_NO_CARD_RECORD);
-        boolean good = false;
-        try {
-            timeKey.setW(cardRecord, CARD_TIMEKEY_OFFSET, EC_POINT_LEN);
-            ecdsa.init(timeKey, Signature.MODE_VERIFY);
-            ecdsa.update(LABEL_TIME, (short) 0, (short) LABEL_TIME.length);
-            good = ecdsa.verify(buf, at, (short) 4, buf, (short)(at + 5), sigLen);
-        } catch (CryptoException e) {
-            good = false;
+        if (dataLen != (short) 80) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        // the work: the header hashed twice, the hash turned round into a big-endian number (Bitcoin reads it little-endian)
+        sha.reset();
+        sha.doFinal(buf, at, (short) 80, scratch, X_MSG);
+        sha.reset();
+        sha.doFinal(scratch, X_MSG, (short) 32, scratch, X_MSG);
+        for (short i = 0; i < 32; i++) scratch[(short)(X_OUT + i)] = scratch[(short)(X_MSG + 31 - i)];
+        // at or under the target its own bits name
+        targetOf(buf, (short)(at + 72), scratch, (short)(X_OUT + 32));
+        if (cmp256(scratch, X_OUT, scratch, (short)(X_OUT + 32)) > 0) ISOException.throwIt(SW_LITTLE_WORK);
+        // and enough of it: the floor built in, then a quarter of the hardest taken
+        targetOf(FLOOR_BITS, (short) 0, scratch, X_HEX);
+        if (cmp256(scratch, (short)(X_OUT + 32), scratch, X_HEX) > 0) ISOException.throwIt(SW_LITTLE_WORK);
+        boolean seen = !isZero(cardRecord, CARD_BITS_OFFSET, (short) 4);
+        if (seen) {
+            targetOf(cardRecord, CARD_BITS_OFFSET, scratch, X_HEX);
+            timesFour(scratch, X_HEX);
+            if (cmp256(scratch, (short)(X_OUT + 32), scratch, X_HEX) > 0) ISOException.throwIt(SW_LITTLE_WORK);
         }
-        if (!good) ISOException.throwIt(SW_NOT_THE_TIME);
-        /* The card cannot know the time, only that it is not being told an
-         * earlier one. What it can see is being told twice in one time in the
-         * field, times far apart: no phone's clock moves two minutes in the
-         * one tap, and a terminal walking the clock forward to turn the day
-         * does exactly that. It is not refused (the card has no way to say
-         * which of the two was the lie) and it is written down (6b). A
-         * terminal that cuts the field between the two is not seen here; the
-         * holder's phone, which knows the time, sees a clock that is ahead
-         * of it.
-         *
-         * Judged against where the FIRST telling of this time in the field
-         * left the clock, and not against the clock as it stands: a terminal
-         * that walked it on a minute at a time would never be two minutes
-         * from where it stood. And it begins no entry in the log: SET_TIME
-         * needs no PIN, and an entry for every mark would let anybody near
-         * the card push its eight taps out of the ring with marks. The count
-         * of marked things goes up by one, once for this time in the field;
-         * the tap's entry is marked if it has one, and if it gets one later
-         * (`logEntry`). */
-        boolean jumped = false;
-        if (timeTold[0] == (byte) 1 && timeTold[1] != (byte) 1 && !isZero(timeTold, (short) 2, (short) 4)) {
-            Util.arrayCopyNonAtomic(timeTold, (short) 2, scratch, X_NUM, (short) 4);
-            jumped = addUint32Carry(scratch, X_NUM, CLOCK_JUMP, (short) 0) == 0 && cmpUint32(buf, at, scratch, X_NUM) > 0;
-        }
-        // only forward; one four-byte copy, so the clock is the old time or the new
-        if (cmpUint32(buf, at, cardRecord, CARD_NOW_OFFSET) > 0) {
-            Util.arrayCopy(buf, at, cardRecord, CARD_NOW_OFFSET, (short) 4);
-        }
-        if (timeTold[0] != (byte) 1) {
-            timeTold[0] = (byte) 1;
-            Util.arrayCopyNonAtomic(cardRecord, CARD_NOW_OFFSET, timeTold, (short) 2, (short) 4);
-        }
-        if (jumped) {
-            timeTold[1] = (byte) 1;
-            JCSystem.beginTransaction();
-            addUint32Stop(cardLog, LOG_TAMPERS_OFFSET, ONE, (short) 0);
-            if (tapOpen[0] == (byte) 1) {
-                short entry = logEntry();
-                cardLog[(short)(entry + LOG_E_FLAGS)] |= LOG_FLAG_CLOCK;
+        // the block's time, big-endian
+        scratch[X_NUM] = buf[(short)(at + 71)];
+        scratch[(short)(X_NUM + 1)] = buf[(short)(at + 70)];
+        scratch[(short)(X_NUM + 2)] = buf[(short)(at + 69)];
+        scratch[(short)(X_NUM + 3)] = buf[(short)(at + 68)];
+        if (cmpUint32(scratch, X_NUM, cardRecord, CARD_NOW_OFFSET) > 0) {
+            boolean harder = !seen;
+            if (seen) {
+                targetOf(cardRecord, CARD_BITS_OFFSET, scratch, X_HEX);
+                harder = cmp256(scratch, (short)(X_OUT + 32), scratch, X_HEX) < 0;
             }
+            JCSystem.beginTransaction();
+            Util.arrayCopy(scratch, X_NUM, cardRecord, CARD_NOW_OFFSET, (short) 4);
+            // a day's limit set before the card had seen a header: its window begins at this one
+            if (!isZero(cardRecord, CARD_LIMIT_OFFSET, (short) 4) && isZero(cardRecord, CARD_WINDOW_OFFSET, (short) 4)) {
+                Util.arrayCopy(scratch, X_NUM, cardRecord, CARD_WINDOW_OFFSET, (short) 4);
+            }
+            if (harder) Util.arrayCopy(buf, (short)(at + 72), cardRecord, CARD_BITS_OFFSET, (short) 4);
+            Util.arrayCopy(scratch, X_OUT, cardRecord, CARD_HEADER_OFFSET, (short) 32);
             JCSystem.commitTransaction();
         }
         Util.arrayCopyNonAtomic(cardRecord, CARD_NOW_OFFSET, buf, (short) 0, (short) 4);
         apdu.setOutgoingAndSend((short) 0, (short) 4);
+    }
+
+    /**
+     * The target a header's `bits` name, as a 32-byte big-endian number at
+     * `out[outOff]`: the three-byte mantissa placed `exponent` bytes up from
+     * the bottom, as Bitcoin has it. `bits` are read little-endian from
+     * `src[off]`, as a header carries them. A size no header could carry
+     * (0, or past 32 bytes) or a mantissa with its top bit set (a negative
+     * target) is refused with `6A80`.
+     */
+    private static void targetOf(byte[] src, short off, byte[] out, short outOff) {
+        short exponent = (short)(src[(short)(off + 3)] & 0xFF);
+        if (exponent < 1 || exponent > 32 || (src[(short)(off + 2)] & 0x80) != 0) ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+        Util.arrayFillNonAtomic(out, outOff, (short) 32, (byte) 0);
+        for (short k = 0; k < 3; k++) {
+            short idx = (short)(32 - exponent + k);
+            if (idx < 32) out[(short)(outOff + idx)] = src[(short)(off + 2 - k)];
+        }
+    }
+
+    /** Four times the 32-byte big-endian number at `a[off]`, in place; one too large to hold becomes the largest there is. */
+    private static void timesFour(byte[] a, short off) {
+        short carry = 0;
+        for (short i = 31; i >= 0; i--) {
+            short v = (short)(((a[(short)(off + i)] & 0xFF) << 2) | carry);
+            a[(short)(off + i)] = (byte) v;
+            carry = (short)((v >> 8) & 0x03);
+        }
+        if (carry != 0) Util.arrayFillNonAtomic(a, off, (short) 32, (byte) 0xFF);
+    }
+
+    /**
+     * TELL_TIME: the terminal's own clock, four bytes, big-endian seconds. A
+     * note for this time in the field, written into the receipts and the log
+     * entries made in it, so that the owner's screen can say to the second
+     * when a payment was; the card trusts it for nothing (its day is counted
+     * by block headers), so no key, PIN or state refuses it, and a terminal's
+     * lie here is its own entry's. Answers nothing.
+     */
+    private void processTellTime(APDU apdu) {
+        short dataLen = apdu.setIncomingAndReceive();
+        byte[] buf = apdu.getBuffer();
+        if (dataLen != (short) 4) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        Util.arrayCopyNonAtomic(buf, ISO7816.OFFSET_CDATA, tapTime, (short) 0, (short) 4);
     }
 
     // -------------------------------------------------------------------------
@@ -3179,8 +3222,8 @@ public class CashuApplet extends Applet {
         if (tapOpen[0] != (byte) 1) {
             Util.arrayFillNonAtomic(cardLog, at, LOG_ENTRY_LEN, (byte) 0);
             Util.arrayCopy(cardRecord, CARD_NOW_OFFSET, cardLog, (short)(at + LOG_E_TIME), (short) 4);
-            // a clock moved twice in this time in the field, before the tap had an entry to say so
-            if (timeTold[1] == (byte) 1) cardLog[(short)(at + LOG_E_FLAGS)] = LOG_FLAG_CLOCK;
+            // the time the terminal told at this tap (TELL_TIME), beside the card's own: a note, trusted for nothing
+            Util.arrayCopy(tapTime, (short) 0, cardLog, (short)(at + LOG_E_TOLD), (short) 4);
         }
         return at;
     }
@@ -3203,10 +3246,12 @@ public class CashuApplet extends Applet {
         addUint32Stop(cardLog, LOG_REFUSED_OFFSET, ONE, (short) 0);
         if (cardLog[(short)(entry + LOG_E_REFUSED)] != (byte) 0xFF) cardLog[(short)(entry + LOG_E_REFUSED)]++;
         /* A new run: the first refusal there has been, or ten seconds on from
-         * the last run's first, or a clock that is now behind that (a new time
-         * key sets the clock back to nothing, and a run begun by the old one
-         * would otherwise never end). */
+         * the last run's first, or a clock that is behind that. And every
+         * refusal on a card that has seen no block header yet (now = 0): with
+         * no clock, three visits a week apart would read as one run of three,
+         * and a false mark is worse than none. */
         if (cardLog[LOG_RUN_OFFSET] == (byte) 0
+            || isZero(cardRecord, CARD_NOW_OFFSET, (short) 4)
             || cmpUint32(cardRecord, CARD_NOW_OFFSET, cardLog, LOG_RUN_AT_OFFSET) < 0
             || windowIsOver(cardLog, LOG_RUN_AT_OFFSET, TAP_SECONDS)) {
             Util.arrayCopy(cardRecord, CARD_NOW_OFFSET, cardLog, LOG_RUN_AT_OFFSET, (short) 4);
@@ -3226,10 +3271,12 @@ public class CashuApplet extends Applet {
      * GET_LOG: the card's own account of its taps. Sixteen bytes of counts
      * (taps, sats signed for, spends refused for being over a limit, runs of
      * three such refusals: four bytes each, big-endian), then the taps the
-     * ring holds, newest first, twelve bytes each: the clock when it began
-     * (4), sats signed for in it (4), pieces signed (1), spends refused (1),
-     * flags (1; bit 0, a run of three refusals reached or gone past in it),
-     * and a byte of nothing.
+     * ring holds, newest first, twenty bytes each: the clock (the last block
+     * header's time) when it began (4), sats signed for in it (4), pieces
+     * signed (1), spends refused (1), flags (1; bit 0, a run of three refusals
+     * reached or gone past in it), pieces put on (1), sats put on (4), and the
+     * time the terminal told at the tap (4; TELL_TIME, a note trusted for
+     * nothing).
      *
      * For whoever the card is open to: the PIN verified in this tap, or the
      * owner's grant (ALLOW_LOAD). It says when the card was used and for how
@@ -3397,9 +3444,6 @@ public class CashuApplet extends Applet {
      * take away.
      */
     private static void sizeTheFile(byte[] a) {
-        a[10] = (byte) 20; a[11] = (byte) 21; a[12] = (byte) 22; a[13] = (byte) 23;
-        a[14] = (byte) 24; a[15] = (byte) 25; a[16] = (byte) 26; a[17] = (byte) 27;
-        a[18] = (byte) 28; a[19] = (byte) 29; a[20] = (byte) 30; a[21] = (byte) 31;
-        a[22] = (byte) 32;
+        // no lines at present: 1.15 lands in the window on its own
     }
 }

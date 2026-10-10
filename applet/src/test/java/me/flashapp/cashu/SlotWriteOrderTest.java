@@ -419,7 +419,7 @@ class SlotWriteOrderTest {
         assertEquals(CashuAppletTest.SW_OK, paid.getSW());
         assertTrue(signedFor(paid.getData(), CashuAppletTest.PROOF_1));
         byte[] d = log().getData();
-        assertEquals(32, d.length, "one tap");
+        assertEquals(16 + 20, d.length, "one tap: the counts, and one entry of twenty bytes (1.15)");
         assertEquals(1, CashuAppletTest.readUint32(d, 0));
         assertEquals(1000, CashuAppletTest.readUint32(d, 20), "sats signed for");
         assertEquals(0, d[27], "nothing put on in it: that load is not in the log");
@@ -453,9 +453,9 @@ class SlotWriteOrderTest {
         assertEquals(CashuAppletTest.SW_OK, second.getSW());
         assertEquals(CashuAppletTest.SW_OK, allowLoad());
         ResponseAPDU one = send(new CommandAPDU(CLA, CashuAppletTest.INS_GET_LOG, 1, 0, 256));
-        assertEquals(4 + 73, one.getData().length);
+        assertEquals(4 + CashuAppletTest.RECEIPT_LEN, one.getData().length, "a receipt is 77 bytes since 1.15");
         assertEquals(1, CashuAppletTest.readUint32(one.getData(), 0));
-        assertEquals(500, CashuAppletTest.readUint32(one.getData(), 4 + 4), "what its pieces were worth");
+        assertEquals(500, CashuAppletTest.readUint32(one.getData(), 4 + 8), "what its pieces were worth: after the block's time and the time told");
         assertEquals(1500, CashuAppletTest.readUint32(log().getData(), 4), "and the log has both");
     }
 

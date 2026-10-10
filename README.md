@@ -15,8 +15,11 @@ What differs from upstream:
 - The card has an owner, a P-256 public key worked out on the holder's phone
   from its seed. Only that phone can change the PIN, unblock the card, set the
   limit or add funds with no PIN.
-- The card keeps a daily limit and a clock that only moves forward. The time it
-  is told is interim and weak for now, and the documents say so.
+- The card keeps a daily limit and a clock that only moves forward. The clock is
+  the time written in the newest Bitcoin block header the card has been shown
+  (1.15), believed for its proof of work and for nothing else, so a terminal
+  cannot start a new day by telling the card it is later. The documents say what
+  that does and does not bound.
 - A slot carries a date and a refund key; the card records its mint; 128 slots
   of 82 bytes (64 before software 1.7).
 - A payment is one signature for as many pieces as it is made of (NUT-11

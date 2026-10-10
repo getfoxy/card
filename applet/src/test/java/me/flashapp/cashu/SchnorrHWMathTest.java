@@ -614,7 +614,7 @@ class SchnorrHWMathTest {
     }
 
     @Test
-    @DisplayName("RAM budget: the two constructors ask for no more than 941 bytes of CLEAR_ON_DESELECT, 8 of CLEAR_ON_RESET, in no more than 16 arrays: the figures of 1.12, which are 1.7's and a payment's change and net")
+    @DisplayName("RAM budget: the two constructors ask for no more than 941 bytes of CLEAR_ON_DESELECT, 8 of CLEAR_ON_RESET, in no more than 16 arrays: the figures of 1.12, which are 1.7's and a payment's change and net (1.15 asks for 6 on reset: the time the terminal told, 4, and the tap's two flags)")
     void transientMemoryIsWithinTheBuildThatInstallsOnTheChip() throws Exception {
         int[] asked = transientMemoryAskedFor();
         String why = " These are the figures of 1.12 (941 bytes that are cleared on deselect, 8 on reset, in 16 arrays: 1.7's 931 in 14, and the change and the net of a payment). "
@@ -625,7 +625,7 @@ class SchnorrHWMathTest {
         // a parse that found nothing would prove nothing
         org.junit.jupiter.api.Assertions.assertEquals(16, asked[2], "the parse found the 14 of CashuApplet and the 2 of SchnorrHW");
         org.junit.jupiter.api.Assertions.assertEquals(941, asked[0], "and they add up: CashuApplet 397 and SchnorrHW 544");
-        org.junit.jupiter.api.Assertions.assertEquals(8, asked[1]);
+        org.junit.jupiter.api.Assertions.assertEquals(6, asked[1], "1.15: the time the terminal told (4) and the tap's two flags (2); 1.14 kept six bytes for a clock told twice, and eight with the flags");
     }
 
     @Test
@@ -647,7 +647,7 @@ class SchnorrHWMathTest {
      * a site that runs twice says so.
      */
     @Test
-    @DisplayName("Crypto objects: CashuApplet makes 1 OwnerPIN, 1 Signature, 2 MessageDigests, 1 RandomData, 2 KeyPairs and (in newP256Key, run twice) 2 key sites; SchnorrHW makes 1 MessageDigest, 2 KeyAgreements, 1 RandomData and 1 key; no KeyAgreement, Cipher or Checksum is made anywhere else")
+    @DisplayName("Crypto objects: CashuApplet makes 1 OwnerPIN, 1 Signature, 2 MessageDigests, 1 RandomData, 2 KeyPairs and 2 key sites (newP256Key, run once since 1.15 for the owner's key alone, and the RSA keys of the change); SchnorrHW makes 1 MessageDigest, 2 KeyAgreements, 1 RandomData and 1 key; no KeyAgreement, Cipher or Checksum is made anywhere else")
     void cryptoObjectsAreThoseOfTheBuildThatInstalls() throws Exception {
         String applet = stripCommentsAndCharLiterals(new String(java.nio.file.Files.readAllBytes(mainSourceDir().resolve("CashuApplet.java")), java.nio.charset.StandardCharsets.UTF_8));
         String signer = stripCommentsAndCharLiterals(new String(java.nio.file.Files.readAllBytes(mainSourceDir().resolve("SchnorrHW.java")), java.nio.charset.StandardCharsets.UTF_8));
@@ -665,8 +665,8 @@ class SchnorrHWMathTest {
                 org.junit.jupiter.api.Assertions.assertEquals(inSigner[i], h, "SchnorrHW.java: " + kinds[i] + " is called " + h + " times where the build that installs called it " + inSigner[i] + ". A chip counts these; measure a larger figure on a card first.");
             }
         }
-        // and the EC key objects that exist: the card's pair, the PIN key's pair, the signer's temporary key, the owner's and the time signer's keys
-        org.junit.jupiter.api.Assertions.assertEquals(2, java.util.regex.Pattern.compile("\\bnewP256Key\\(\\)").matcher(applet).results().count() - 1, "newP256Key is run for the owner key and the time key, and for no more");
+        // and the EC key objects that exist: the card's pair, the PIN key's pair, the signer's temporary key, and the owner's key (the time signer's key went in 1.15: the clock is block headers)
+        org.junit.jupiter.api.Assertions.assertEquals(1, java.util.regex.Pattern.compile("\\bnewP256Key\\(\\)").matcher(applet).results().count() - 1, "newP256Key is run for the owner key, and for no more: the time key is gone");
     }
 
     @Test

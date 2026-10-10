@@ -15,14 +15,15 @@ section 4. In short:
 - Nothing is loaded onto a card with no PIN, or onto a card with no owner.
 - The card keeps a daily limit in permanent memory: the most it will sign for in
   one day, in sats (0 is none, and a new card has none). It keeps the day itself:
-  a clock that only moves forward, set under an ECDSA signature (P-256) by a time
-  key held in the card's record. Every spend adds the whole piece it signs to
-  what has been signed today, in the same transaction that burns the slot, and a
-  piece that would take today past the limit is refused (`6A8F`). A terminal that
-  has been handed the PIN can take one day's limit per visit. Until a real time
-  signer exists the time is the receiving phone's own clock, signed by a key
-  built into the app, which is not secret: that bounds an honest terminal and the
-  holder's own spending, and does not bound a terminal built to cheat. (Earlier
+  a clock that only moves forward, the time written in the newest Bitcoin block
+  header the card has been shown (`SET_HEADER`, software 1.15), believed for the
+  work in it and not for who brought it. What a payment takes off the card is
+  added to what has been signed today, in the transaction that signs, and a
+  payment that would take today past the limit is refused (`6A8F`). A terminal
+  that has been handed the PIN can take one day's limit, and can end the day only
+  by bringing a real block dated a day on. (Before 1.15 the clock was a time
+  signed by a key built into the app, which was not secret, and so bound no
+  terminal built to cheat. Earlier
   tries: a limit on one PIN entry, which a terminal that had the PIN walked
   round; then an allowance that only went down and only an owner's proof
   raised, which held against a terminal but stopped a card whose owner's phone
@@ -50,7 +51,7 @@ and its proofs in 5.6, and the daily limit and the clock in 5.7; the whole text
 of those three is `docs/FOXY-CARD-DAILY-LIMIT.md`. The applet's version is 1.1
 (`SELECT` answers `01 01`) and the format byte is 3: `GET_INFO` is 29 bytes (the
 first 16 did not move), `CHANGE_PIN` and `LOCK_CARD` carry an owner's proof, and
-`33`, `34`, `35`, `41`, `42`, `43`, `44` and `45` are the instructions of the
+`33`, `34`, `36`, `37`, `41`, `42`, `43`, `44` and `45` are the instructions of the
 limit, the clock and the owner. The applet has run on a real card (below), but
 only test cards, so none is expected in the field with an older shape.
 
@@ -126,8 +127,8 @@ fails here. On the J3R180 used here the applet installed the first time.
 
 A card straight from the install has no PIN and no owner. It holds nothing and
 cannot be loaded, but any reader in range can give it a PIN and an owner of its
-own choosing (`SET_PIN`, `SET_OWNER`). Set it up (the PIN, the record with the
-time key, then the owner: spec 5.6) before it leaves your hands.
+own choosing (`SET_PIN`, `SET_OWNER`). Set it up (the PIN, the record, then the
+owner: spec 5.6) before it leaves your hands.
 
 After that, the phone: Foxy (https://github.com/getfoxy/iOS) built with the NFC
 entitlement (`tools/flashcard.entitlements` there), MENU, FLASHCARD, TAP CARD.
