@@ -127,7 +127,8 @@ public class CashuApplet extends Applet {
     // 1.13 shapes the wait so that a payer can tell by feel that a payment was over the limit: nothing
     // within it (change or no change: the phone says change is coming, the card does not), about five
     // seconds over it, and two more for every further limit's worth (`waitsFor`). The work of making the
-    // change counts toward it.
+    // change counts toward it. And one payment a tap at full speed: a second one in the same time in the
+    // field is slowed as one over the limit, unless the owner's grant is in the tap.
     static final byte VERSION_MINOR = (byte) 0x0D;
     static final byte FORMAT        = (byte) 0x04;
 
@@ -767,7 +768,12 @@ public class CashuApplet extends Applet {
      * that first telling left it, [2..5] where that was.
      */
     private byte[] timeTold;
-    /** Whether this time in the field has an entry in the log yet. Gone with the power, not with a SELECT. */
+    /**
+     * This time in the field (gone with the power, not with a SELECT): [0]
+     * whether it has an entry in the log yet; [1] whether a payment has been
+     * signed in it, so that a second one is slowed (6a: one payment a tap at
+     * full speed, unless the owner's grant is in this tap).
+     */
     private byte[] tapOpen;
     private MessageDigest sha;
     /** The hash of the message a payment's one signature is over, kept from SPEND_ALL_BEGIN to SPEND_ALL_SIGN. */
@@ -859,7 +865,7 @@ public class CashuApplet extends Applet {
         cardReceipts    = new byte[RECEIPTS_LEN];
         allOut          = JCSystem.makeTransientByteArray((short) 33, JCSystem.CLEAR_ON_DESELECT);
         timeTold        = JCSystem.makeTransientByteArray((short) 6, JCSystem.CLEAR_ON_RESET);
-        tapOpen         = JCSystem.makeTransientByteArray((short) 1, JCSystem.CLEAR_ON_RESET);
+        tapOpen         = JCSystem.makeTransientByteArray((short) 2, JCSystem.CLEAR_ON_RESET);
         sha             = MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
         shaAll          = MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
         allSlots        = JCSystem.makeTransientByteArray(ALL_MOST, JCSystem.CLEAR_ON_DESELECT);
@@ -1885,7 +1891,8 @@ public class CashuApplet extends Applet {
                 allState[0] = (byte) 0;
                 throw e;
             }
-            waits = waitsFor(allNet, (short) 0, (short)(allState[6] & 0xFF), allState[7] != (byte) 0);
+            waits = waitsFor(allNet, (short) 0, (short)(allState[6] & 0xFF), allState[7] != (byte) 0,
+                             tapOpen[1] == (byte) 1 && loadGrant[0] != (byte) 1);
             Util.setShort(allState, (short) 2, waits);
             allState[4] = (byte)(waits > 0 ? 1 : 0);
         }
@@ -1961,6 +1968,8 @@ public class CashuApplet extends Applet {
         // committed: the status bytes follow, here or at the card's next command
         finishBurn();
         tapOpen[0] = (byte) 1;
+        // a payment in this tap: another in the same tap is slowed (6a)
+        tapOpen[1] = (byte) 1;
 
         /* The receipt, after the burn and by itself: what it says is true
          * only of a payment that was made, and it is kept out of the payment's
@@ -2072,46 +2081,62 @@ public class CashuApplet extends Applet {
     /**
      * What the payment costs in time: the signatures of work to be done at
      * SPEND_ALL_SIGN before it is signed (6a), shaped so that a payer can
-     * tell by feel what kind of payment it was.
+     * feel that a payment was over the limit.
      *
      * With a limit on one payment of L and S leaving the card (`sum`: the
      * pieces less the card's own change): within L (or within a thirty-second
      * over it, see below), nothing, change or no change — that change is
-     * coming is the phone's to say, not the card's; over L,
-     * WAIT_OVER_SIGNS for the first limit's worth over (about five seconds)
-     * and WAIT_MORE_SIGNS for every further one, whole or in part (two
-     * seconds each). The change outputs the card made (`made`), about 0.4 s
-     * of its work each, count as that many signatures done already. Nothing
-     * is remembered from one payment to the next and no clock is asked, so
-     * there is nothing a terminal can replay or reset to make it less; what a
-     * terminal can do is take the money a limit at a time, each a signature
-     * of its own, which is the rate this limit holds it to. No limit: 0. A
-     * sum that wrapped (`carry`) waits the most.
+     * coming is the phone's to say, not the card's; over L, WAIT_OVER_SIGNS
+     * for the first limit's worth over (about five seconds) and
+     * WAIT_MORE_SIGNS for every further one, whole or in part (two seconds
+     * each). The change outputs the card made (`made`), about 0.4 s of its
+     * work each, count as that many signatures done already.
+     *
+     * One payment a tap at full speed: a second payment signed in the same
+     * time in the field (`second`: one was, and the owner's grant is not in
+     * this tap) is slowed as one over the limit is, limit or no limit. A
+     * terminal that has the PIN could otherwise take a limit's worth a second
+     * for as long as the card is held; now each costs it about five seconds,
+     * or a fresh tap, which asks the PIN again. The owner's phone, which takes
+     * a whole card off in more than one signature where its pieces have more
+     * than one date, gives its grant first and is not slowed.
+     *
+     * Nothing is remembered from one payment to the next but that, and no
+     * clock is asked, so there is nothing a terminal can replay or reset to
+     * make it less. No limit: 0, or WAIT_OVER_SIGNS for a second payment in
+     * the tap. A sum that wrapped (`carry`) waits the most.
      */
-    private short waitsFor(byte[] sum, short sumOff, short made, boolean carry) {
-        if (isZero(cardRecord, CARD_TAP_LIMIT_OFFSET, (short) 4)) return (short) 0;
-        if (carry) return WAIT_SIGNS_MOST;
-        Util.arrayCopyNonAtomic(sum, sumOff, scratch, X_TAP, (short) 4);
-        /* Within the limit, or within a thirty-second over it: a limit set in
-         * another money is so many sats at one moment and a price in that
-         * money so many at another, and a payment of exactly the limit lands
-         * a few sats over. That is one limit's worth, not two. */
-        Util.arrayCopyNonAtomic(cardRecord, CARD_TAP_LIMIT_OFFSET, scratch, X_NUM, (short) 4);
-        div32Uint32(scratch, X_NUM);
-        short units;
-        if (addUint32Carry(scratch, X_NUM, cardRecord, CARD_TAP_LIMIT_OFFSET) != 0 || cmpUint32(scratch, X_TAP, scratch, X_NUM) <= 0) {
-            units = 1;
+    private short waitsFor(byte[] sum, short sumOff, short made, boolean carry, boolean second) {
+        short waits;
+        if (isZero(cardRecord, CARD_TAP_LIMIT_OFFSET, (short) 4)) {
+            if (!second) return (short) 0;
+            waits = WAIT_OVER_SIGNS;
         } else {
-            // how many limits' worth leave the card, a part counting as one: the whole ones taken off, then the part
-            units = 0;
-            while (units < WAIT_UNITS_MOST && cmpUint32(scratch, X_TAP, cardRecord, CARD_TAP_LIMIT_OFFSET) > 0) {
-                subUint32(scratch, X_TAP, cardRecord, CARD_TAP_LIMIT_OFFSET);
-                units++;
+            if (carry) return WAIT_SIGNS_MOST;
+            Util.arrayCopyNonAtomic(sum, sumOff, scratch, X_TAP, (short) 4);
+            /* Within the limit, or within a thirty-second over it: a limit set in
+             * another money is so many sats at one moment and a price in that
+             * money so many at another, and a payment of exactly the limit lands
+             * a few sats over. That is one limit's worth, not two. */
+            Util.arrayCopyNonAtomic(cardRecord, CARD_TAP_LIMIT_OFFSET, scratch, X_NUM, (short) 4);
+            div32Uint32(scratch, X_NUM);
+            short units;
+            if (addUint32Carry(scratch, X_NUM, cardRecord, CARD_TAP_LIMIT_OFFSET) != 0 || cmpUint32(scratch, X_TAP, scratch, X_NUM) <= 0) {
+                units = 1;
+            } else {
+                // how many limits' worth leave the card, a part counting as one: the whole ones taken off, then the part
+                units = 0;
+                while (units < WAIT_UNITS_MOST && cmpUint32(scratch, X_TAP, cardRecord, CARD_TAP_LIMIT_OFFSET) > 0) {
+                    subUint32(scratch, X_TAP, cardRecord, CARD_TAP_LIMIT_OFFSET);
+                    units++;
+                }
+                if (units < WAIT_UNITS_MOST && !isZero(scratch, X_TAP, (short) 4)) units++;
             }
-            if (units < WAIT_UNITS_MOST && !isZero(scratch, X_TAP, (short) 4)) units++;
+            // a second payment in the tap is at least one over the limit
+            if (second && units <= 1) units = 2;
+            if (units <= 1) return (short) 0;
+            waits = (short)(WAIT_OVER_SIGNS + WAIT_MORE_SIGNS * (units - 2));
         }
-        if (units <= 1) return (short) 0;
-        short waits = (short)(WAIT_OVER_SIGNS + WAIT_MORE_SIGNS * (units - 2));
         // the change already made is work done
         waits -= made;
         return waits > 0 ? waits : (short) 0;

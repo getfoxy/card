@@ -541,7 +541,7 @@ class SchnorrHWMathTest {
      * memory). 1.12 asks for 941 in 16: the change and the net of a payment, four bytes each. A larger figure
      * has to be measured on a card first.
      */
-    static final int RAM_ON_DESELECT_MOST = 941, RAM_ON_RESET_MOST = 7, RAM_ARRAYS_MOST = 16;
+    static final int RAM_ON_DESELECT_MOST = 941, RAM_ON_RESET_MOST = 8, RAM_ARRAYS_MOST = 16;
 
     /** Every `static final short|byte|int NAME = expr;` of the applet's two sources. */
     private static java.util.Map<String, String> constantExpressions(String... sources) {
@@ -614,10 +614,10 @@ class SchnorrHWMathTest {
     }
 
     @Test
-    @DisplayName("RAM budget: the two constructors ask for no more than 941 bytes of CLEAR_ON_DESELECT, 7 of CLEAR_ON_RESET, in no more than 16 arrays: the figures of 1.12, which are 1.7's and a payment's change and net")
+    @DisplayName("RAM budget: the two constructors ask for no more than 941 bytes of CLEAR_ON_DESELECT, 8 of CLEAR_ON_RESET, in no more than 16 arrays: the figures of 1.12, which are 1.7's and a payment's change and net")
     void transientMemoryIsWithinTheBuildThatInstallsOnTheChip() throws Exception {
         int[] asked = transientMemoryAskedFor();
-        String why = " These are the figures of 1.12 (941 bytes that are cleared on deselect, 7 on reset, in 16 arrays: 1.7's 931 in 14, and the change and the net of a payment). "
+        String why = " These are the figures of 1.12 (941 bytes that are cleared on deselect, 8 on reset, in 16 arrays: 1.7's 931 in 14, and the change and the net of a payment). "
             + "1.9 asked for 1,030 in 15 and the chip refused to install it (6F00); jCardSim has no limit and says nothing. A larger figure has to be measured on a card first.";
         org.junit.jupiter.api.Assertions.assertTrue(asked[0] <= RAM_ON_DESELECT_MOST, "CLEAR_ON_DESELECT is " + asked[0] + " bytes, over " + RAM_ON_DESELECT_MOST + "." + why);
         org.junit.jupiter.api.Assertions.assertTrue(asked[1] <= RAM_ON_RESET_MOST, "CLEAR_ON_RESET is " + asked[1] + " bytes, over " + RAM_ON_RESET_MOST + "." + why);
@@ -625,7 +625,7 @@ class SchnorrHWMathTest {
         // a parse that found nothing would prove nothing
         org.junit.jupiter.api.Assertions.assertEquals(16, asked[2], "the parse found the 14 of CashuApplet and the 2 of SchnorrHW");
         org.junit.jupiter.api.Assertions.assertEquals(941, asked[0], "and they add up: CashuApplet 397 and SchnorrHW 544");
-        org.junit.jupiter.api.Assertions.assertEquals(7, asked[1]);
+        org.junit.jupiter.api.Assertions.assertEquals(8, asked[1]);
     }
 
     @Test

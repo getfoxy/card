@@ -362,6 +362,17 @@ as 255 do, which is about eight minutes and so never. (Before 1.13, 1.12
 counted four signatures for every limit's worth, a part counting as one;
 before 1.12 the first `L` was free and the pieces were counted whole.)
 
+**One payment a tap at full speed.** A second payment signed in the same time
+in the field waits as one over the limit does — about five seconds, and two
+more for every limit's worth of it — whether or not there is a limit, unless
+the owner's grant (`ALLOW_LOAD`) is in the tap. A terminal that holds the PIN
+could otherwise take a limit's worth a second for as long as the card is held,
+each payment signed at once; now each costs it five seconds, or a fresh tap,
+which asks the PIN again. The owner's phone, which takes a whole card off in
+more than one signature where its pieces have more than one date, gives its
+grant first and is not slowed. The change tap and a refund are loads, not
+payments, and are not touched by this.
+
 **What a wait is.** The card cannot sleep and has no timer. The one thing on it
 whose duration is the chip's own, and that no terminal can shorten, is a
 signature: about three quarters of a second, measured, and very steady. So the
