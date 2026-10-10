@@ -341,22 +341,23 @@ has nothing to replay.
 the card for good — the pieces named at `SPEND_ALL_BEGIN`, less the change the
 card makes for itself (`SPEND_ALL_CHANGE`, software 1.12; section 6d) — worked
 out at the first `SPEND_ALL_SIGN`, when the change is known, and shaped
-(software 1.13) so that whoever holds the card can tell the three kinds of
-payment apart by feel:
+(software 1.13) so that whoever holds the card can feel that a payment was over
+the limit:
 
-    S ≤ L, no change     waits = 0
-    S ≤ L, with change   waits = WAIT_CHANGE_SIGNS                                  (3: about two seconds)
+    S ≤ L                waits = 0                                                (change or no change)
     S > L                waits = WAIT_OVER_SIGNS + WAIT_MORE_SIGNS × (ceil(S / L) − 2)   (7 + 3 for each further limit's worth: about five seconds, then two each)
 
 less one for every change output the card made in this payment, which is work
-of about the same size done already; never below 0. "Within `L`" is `S ≤ L +
+of about the same size done already; never below 0. That change is coming is
+the phone's to say, not the card's: the till's phone buzzes three times as the
+first tap ends with change owed. "Within `L`" is `S ≤ L +
 L/32`: a limit set in another money is so many sats at one moment and a price
 in that money so many at another, so a payment of exactly the limit lands a
 few sats over, and that is not "over the limit". So a payment within the
 limit that makes no change goes at once (about two seconds in the hand, all of
-it reading and signing); one with change holds the card about two seconds
-longer; one over the limit about five seconds longer, and two more for every
-further limit's worth. `L` of 0 is no limit. Past 255 limits a payment waits
+it reading and signing, plus about half a second for each change output the
+card makes); one over the limit about five seconds longer, and two more for
+every further limit's worth. `L` of 0 is no limit. Past 255 limits a payment waits
 as 255 do, which is about eight minutes and so never. (Before 1.13, 1.12
 counted four signatures for every limit's worth, a part counting as one;
 before 1.12 the first `L` was free and the pieces were counted whole.)

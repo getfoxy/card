@@ -92,21 +92,21 @@ class CashuAppletTest {
     // any more: every test is checked for it at the end (noPaymentLimitRefusal), and the applet's source for the word.
     static final int SW_NO_LONGER_ANSWERED  = 0x6A95;
     static final int SW_TOO_MANY            = 0x6A96;
-    /** The wait (6a) in answers of SPEND_ALL_SIGN: the applet's three sizes, for change within the limit, for the first limit's worth over, and for every further one. */
-    static final int WAIT_CHANGE_SIGNS = 3, WAIT_OVER_SIGNS = 7, WAIT_MORE_SIGNS = 3;
+    /** The wait (6a) in answers of SPEND_ALL_SIGN: the applet's two sizes, for the first limit's worth over the limit and for every further one. */
+    static final int WAIT_OVER_SIGNS = 7, WAIT_MORE_SIGNS = 3;
     /** The most limits' worth a payment is counted for: the applet's WAIT_UNITS_MOST. */
     static final int WAIT_UNITS_MOST = 255;
     /**
      * The rule of 1.13: what a payment of which `net` sats leave the card waits under a limit of `limit`, having made `made`
-     * change outputs. Within the limit, or within a thirty-second over it (a price pegged in another money), with no change:
-     * nothing; with change, WAIT_CHANGE_SIGNS; over it, WAIT_OVER_SIGNS and WAIT_MORE_SIGNS for every further limit's worth,
-     * whole or in part, 255 limits' worth at most; less one for every change output made, never below 0.
+     * change outputs. Within the limit, or within a thirty-second over it (a price pegged in another money), change or no
+     * change: nothing; over it, WAIT_OVER_SIGNS and WAIT_MORE_SIGNS for every further limit's worth, whole or in part, 255
+     * limits' worth at most; less one for every change output made, never below 0.
      */
     static int waitsRule(long limit, long net, int made) {
         if (limit <= 0) return 0;
         long units = net <= limit + limit / 32 ? 1 : Math.min(WAIT_UNITS_MOST, (net + limit - 1) / limit);
-        int w = units <= 1 ? (made > 0 ? WAIT_CHANGE_SIGNS : 0) : WAIT_OVER_SIGNS + WAIT_MORE_SIGNS * (int)(units - 2);
-        return Math.max(0, w - made);
+        if (units <= 1) return 0;
+        return Math.max(0, WAIT_OVER_SIGNS + WAIT_MORE_SIGNS * (int)(units - 2) - made);
     }
     /** So the most a payment waits: 1020 answers before the signature. */
     static final int WAITS_MOST = WAIT_OVER_SIGNS + WAIT_MORE_SIGNS * (WAIT_UNITS_MOST - 2);
@@ -5846,7 +5846,7 @@ class CashuAppletTest {
     }
 
     @Test
-    @DisplayName("The limits are held to what leaves the card: a piece larger than the day's limit pays a small price with change, and the limit on a payment waits by the net; a payment within it that makes change waits about two seconds' worth, less the change's own work")
+    @DisplayName("The limits are held to what leaves the card: a piece larger than the day's limit pays a small price with change, and the limit on a payment waits by the net; a payment within it that makes change waits nothing: that change is coming is the phone's to say")
     void testTheLimitsAreHeldToWhatLeavesTheCard() throws Exception {
         readyWithLimit(100);
         assertEquals(SW_OK, setLimits(100, 100));
@@ -5858,7 +5858,7 @@ class CashuAppletTest {
         assertEquals(SW_OK, sw(beginCommand(0)));
         assertEquals(SW_OK, change(60).getSW());
         assertEquals(SW_OK, signAll().getSW(), "150 less 60 is 90: within the day");
-        assertEquals(waitsRule(100, 90, 1), waitsTaken(), "90 is within the limit on a payment, and makes change: the change's wait, less the one output's own work");
+        assertEquals(0, waitsTaken(), "90 is within the limit on a payment: no wait, change or no change");
         assertEquals(90, spentToday());
         assertEquals(SW_OK, sw(beginCommand(1)));
         assertEquals(SW_OK, change(39).getSW());
@@ -7088,8 +7088,7 @@ class CashuAppletTest {
     @DisplayName("The wait is worked out at the first SIGN, after the day has been asked, from what leaves the card and the limit alone: no clock is read, nothing is remembered, nothing is written; the beginning works out nothing, since the change is not known yet")
     void testTheWaitIsWorkedOutFromThePaymentAlone() throws Exception {
         String code = appletCode();
-        assertEquals(WAIT_CHANGE_SIGNS, CashuApplet.WAIT_CHANGE_SIGNS, "these tests count in the applet's sizes: three signatures for change within the limit");
-        assertEquals(WAIT_OVER_SIGNS, CashuApplet.WAIT_OVER_SIGNS, "seven for the first limit's worth over");
+        assertEquals(WAIT_OVER_SIGNS, CashuApplet.WAIT_OVER_SIGNS, "these tests count in the applet's sizes: seven signatures for the first limit's worth over");
         assertEquals(WAIT_MORE_SIGNS, CashuApplet.WAIT_MORE_SIGNS, "three for every further one");
         assertEquals(WAIT_UNITS_MOST, CashuApplet.WAIT_UNITS_MOST, "and stop where it stops: 255 limits' worth");
         String begin = body(code, "private void processSpendAllBegin(", "private void processSpendAllOutputs(");
@@ -9055,10 +9054,7 @@ class CashuAppletTest {
         int changeAgainAt = out.length();
         changeA = say(out, "the card's own change: 40, a fresh output", "exact", SW_OK, new CommandAPDU(CLA, INS_SPEND_ALL_CHANGE, 0, 0, u32(40), 33));
         changeB = say(out, "and 20, another", "exact", SW_OK, new CommandAPDU(CLA, INS_SPEND_ALL_CHANGE, 0, 0, u32(20), 33));
-        for (int k = 1; k <= 1; k++) {
-            assertNotYet(say(out, "90 leaves the card, within the limit, with change: wait " + k + " of 1, the two change outputs made counting for two", "exact", SW_OK, SIGN_ALL), "not yet");
-        }
-        ResponseAPDU changeSigned = say(out, "the signature, over the pieces, the terminal's output and the card's two", "sigall", SW_OK, SIGN_ALL);
+        ResponseAPDU changeSigned = say(out, "90 leaves the card, within the limit: no wait for change; the signature, over the pieces, the terminal's output and the card's two", "sigall", SW_OK, SIGN_ALL);
         assertEquals(64, changeSigned.getData().length);
         say(out, "the info: the day counted nothing, having no limit; the log says 90", "exact", SW_OK, infoTap);
         ResponseAPDU opened = say(out, "the openings of the change: two, pending", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_CHANGE, 0, 0, 256));

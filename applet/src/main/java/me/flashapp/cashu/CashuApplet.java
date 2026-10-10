@@ -124,9 +124,10 @@ public class CashuApplet extends Applet {
     // built by the card, so that nothing a terminal names can take them; the limits and the wait are
     // held to what leaves the card for good, the pieces less that change; and the openings of change
     // not yet handed back can be read (GET_CHANGE) by any phone that would finish the pieces.
-    // 1.13 shapes the wait so that a payer can tell the three cases apart by feel: nothing within the
-    // limit with no change; about two seconds within it with change; about five seconds over it, and two
-    // more for every further limit's worth (`waitsFor`). The work of making the change counts toward it.
+    // 1.13 shapes the wait so that a payer can tell by feel that a payment was over the limit: nothing
+    // within it (change or no change: the phone says change is coming, the card does not), about five
+    // seconds over it, and two more for every further limit's worth (`waitsFor`). The work of making the
+    // change counts toward it.
     static final byte VERSION_MINOR = (byte) 0x0D;
     static final byte FORMAT        = (byte) 0x04;
 
@@ -608,9 +609,8 @@ public class CashuApplet extends Applet {
 
     /** What one limit's worth past the first costs a payment: this many signatures of work, about three seconds on the chip. */
     // The wait (6a), in signatures of the card's own work (about 0.6 s each on the chip, 0.7 over NFC):
-    // for a payment within the limit that makes change; for the first limit's worth over it; and for
-    // every further limit's worth. Each change output made (about 0.4 s) counts as one of them done.
-    static final short WAIT_CHANGE_SIGNS = (short) 3;
+    // for the first limit's worth over the limit, and for every further limit's worth. Each change output
+    // made (about 0.4 s) counts as one of them done. Within the limit there is no wait.
     static final short WAIT_OVER_SIGNS   = (short) 7;
     static final short WAIT_MORE_SIGNS   = (short) 3;
     /** The most limits' worth a payment is counted as: past this it waits as 255 do (about eight minutes). */
@@ -2076,8 +2076,8 @@ public class CashuApplet extends Applet {
      *
      * With a limit on one payment of L and S leaving the card (`sum`: the
      * pieces less the card's own change): within L (or within a thirty-second
-     * over it, see below) and no change, nothing; within L with change,
-     * WAIT_CHANGE_SIGNS (about two seconds); over L,
+     * over it, see below), nothing, change or no change — that change is
+     * coming is the phone's to say, not the card's; over L,
      * WAIT_OVER_SIGNS for the first limit's worth over (about five seconds)
      * and WAIT_MORE_SIGNS for every further one, whole or in part (two
      * seconds each). The change outputs the card made (`made`), about 0.4 s
@@ -2110,9 +2110,8 @@ public class CashuApplet extends Applet {
             }
             if (units < WAIT_UNITS_MOST && !isZero(scratch, X_TAP, (short) 4)) units++;
         }
-        short waits;
-        if (units <= 1) waits = made > 0 ? WAIT_CHANGE_SIGNS : (short) 0;
-        else waits = (short)(WAIT_OVER_SIGNS + WAIT_MORE_SIGNS * (units - 2));
+        if (units <= 1) return (short) 0;
+        short waits = (short)(WAIT_OVER_SIGNS + WAIT_MORE_SIGNS * (units - 2));
         // the change already made is work done
         waits -= made;
         return waits > 0 ? waits : (short) 0;
