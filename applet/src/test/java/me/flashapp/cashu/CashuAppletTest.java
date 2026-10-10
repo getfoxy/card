@@ -8662,7 +8662,7 @@ class CashuAppletTest {
         String hwCode = SchnorrHWMathTest.stripCommentsAndCharLiterals(hw).replaceAll("\\s+", " ");
         int agree = hwCode.indexOf("short agree(ECPrivateKey priv, byte[] pub, short pubOff, short pubLen, byte[] out, short outOff) {");
         assertTrue(agree > 0 && hwCode.indexOf("ecdh.init(priv); return ecdh.generateSecret(pub, pubOff, pubLen, out, outOff); }", agree) == hwCode.indexOf("ecdh.init(priv);", agree), "SchnorrHW.agree: sets the given key, then agrees, and does no more");
-        assertEquals(3, count(hwCode, "ecdh.init("), "the signer's agreement is initialised in the install probe, in sign (its own key, every time) and in agree");
+        assertEquals(2, count(hwCode, "ecdh.init("), "the signer's agreement is initialised in sign (its own key, every time) and in agree");
         assertTrue(hwCode.indexOf("tmpPriv.setS(sc, SC_K, (short)32); ecdh.init(tmpPriv);") > 0, "sign sets its own key and initialises the agreement with it before every use, so that agree leaves nothing behind");
     }
 

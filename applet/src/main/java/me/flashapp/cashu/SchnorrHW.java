@@ -218,8 +218,7 @@ final class SchnorrHW {
         // DELTA is defined as 2^256 − N, i.e. N + DELTA must be exactly 2^256:
         // a 256-bit sum of zero with a carry out. mulModN's whole reduction
         // rests on that identity, so it is checked rather than commented.
-        // Uses sc as scratch — allocated already, and nothing has signed yet at
-        // install time. probeEcdhFraming() clobbers the same bytes below.
+        // Uses sc as scratch: allocated already, and nothing has signed yet.
         if (add32(N, (short)0, DELTA, (short)0, sc, (short)0) != (short)1) {
             ISOException.throwIt(CashuApplet.SW_CRYPTO_ERROR);
         }
@@ -233,72 +232,19 @@ final class SchnorrHW {
             }
         }
 
-        // SHA256("BIP0340/aux")  — tag is 11 ASCII bytes
+        // The three tags, hashed once. Written out here rather than kept as
+        // constants of the class: each constant is one more entry in the
+        // package's constant pool, and the chip takes only so many at an
+        // install (docs/FOXY-CARD-HARDWARE.md). A fresh digest is in its
+        // initial state, and doFinal leaves it there for the next.
         byte[] tagAux = { 'B','I','P','0','3','4','0','/','a','u','x' };
-        sha256.reset();
         sha256.doFinal(tagAux, (short)0, (short)11, tagHashAux, (short)0);
-
-        // SHA256("BIP0340/nonce")  — tag is 13 ASCII bytes
         byte[] tagNonce = { 'B','I','P','0','3','4','0','/','n','o','n','c','e' };
-        sha256.reset();
         sha256.doFinal(tagNonce, (short)0, (short)13, tagHashNonce, (short)0);
-
-        // SHA256("BIP0340/challenge")  — tag is 17 ASCII bytes
         byte[] tagChallenge = {
             'B','I','P','0','3','4','0','/','c','h','a','l','l','e','n','g','e'
         };
-        sha256.reset();
         sha256.doFinal(tagChallenge, (short)0, (short)17, tagHashChallenge, (short)0);
-
-        // Probe using the transient scratchpad rather than a fresh array: a
-        // `new byte[80]` here would be persistent EEPROM that is orphaned the
-        // moment init() returns and never reclaimed, which is precisely what
-        // the memory-discipline note on this class forbids. `sc` is already
-        // allocated, is 256 B, and nothing has signed yet at install time.
-        probeEcdhFraming(sc);
-    }
-
-    /**
-     * Verify once, at install time, that ALG_EC_SVDP_DH_PLAIN_XY returns the
-     * 65-byte {@code 04 ‖ X ‖ Y} framing that sign() indexes into.
-     *
-     * Deliberately scoped to the ECDH framing and nothing else. An earlier
-     * version also asserted that {@code getS} left-pads to 32 bytes, which was
-     * wrong twice over: it asserted it on {@code tmpPriv} — a key loaded here
-     * by {@code setS}, not the {@code cardPrivKey} that {@code sign()} actually
-     * reads — so a card that echoes back whatever length setS was handed while
-     * reporting a stripped length for generated keys sailed through the probe
-     * and failed in sign(); and a card returning fewer than 32 bytes is
-     * spec-legal, so the check refused to install on hardware that works.
-     * sign() right-aligns the scalar instead.
-     *
-     * The framing is a property of the card, not of the message, so a card that
-     * returns the bare 64-byte X‖Y is wrong on the very first tap and wrong on
-     * every tap after it. Discovering that inside sign() is far too late:
-     * CashuApplet marks the proof SPENT before it calls doSign, so an
-     * incompatible card would burn one slot per attempt and hand back 6F00 each
-     * time until the balance was gone — with the proofs unredeemable, because
-     * they are P2PK-locked to a key whose card can no longer sign. Throwing here
-     * fails the {@code gp --install} instead, before a single proof is loaded.
-     *
-     * @param probe scratch of at least 80 bytes, owned by the caller. Sized well
-     *              above the expected 65 so that a card returning more trips the
-     *              length check below rather than an
-     *              ArrayIndexOutOfBoundsException. Its first 80 bytes are
-     *              clobbered.
-     */
-    private void probeEcdhFraming(byte[] probe) {
-        // Zero the scalar explicitly — the buffer is shared scratch, not a
-        // freshly allocated (and therefore zeroed) array.
-        Util.arrayFillNonAtomic(probe, (short)0, (short)80, (byte)0);
-        probe[31] = (byte)0x02;              // throwaway scalar d = 2, so R = 2G
-        tmpPriv.setS(probe, (short)0, (short)32);
-
-        ecdh.init(tmpPriv);
-        short len = ecdh.generateSecret(G, (short)0, (short)65, probe, (short)0);
-        if (len != (short)65 || probe[0] != (byte)0x04) {
-            ISOException.throwIt(CashuApplet.SW_CRYPTO_ERROR);
-        }
     }
 
     // ── Public API ────────────────────────────────────────────────────────
@@ -414,9 +360,8 @@ final class SchnorrHW {
         // unexpected framing would silently shift both by one byte and emit
         // well-formed signatures that no mint can verify.
         //
-        // probeEcdhFraming() already rejected such a card at install time, so
-        // this is a cheap assert on a condition that cannot change between taps;
-        // it is not the place the incompatibility is meant to be discovered.
+        // A card that frames it otherwise is found out here, at its first
+        // signature, and signs nothing.
         short rLen = ecdh.generateSecret(G, (short)0, (short)65, sc, SC_TMP);
         if (rLen != (short)65 || sc[SC_TMP] != (byte)0x04) {
             ISOException.throwIt(CashuApplet.SW_CRYPTO_ERROR);

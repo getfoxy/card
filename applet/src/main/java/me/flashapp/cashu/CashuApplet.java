@@ -1158,13 +1158,16 @@ public class CashuApplet extends Applet {
     private void processGetBalance(APDU apdu) {
         byte[] buf = apdu.getBuffer();
         // Accumulate the uint32 total directly in the outgoing buffer.
-        // JavaCard has no long, so the sum is done byte-wise with carry.
+        // JavaCard has no long, so the sum is done byte-wise with carry. A sum
+        // past 2^32-1 wraps, and the carry out is let go: it cannot happen for
+        // any realistic set of pieces, but the wrap is real behaviour, not an
+        // impossibility (testGetBalanceWrapsPast2Pow32 pins it).
         buf[0] = 0; buf[1] = 0; buf[2] = 0; buf[3] = 0;
         for (short i = 0; i < MAX_PROOFS; i++) {
             short base = (short)(i * PROOF_SIZE);
             if (proofStorage[(short)(base + PROOF_STATUS_OFFSET)] == STATUS_UNSPENT) {
-                addUint32(buf, (short) 0, proofStorage,
-                          (short)(base + PROOF_AMOUNT_OFFSET));
+                addUint32Carry(buf, (short) 0, proofStorage,
+                               (short)(base + PROOF_AMOUNT_OFFSET));
             }
         }
         apdu.setOutgoingAndSend((short) 0, (short) 4);
@@ -1508,15 +1511,9 @@ public class CashuApplet extends Applet {
     private void processSpendAllOutputs(APDU apdu) {
         if (allState[0] != (byte) 1) ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
         // the terminal's outputs come before the card's own change, as the swap will name them: none after it
-        if (allState[6] != (byte) 0) {
-            allState[0] = (byte) 0;
-            ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
-        }
+        if (allState[6] != (byte) 0) dropPayment(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
         short len = apdu.setIncomingAndReceive();
-        if (len < ALL_OUTPUT_LEN || (short)(len % ALL_OUTPUT_LEN) != (short) 0) {
-            allState[0] = (byte) 0;
-            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-        }
+        if (len < ALL_OUTPUT_LEN || (short)(len % ALL_OUTPUT_LEN) != (short) 0) dropPayment(ISO7816.SW_WRONG_LENGTH);
         byte[] buf = apdu.getBuffer();
         // the first output of the payment, for its receipt
         if (allState[5] != (byte) 1) {
@@ -1551,17 +1548,13 @@ public class CashuApplet extends Applet {
         if (allState[0] != (byte) 1) ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
         short len = apdu.setIncomingAndReceive();
         byte[] buf = apdu.getBuffer();
-        if (len != (short) 4) {
-            allState[0] = (byte) 0;
-            ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
-        }
+        if (len != (short) 4) dropPayment(ISO7816.SW_WRONG_LENGTH);
         // the change, with this, may not come to more than the pieces: what leaves the card cannot be less than nothing
         Util.arrayCopyNonAtomic(allChange, (short) 0, scratch, X_TAP, (short) 4);
         if (isZero(buf, ISO7816.OFFSET_CDATA, (short) 4)
             || addUint32Carry(scratch, X_TAP, buf, ISO7816.OFFSET_CDATA) != 0
             || cmpUint32(scratch, X_TAP, allSum, (short) 0) > 0) {
-            allState[0] = (byte) 0;
-            ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+            dropPayment(ISO7816.SW_WRONG_DATA);
         }
         short which = (short) -1;
         for (short k = 0; k < CHANGE_MOST; k++) {
@@ -1570,10 +1563,7 @@ public class CashuApplet extends Applet {
                 break;
             }
         }
-        if (which < 0) {
-            allState[0] = (byte) 0;
-            ISOException.throwIt(SW_NO_SPACE);
-        }
+        if (which < 0) dropPayment(SW_NO_SPACE);
         short open = (short)(which * OPEN_LEN);
         // the opening's amount, keyset and date: the payment's, as every piece of it has them
         short first = (short)((short)(allSlots[0] & 0xFF) * PROOF_SIZE);
@@ -1583,8 +1573,7 @@ public class CashuApplet extends Applet {
         try {
             blindChange(first, open, buf);
         } catch (CryptoException e) {
-            allState[0] = (byte) 0;
-            ISOException.throwIt(SW_CRYPTO_ERROR);
+            dropPayment(SW_CRYPTO_ERROR);
         }
         // the opening is the payment's until it is signed for (SIGN) or given up (BEGIN)
         openState[which] = OPEN_DRAFT;
@@ -1683,6 +1672,12 @@ public class CashuApplet extends Applet {
         reduceModP(buf, (short) 96, scratch, X_OUT);
     }
 
+    /** The payment in hand is given up, and the command refused with `sw`. */
+    private void dropPayment(short sw) {
+        allState[0] = (byte) 0;
+        ISOException.throwIt(sw);
+    }
+
     /** The chip's RSA key for one power over p*p (RSA_PP). */
     private static RSAPrivateKey fieldKey(byte[] d) {
         RSAPrivateKey k = (RSAPrivateKey) KeyBuilder.buildKey(KeyBuilder.TYPE_RSA_PRIVATE, KeyBuilder.LENGTH_RSA_512, false);
@@ -1731,24 +1726,24 @@ public class CashuApplet extends Applet {
         }
     }
 
-    /** The four big-endian bytes at off, divided by 32. */
-    private static void div32Uint32(byte[] a, short off) {
-        short carry = 0;
-        for (short i = 0; i < 4; i++) {
-            short v = (short)(a[(short)(off + i)] & 0xFF);
-            a[(short)(off + i)] = (byte)(((carry << 3) | (v >> 5)) & 0xFF);
-            carry = (short)(v & 0x1F);
+    /** out = a - b over 32 bytes, big-endian (out may be a): the borrow out of the top, 1 where b was the larger. */
+    private static short sub256(byte[] a, short aOff, byte[] b, short bOff, byte[] out, short outOff) {
+        short borrow = 0;
+        for (short i = 31; i >= 0; i--) {
+            short d = (short)((short)(a[(short)(aOff + i)] & 0xFF) - (short)(b[(short)(bOff + i)] & 0xFF) - borrow);
+            if (d < 0) { d += (short) 256; borrow = 1; } else { borrow = 0; }
+            out[(short)(outOff + i)] = (byte) d;
         }
+        return borrow;
     }
 
-    /** v[off..off+64) -= p, as one 64-byte number. */
+    /** v[off..off+64) -= p, as one 64-byte number: the low half less p, and the borrow taken from the high half. */
     private static void subP64(byte[] v, short off) {
-        short borrow = 0;
-        for (short i = 63; i >= 0; i--) {
-            short pb = i >= 32 ? (short)(SECP256K1_P[(short)(i - 32)] & 0xFF) : (short) 0;
-            short d = (short)((short)(v[(short)(off + i)] & 0xFF) - pb - borrow);
+        short borrow = sub256(v, (short)(off + 32), SECP256K1_P, (short) 0, v, (short)(off + 32));
+        for (short i = (short)(off + 31); borrow != 0 && i >= off; i--) {
+            short d = (short)((short)(v[i] & 0xFF) - borrow);
             if (d < 0) { d += (short) 256; borrow = 1; } else { borrow = 0; }
-            v[(short)(off + i)] = (byte) d;
+            v[i] = (byte) d;
         }
     }
 
@@ -1770,24 +1765,12 @@ public class CashuApplet extends Applet {
             carry = (short)((sum >> 8) & 0xFF);
         }
         // under 2p before, so one taking of p at most; the sum cannot pass 2^256 (p + 7 does not)
-        if (cmp256(v, off, SECP256K1_P, (short) 0) >= 0) {
-            short borrow = 0;
-            for (short i = 31; i >= 0; i--) {
-                short d = (short)((short)(v[(short)(off + i)] & 0xFF) - (short)(SECP256K1_P[i] & 0xFF) - borrow);
-                if (d < 0) { d += (short) 256; borrow = 1; } else { borrow = 0; }
-                v[(short)(off + i)] = (byte) d;
-            }
-        }
+        if (cmp256(v, off, SECP256K1_P, (short) 0) >= 0) sub256(v, off, SECP256K1_P, (short) 0, v, off);
     }
 
     /** The 32 bytes at off, under p and not zero: p - v. */
     private static void negateModP(byte[] v, short off) {
-        short borrow = 0;
-        for (short i = 31; i >= 0; i--) {
-            short d = (short)((short)(SECP256K1_P[i] & 0xFF) - (short)(v[(short)(off + i)] & 0xFF) - borrow);
-            if (d < 0) { d += (short) 256; borrow = 1; } else { borrow = 0; }
-            v[(short)(off + i)] = (byte) d;
-        }
+        sub256(SECP256K1_P, (short) 0, v, off, v, off);
     }
 
     /**
@@ -2113,24 +2096,33 @@ public class CashuApplet extends Applet {
             waits = WAIT_OVER_SIGNS;
         } else {
             if (carry) return WAIT_SIGNS_MOST;
-            Util.arrayCopyNonAtomic(sum, sumOff, scratch, X_TAP, (short) 4);
             /* Within the limit, or within a thirty-second over it: a limit set in
              * another money is so many sats at one moment and a price in that
              * money so many at another, and a payment of exactly the limit lands
-             * a few sats over. That is one limit's worth, not two. */
-            Util.arrayCopyNonAtomic(cardRecord, CARD_TAP_LIMIT_OFFSET, scratch, X_NUM, (short) 4);
-            div32Uint32(scratch, X_NUM);
+             * a few sats over. That is one limit's worth, not two. The sum is
+             * copied, to be taken from; the limit's thirty-second is its four
+             * bytes shifted down by five, written beside it. Both by hand: a
+             * call is a place in the package the chip relocates at an install,
+             * and it takes only so many (docs/FOXY-CARD-HARDWARE.md). */
+            short bits = 0;
+            for (short i = 0; i < 4; i++) {
+                scratch[(short)(X_TAP + i)] = sum[(short)(sumOff + i)];
+                short v = (short)(cardRecord[(short)(CARD_TAP_LIMIT_OFFSET + i)] & 0xFF);
+                scratch[(short)(X_NUM + i)] = (byte)(((bits << 3) | (v >> 5)) & 0xFF);
+                bits = (short)(v & 0x1F);
+            }
             short units;
             if (addUint32Carry(scratch, X_NUM, cardRecord, CARD_TAP_LIMIT_OFFSET) != 0 || cmpUint32(scratch, X_TAP, scratch, X_NUM) <= 0) {
                 units = 1;
             } else {
-                // how many limits' worth leave the card, a part counting as one: the whole ones taken off, then the part
+                // how many limits' worth leave the card, a part counting as one: the whole ones are taken off while
+                // more than one is there, so what is left is never nothing, and is the part
                 units = 0;
                 while (units < WAIT_UNITS_MOST && cmpUint32(scratch, X_TAP, cardRecord, CARD_TAP_LIMIT_OFFSET) > 0) {
                     subUint32(scratch, X_TAP, cardRecord, CARD_TAP_LIMIT_OFFSET);
                     units++;
                 }
-                if (units < WAIT_UNITS_MOST && !isZero(scratch, X_TAP, (short) 4)) units++;
+                if (units < WAIT_UNITS_MOST) units++;
             }
             // a second payment in the tap is at least one over the limit
             if (second && units <= 1) units = 2;
@@ -3137,28 +3129,6 @@ public class CashuApplet extends Applet {
     // Utility
     // -------------------------------------------------------------------------
 
-    /**
-     * Big-endian 32-bit add: acc[accOff..accOff+3] += src[srcOff..srcOff+3].
-     *
-     * JavaCard has no long and int is optional, so the addition is performed
-     * byte-wise with an explicit carry.
-     *
-     * Overflow past 2^32-1 wraps silently and is NOT detected. It cannot occur
-     * for any realistic denomination set (32 slots of sane uint32 amounts stay
-     * far below 2^32-1), but the wrap is real behaviour, not an impossibility —
-     * see testGetBalanceWrapsPast2Pow32, which pins it.
-     */
-    private static void addUint32(byte[] acc, short accOff,
-                                  byte[] src, short srcOff) {
-        short carry = 0;
-        for (short i = 3; i >= 0; i--) {
-            short sum = (short) ((short)(acc[(short)(accOff + i)] & 0xFF)
-                               + (short)(src[(short)(srcOff + i)] & 0xFF)
-                               + carry);
-            acc[(short)(accOff + i)] = (byte) (sum & 0xFF);
-            carry = (short) ((sum >> 8) & 0xFF);
-        }
-    }
     /** Compare two big-endian uint32s: negative, zero or positive as a is below, equal to or above b. */
     private static short cmpUint32(byte[] a, short aOff, byte[] b, short bOff) {
         for (short i = 0; i < 4; i++) {
@@ -3408,5 +3378,21 @@ public class CashuApplet extends Applet {
             scratch[(short)(X_DEC + 10 - digits)] = (byte)('0' + rem);
         } while (!isZero(scratch, X_NUM, (short) 4));
         return digits;
+    }
+
+    /**
+     * Nothing is done here, and nothing calls it: this method is in the
+     * package for its length alone. The chip the card runs on installs the
+     * card's applet only when the load file's size falls in a window of each
+     * 256 bytes (docs/FOXY-CARD-HARDWARE.md), the same code failing a few
+     * dozen bytes to either side. Each line below is six bytes of the file;
+     * `tools/refcheck.py`, run after every build, says how many to add or to
+     * take away.
+     */
+    private static void sizeTheFile(byte[] a) {
+        a[10] = (byte) 20; a[11] = (byte) 21; a[12] = (byte) 22; a[13] = (byte) 23;
+        a[14] = (byte) 24; a[15] = (byte) 25; a[16] = (byte) 26; a[17] = (byte) 27;
+        a[18] = (byte) 28; a[19] = (byte) 29; a[20] = (byte) 30; a[21] = (byte) 31;
+        a[22] = (byte) 32;
     }
 }
