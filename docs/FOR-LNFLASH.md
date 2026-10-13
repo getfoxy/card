@@ -18,10 +18,10 @@ own class in jCardSim, including with a few real sats at your own mint
 tested.
 
 **Which version this describes.** The note was written when the applet was at
-version 1.1, and most of its tables still say so (29 bytes of `GET_INFO`, 64
-slots, a `SPEND` of one slot). The clock has been brought up to software 1.15,
-and the PIN made optional in 1.16: the rows and sentences that name them say what
-the card does now. For the rest,
+version 1.1. Its figures for `GET_INFO` (30 bytes), the slots (128) and what a
+payment signs (one signature for all its pieces) are those of software 1.20, as
+are the clock (1.15) and the optional PIN (1.16); other tables may still show
+1.1. For the rest,
 `docs/FOXY-CARD-SPEC.md` and `docs/FOXY-CARD-DAILY-LIMIT.md` are what is built.
 
 ## 1. What we would like you to look at
@@ -62,7 +62,7 @@ the card does now. For the rest,
    path "the right shape" and named its flaw. We think the date on the slot
    answers it. Do you?
 5. **Anything about real hardware** that jCardSim would not show us: memory
-   for 64 slots of 82 bytes, torn writes, how long a tap takes with several
+   for 128 slots of 82 bytes, torn writes, how long a tap takes with several
    pieces to sign, how long the ECDSA verifies take (one for each owner
    command), and how long a block header takes (two SHA-256 passes and a few
    compares; we expect well under 20 ms and have not measured it).
@@ -154,7 +154,9 @@ open to a card with an owner, `6A93` a `SET_HEADER` whose work is not enough,
 and (1.16) a signature refused for want of the PIN. (`6A92` was "never told the
 time", and is unused since 1.15.)
 
-64 slots of 82 bytes (yours: 32 of 78). The card record is unit, the daily
+128 slots of 82 bytes since software 1.7 (yours: 32 of 78), with the text a
+payment hashes (130 bytes) and, from 1.20, the mint's proof (96 bytes) kept
+beside each. The card record is unit, the daily
 limit, a 33-byte refund key, 65 bytes that hold the hardest difficulty and the
 newest hash of a block header taken (a time key up to 1.14), the clock and the
 day, and the mint's address (up to 80 bytes). Apart from it the card keeps a
@@ -210,14 +212,17 @@ clock moves a block at a time, only when someone shows the card a header.
 If the J3R180 turns out to have no usable ECDSA verifier, we have a documented
 fallback for the owner's proof, built on a hash of a secret.
 
-**What SPEND signs.** SHA-256 of the secret, where the secret is the exact
-text cashu-ts writes for a P2PK piece, built on the card:
+**What a payment signs.** Since software 1.4 there is no `SPEND` of one piece:
+`0x20` answers `6D00`. Every secret ends with the SIG_ALL flag, and a payment is
+one signature over a running hash of every piece's secret and `C`, then the
+outputs (`FOXY-CARD-SPEC.md` 5.2). The secret is the exact text cashu-ts writes
+for a P2PK piece, built on the card:
 
-    ["P2PK",{"nonce":"<64 hex>","data":"<card key, 66 hex>","tags":[]}]
+    ["P2PK",{"nonce":"<64 hex>","data":"<card key, 66 hex>","tags":[["sigflag","SIG_ALL"]]}]
 
 and for a piece with a date:
 
-    ["P2PK",{"nonce":"…","data":"…","tags":[["locktime","<decimal>"],["refund","<66 hex>"]]}]
+    ["P2PK",{"nonce":"…","data":"…","tags":[["locktime","<decimal>"],["refund","<66 hex>"],["sigflag","SIG_ALL"]]}]
 
 So loading a card is an ordinary locked send from any NUT-11 wallet, and
 nothing is made specially for it. This is not your secret text.
@@ -283,8 +288,10 @@ Not tested:
   endurance for the extra write on every spend.
 - The wallet and the iPhone app against the daily limit, the clock and the owner
   key on a real card, beyond a set-up and a payment: the applet's side of them
-  was walked command by command through a reader. `SET_HEADER` itself has not
-  been run on a real card, and so has not been timed.
+  was walked command by command through a reader. `SET_HEADER` has since been
+  run on real cards from the phone, where the step that shows a header that
+  moves the clock takes 0.07 to 0.09 s over NFC. It has not been timed through
+  a reader.
 - Any mint's behaviour once a locktime has passed.
 
 ## 7. Three things that may be useful to you

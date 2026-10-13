@@ -300,7 +300,7 @@ has most of them as commands and answers):
 
 | INS | Command | Needs | Data sent | Answers |
 |---|---|---|---|---|
-| `01` | GET_INFO | | | 29 bytes: version (2), slots, unspent, spent, empty, capabilities, PIN state (0 none, 1 set, 2 blocked), format, tries left, locked, record set, limit (4), has owner (1); then `now` (4), window start (4), spent today (4); then whether this tap may put change on with no PIN (1), 30 bytes in all. With P1 = 1, 42: those thirty, then the limit on one payment (4, the owner's grant only, zeros to anyone else), the no-PIN allowance (4) and what has been signed for with no PIN in the window (4), both to anyone (software 1.16; zeros up to 1.15). With P1 = 2 (software 1.19), 43: those 42, then whether the NFC tag is on (1: `00` on, `01` off, to anyone) |
+| `01` | GET_INFO | | | 30 bytes: version (2), slots, unspent, spent, empty, capabilities, PIN state (0 none, 1 set, 2 blocked), format, tries left, locked, record set, limit (4), has owner (1); then `now` (4), window start (4), spent today (4); then whether this tap may put change on with no PIN (1). With P1 = 1, 42: those thirty, then the limit on one payment (4, the owner's grant only, zeros to anyone else), the no-PIN allowance (4) and what has been signed for with no PIN in the window (4), both to anyone (software 1.16; zeros up to 1.15). With P1 = 2 (software 1.19), 43: those 42, then whether the NFC tag is on (1: `00` on, `01` off, to anyone) |
 | `10` | GET_PUBKEY | | | the card's 33-byte compressed key |
 | `11` `12` `13` `14` | GET_BALANCE, GET_PROOF_COUNT, GET_PROOF, GET_SLOT_STATUS | | | as upstream, except that GET_PROOF returns the 82-byte slot |
 | `15` | AUTH | | 16 random bytes | 16 of the card's own and a signature |

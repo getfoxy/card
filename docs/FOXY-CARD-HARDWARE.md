@@ -122,11 +122,11 @@ nowhere else, so tests pin it: the store is null after install and made by the
 first `SET_CARD`; no constructor names it; the arrays the constructors make add up
 to 29,806 bytes, the figure of the build that installs, and a larger figure has to
 be measured on a card first; and the scan for allocations on the path of a command
-(D10) lets through that one guarded statement and nothing beside it. The 1.20 build
-itself has not been installed on the chip yet. `tools/chip` has a short case for
-that (`ProofStoreCheck.java`, run by `proofstore.sh`): it sets a blank card up, loads a
-piece with a proof and reads it back, loads a plain piece and reads `00`, pays, and
-resets the card, which ends blank.
+(D10) lets through that one guarded statement and nothing beside it. `tools/chip`
+has a short case for the build itself (`ProofStoreCheck.java`, run by
+`proofstore.sh`): it sets a blank card up, loads a piece with a proof and reads it
+back, loads a plain piece and reads `00`, pays, and resets the card, which ends
+blank. It has been run on the chip with the 1.20 build, and every check held.
 
 ## One transaction holds about a dozen status bytes
 
@@ -174,7 +174,7 @@ Measured with the card in an ACS ACR39U, one command at a time:
 | AUTH | 0.7 s |
 | LOAD_PROOF, three pieces in one command | 0.19 s |
 | GET_PIECES, the whole list | 0.1 s |
-| SET_HEADER (a real header accepted, the clock moved) | 0.05 s |
+| SET_HEADER (a real header accepted, the clock moved) | not timed through this reader |
 | TELL_TIME | 0.01 s |
 | SELECT, GET_INFO, GET_BALANCE | 0.02 to 0.03 s |
 
@@ -187,8 +187,11 @@ measured), which verified an ECDSA signature. It verifies none: the card hashes
 the header's 80 bytes and then the 32-byte hash, as Bitcoin does, turns the
 result round, and compares it with three numbers of 32 bytes (the header's own
 target, the floor and four times the hardest target taken). SHA-256 over 100 bytes is measured further down this page
-(4 ms); the byte loops around it, which the chip runs in bytecode, are not. The
-figure in the table is an expectation, to be replaced by a measurement.
+(4 ms); the byte loops around it, which the chip runs in bytecode, are not, and
+the command has not been timed through this reader. Over NFC from an iPhone, the
+step of a read that tells the time and shows a header takes 0.07 to 0.09 s when
+the header moves the clock and about 0.01 s when it does not, by the phone's own
+timing of that step.
 `TELL_TIME` copies four bytes.
 
 ## The field's arithmetic, measured on the chip

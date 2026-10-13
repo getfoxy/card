@@ -404,7 +404,8 @@ reader and phone will carry (the same reason a plain batch stops at three pieces
 of 81 bytes). `LOAD_PROOF` with `P1 = 1` is one piece and its proof, and any
 other P1 is the plain form it always was. A command to each piece is slower than
 a batch of three (a batch took 0.19 s on the chip: [`FOXY-CARD-HARDWARE.md`](FOXY-CARD-HARDWARE.md));
-the one-piece form has not been timed there.
+the one-piece form has not been timed there. From a phone over NFC it takes
+about 0.09 s a piece (96 pieces in 9 s).
 
 **Why zeros are refused as a proof.** A record of zeros is how the card says "no
 proof". If a load could store zeros and answer "kept", the answer would be false.

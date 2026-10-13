@@ -255,7 +255,7 @@ leaves an empty place with a record beside it, which nothing serves.
   back, a plain piece and a place used again read `00`, a payment and a reset go
   through, and `GET_INFO` is the length it was (`tools/chip/proofstore.sh`, 27
   checks). Not run there: a card pulled away during the first `SET_CARD` or a
-  load with a proof, and the time a phone takes to load one piece a command
+  load with a proof. From a phone, a load with proofs takes about 0.09 s a piece
 
 An earlier card, a J3R452 on applet 0.1, ran the read and sign path on
 2026-09-01 ([its report](HARDWARE_TEST_REPORT_2026-09-01.j3r452.md)).

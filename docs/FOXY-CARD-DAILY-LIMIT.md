@@ -392,7 +392,11 @@ and the slot checks, when the limit is not 0:
 2. spent today (0 in a new window) + the piece's amount, with its carry, over
    the limit → `6A8F`, nothing signed, nothing burned, nothing written.
 3. Otherwise, in one transaction: the window start (if new) `= now`; spent today
-   `+=` the amount; the slot's status `=` spent. Then the signature.
+   `+=` the amount; the slot's status `=` spent. Then the signature. (That is
+   the order of software 1.1. Now the signature is made first, in memory that
+   leaves the card only with the answer; the transaction commits the note that
+   the payment's pieces are spent, with their list; and since 1.8 their status
+   bytes are written after it: see "Version 1.8" below.)
 
 A limit of 0 is no limit: steps 1 to 3 are skipped, nothing is counted, and the
 clock is not looked at. **A new card's limit is 0, and set-up does not ask for
@@ -584,8 +588,9 @@ The card keeps its own account of what it has signed for and what it has
 refused. It is the only record of a card's use that no terminal's honesty is
 needed for, and it is what a holder reads to find out what a tap really took.
 
-**Only the card writes it.** A `SPEND` writes it in the transaction that burns
-the piece: no piece is burned that the log does not have. A `SPEND` refused for
+**Only the card writes it.** A payment writes it in the transaction that commits
+it, which is the one that notes its pieces spent (since 1.8 their status bytes
+follow it): no piece is burned that the log does not have. A `SPEND` refused for
 being over the day's limit (`6A8F`) writes it and then refuses. No command sets
 it, moves it back or clears it, for the PIN or for the owner, and `CLEAR_SPENT`,
 `SET_LIMIT`, `CHANGE_PIN`, `SET_CARD` and `LOCK_CARD` leave it as it is. The
@@ -651,8 +656,11 @@ refused or put on.
 **The clock moved twice in a tap** (flag bit 2) is gone. Up to software 1.14 the
 card marked a time in the field in which a signed time was told twice, more than
 two minutes apart, because a terminal walking the clock forward to turn the day
-did exactly that. A terminal cannot walk the clock now: it moves only by headers
-that have the work (5). Bit 2 is never set, and the fourth count counts runs of
+did exactly that. A terminal cannot move the clock past the present now: it moves
+only by headers that have the work (5). It can still walk a clock that is behind,
+one real header at a time, and turn the day with each: a card whose clock lags by
+some days gives up that many more days' limit in one visit. That is open, and the
+guard for it is not built. Bit 2 is never set, and the fourth count counts runs of
 refusals and nothing else.
 
 **Receipts** (`GET_LOG` with P1 = 1). For each payment the card signs, written
@@ -1414,10 +1422,13 @@ and a card loaded before it has been shown a block spends its first day on trust
   compressed public key: 130 hex characters, uncompressed. Used for `SET_OWNER`.
 - `cardOwnerSign {key, label, nonce, value}`: an ECDSA signature (DER, hex) by the
   owner key for that card, over `"FoxyCard/" + label ‖ nonce ‖ value`, where `label`
-  is one of `change-pin`, `set-limit`, `set-owner`, `set-card`, `load`, the nonce is
-  the 16 bytes the card gave and the value has the shape that label takes. Native
-  refuses every other label (in particular `lock`) and every other shape, before
-  it reads the seed. It answers the signature and nothing else.
+  is one of `change-pin`, `set-limit`, `set-owner`, `set-card`, `load`, `reset`
+  (software 1.17), the nonce is the 16 bytes the card gave and the value has the
+  shape that label takes. Native refuses every other label and every other shape,
+  before it reads the seed. It answers the signature and nothing else. The card
+  knows two labels more, `lock` (`LOCK_CARD` needs the owner's proof under it) and
+  `tag` (`SET_TAG`, software 1.19). The phone signs neither yet, so it can neither
+  lock a card nor switch its tag.
 
 The owner's private key and the seed never leave native. The draft's action that
 handed the page a secret is gone.
