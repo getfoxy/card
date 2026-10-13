@@ -95,9 +95,10 @@ silently converts the card into a brick; and the card cannot enforce a timeout
 because JavaCard has no clock, so a merchant would accept a tap that the mint
 later refuses.
 
-Since 0.3, a card whose PIN is blocked strands its balance too
-([SECURITY-MODEL](SECURITY-MODEL.md) #14), so a refund path would rescue a
-blocked card as well as a lost one.
+Since 0.3, a card whose PIN is blocked and which has no owner strands its
+balance too ([SECURITY-MODEL](SECURITY-MODEL.md) #14), so a refund path would
+rescue that card as well as a lost one. A card with an owner is unblocked by
+its owner's phone.
 
 If you want to solve recovery, start from that PR and that objection.
 
@@ -268,6 +269,11 @@ this profile — a blocked card is replaced at re-provisioning. An
 `UNBLOCK_PIN` command gated by a provisioning PUK is the designated follow-up
 **before volume issuance**; do not ship consumer cards at scale without it.
 
+*Later:* the owner's proof took the PUK's place. On a card with an owner,
+`CHANGE_PIN` with the owner's proof sets a new PIN and unblocks
+([spec](FOXY-CARD-SPEC.md) 5.6). The paragraph above stands only for a card
+with a PIN and no owner.
+
 *Correction (ENG-615, after v0.2.0):* "dead" was not what the applet did. The
 gate checked `pinState == 1`, and a blocked card has `pinState == 2`, so
 exhausting the tries **removed** the gate: every PIN-gated command opened up
@@ -295,7 +301,8 @@ reinstall regenerates the card key. [D14](#d14) later moved that floor to
 card's P2PK-locked proofs, so a blocked card's balance is unrecoverable, and
 `VERIFY_PIN` is unauthenticated: any reader in range can block a card with
 three APDUs ([`SECURITY-MODEL.md`](SECURITY-MODEL.md) #14). That loss is what
-`UNBLOCK_PIN` + PUK (ENG-617) has to remove.
+`UNBLOCK_PIN` + PUK (ENG-617) had to remove; the owner's proof has since removed
+it for every card with an owner (see *Later*, above).
 
 Provisioning: POS cards are personalised with a PIN by default
 (`cardctl set-pin` during personalisation; `fund-card --pin` when the funding

@@ -32,7 +32,7 @@ get around it rather than through it.
 | 11 | Tear-off (card pulled mid-write) | **Yes, by write order** (applet 0.4 on); not yet on silicon | Every slot write changes the data first and commits the status byte last, as a single byte the JCRE writes atomically ([D14](DECISIONS.md#d14)). A card whose `SELECT` answers below `00 04` may write the status byte first and needs the CAP reinstalled. A torn `LOAD_PROOF` leaves the slot empty and a torn `CLEAR_SPENT` leaves it spent; neither state is counted in the balance or signed for. The empty slot's bytes are never read. The half-cleared spent slot still answers `GET_PROOF`, as status `02` with some fields zeroed, and its data is not a proof: a reader that uses a spent slot's data must check it ([`spec/APDU.md`](../spec/APDU.md#clear_spent-0x31)), and `cardctl dump` skips one that fails. `SPEND_PROOF` writes only the status byte, before it signs ([D7](DECISIONS.md#d7)): a tear after the burn loses that signature, which flash-pos re-derives with `SIGN_ARBITRARY` (`resignWitness`). The order is enforced by a source scan and the torn states are tested in jCardSim; no card has been pulled mid-write. |
 | 12 | Counterfeit physical cards | **Not a concern** | Value is bound to the chip's key. A look-alike with no valid chip holds nothing. |
 | 13 | Supply-chain / pre-personalised cards | ⚠️ **Unaddressed** | Nothing currently attests that a card's key was generated on-card by an untampered applet. |
-| 14 | Hostile reader blocks the PIN (3 unauthenticated APDUs), balance unrecoverable | ❌ **No** | `VERIFY_PIN` needs no authentication, so three wrong PINs from any reader in NFC range block the card. Once blocked, nothing can sign for its proofs: they are P2PK-locked to the card key with only a `sigflag` tag (no refund key, no locktime; [D5](DECISIONS.md#d5)'s recovery proposal is unmerged), and a reinstall regenerates the key. The balance is gone. Mitigations: small balances, a shielded sleeve, and `UNBLOCK_PIN` + PUK (ENG-617) before volume issuance. See below. |
+| 14 | Hostile reader blocks the PIN (3 unauthenticated APDUs) | **A nuisance on a card with an owner**; ❌ **No** on a card with a PIN and no owner | `VERIFY_PIN` needs no authentication, so three wrong PINs from any reader in NFC range block the card. A card with an owner is opened again by its owner's phone: `CHANGE_PIN` takes the owner's proof in place of the old PIN, sets a new one and resets the tries ([spec](FOXY-CARD-SPEC.md) 5.6), so nothing is lost and the card cannot pay until its owner taps it. A card that was given a PIN and money but no owner has no such path: `SET_PIN` unblocks only an empty card, so its balance is stranded. See below. |
 | 15 | Reading the NFC tag (software 1.19) | **Nothing of the card to read** | Any reader, with no PIN, gets the same bytes from every card: one web address. It names no card, key, owner or balance. A card on factory keys can have the tag's applet replaced by one carrying another address; rotating the card manager keys closes that. See below. |
 | 16 | A piece on the card that the mint never made (software 1.20) | **Checked by the reader, not by the card** | The card keeps the mint's NUT-12 proof for a piece and gives it back; it checks nothing. A reader that checks it, with the mint's keys, sees that a made-up `C` is not real, and a piece copied from another card is not real here. It does not show that a real piece is unspent. Reading the proof gives away `r`, which ties a piece to the request that made it if the mint is given it. See below. |
 
@@ -126,17 +126,27 @@ silicon. A card whose `SELECT` answers anything below `00 03` (`00 01` or
 [D14](DECISIONS.md#d14) so does one answering `00 03` (#11). Sweep it first: a
 reinstall regenerates the key the proofs are locked to.
 
-**A blocked card strands its balance (#14).** `VERIFY_PIN` is unauthenticated,
-so any reader in NFC range can send the three wrong PINs. Nothing but the card
-key can sign for the card's proofs: the P2PK secret carries only a `sigflag`
-tag, with no refund key and no locktime, and D5's recovery proposal is not
-merged. ENG-615 therefore turned "three wrong PINs = theft" into "three wrong
-PINs = destruction of funds". The thief gets nothing, the holder loses the
-balance, and there is no unblock path in this profile.
+**A blocked card (#14).** `VERIFY_PIN` is unauthenticated, so any reader in NFC
+range can send the three wrong PINs. What that costs depends on whether the
+card has an owner.
 
-Mitigations today: small balances and a shielded sleeve. `UNBLOCK_PIN` gated by
-a provisioning PUK (ENG-617) is what removes the loss, and it blocks volume
-issuance.
+*With an owner*, which is every card the Foxy app sets up: the owner's phone
+opens it again. `CHANGE_PIN` takes the owner's proof in place of the old PIN,
+on a card in any PIN state and holding any funds; it sets the new PIN, resets
+the tries and unblocks ([spec](FOXY-CARD-SPEC.md) 5.6). The thief gets nothing,
+the holder loses nothing, and the card cannot pay until its owner has tapped
+it. Wrong-PIN spam is therefore a nuisance, and one coil at a venue can still
+put every such card out of use for the day.
+
+*With a PIN and no owner*: there is no way back. `SET_PIN` replaces a PIN only
+on a card with no owner and nothing unspent, and nothing but the card key can
+sign for the card's proofs (the P2PK secret carries only a `sigflag` tag, with
+no refund key and no locktime, and D5's recovery proposal is not merged). Three
+wrong PINs then destroy the balance. Do not put money on a card that has a PIN
+and no owner.
+
+This paragraph used to say that no card could be unblocked. That was true
+before the owner's proof existed and is not true now.
 
 ## The NFC tag (#15, software 1.19)
 
@@ -282,8 +292,11 @@ a few hundred taps. Treat simulator results accordingly — see
 
 ## Open items
 
-1. **`UNBLOCK_PIN` + PUK** (ENG-617, #14) — today three unauthenticated APDUs
-   strand a card's balance for good. Blocks volume issuance
+1. **A blocked card with no owner** (#14) — a card with an owner is unblocked
+   by its owner's phone, which closes what ENG-617 (`UNBLOCK_PIN` + PUK) was
+   opened for. What is left is the card with a PIN, money and no owner, which
+   three unauthenticated APDUs still strand; and that anyone in range can put
+   an owned card out of use until its owner taps it
    ([D13](DECISIONS.md#d13)).
 2. **Tear-off on silicon** (#11) — the write order is analysed and enforced
    ([D14](DECISIONS.md#d14)); pulling a card mid-`LOAD_PROOF` and
