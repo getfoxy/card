@@ -1,0 +1,13 @@
+<!-- The fingerprint probe (BioProbe.java). Build: JAVA_HOME=/opt/homebrew/opt/openjdk@17 ant -f tools/probe-bio/build.xml  → tools/probe-bio/probe-bio.cap
+     Uses the ant-javacard jar the main build downloaded into applet/target (pinned there by SHA-256); it does not
+     touch applet/target otherwise. Package FOXYBIO, applet FOXYBIO 01: loads beside the card's applet. -->
+<project name="probe-bio" default="cap" basedir=".">
+  <taskdef name="javacard" classname="pro.javacard.ant.JavaCard" classpath="${basedir}/../../applet/target/ant-javacard-v26.05.15.jar"/>
+  <target name="cap">
+    <javacard jckit="${user.home}/.javacard/sdks/jc305u4_kit">
+      <cap targetsdk="${user.home}/.javacard/sdks/jc305u4_kit" aid="F0464F585942494F" output="probe-bio.cap" sources="src" version="1.0">
+        <applet class="me.foxy.probe.BioProbe" aid="F0464F585942494F01"/>
+      </cap>
+    </javacard>
+  </target>
+</project>
