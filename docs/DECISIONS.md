@@ -4,7 +4,7 @@ Each entry records a call that was made, what was rejected, and why. If you are
 about to change one of these, read the entry first — most were made against a
 real alternative, and several were made *after* getting it wrong once.
 
-Anchors are stable (`#d1` … `#d15`); other docs link to them.
+Anchors are stable (`#d1` … `#d16`); other docs link to them.
 
 ---
 
@@ -58,6 +58,14 @@ anyway in order to unblind.
 The card holds the one thing that genuinely cannot live elsewhere: a private key
 that has never existed outside the secure element. Everything else belongs on
 the host.
+
+*Revisited in the Foxy fork.* From software 1.12 the card blinds the outputs of its
+own change (`SPEND_ALL_CHANGE`), and from 1.21 it unblinds them too (`LOAD_CHANGE`),
+with the chip's RSA and key agreement rather than big integers in bytecode. What
+changed the call: those blinding factors are the card's own secret now, and a
+factor that leaves the card lets whoever holds it finish a piece of the card's
+change ([D16](#d16)). A reader's own pieces are blinded and unblinded on the reader,
+as before.
 
 ---
 
@@ -436,6 +444,56 @@ lets the mint tie the piece to the request that made it, as with any NUT-12 toke
 and the card gives `r` to any reader with no PIN
 ([`SECURITY-MODEL.md`](SECURITY-MODEL.md) #16). 12,288 bytes of the card's storage,
 which the chip has.
+
+---
+
+## <a id="d16"></a>D16 — A PIN first, the card's own change unblinded on the card, the tap after a payment closed, the owner claimed slowly
+
+**Decided:** in software 1.21 ([`FOXY-CARD-SPEC.md`](FOXY-CARD-SPEC.md) 5.10):
+
+- A card with no PIN takes nothing and pays nothing: every load, every payment
+  command and an owner's claim answer `6A97`. `SET_PIN` stays open on an empty card
+  with no owner. The card of 1.16 to 1.20 that an owner set up with no PIN, and its
+  ADD PIN, are gone.
+- The tap after a payment loads that payment's own change and nothing else: one
+  `LOAD_CHANGE` for each opening the payment made, with no PIN, in the next time in
+  the field and no later. It opens neither `LOAD_PROOF` nor `CLEAR_SPENT`.
+- The card unblinds its own change (`LOAD_CHANGE`): it checks the mint's NUT-12
+  proof against the key it is given and its own blinded message, and takes its own
+  blinding factor off. `GET_CHANGE` gives the blinded message and never the factor.
+- An owner is claimed under the PIN given in the tap, by ten askings in a row, a
+  signature's work each, never in a tap that signed a payment, and no payment
+  follows a claim in that tap.
+
+**Rejected:** a no-PIN card that a gift is loaded onto (left for later, not built);
+the grant of 1.20, which any reader could use for any piece; giving the phone `r`
+and letting it finish the change, which is what let any reader do so; a check of
+the mint's proof by the phone alone, which cannot be made without `r`; a claim in
+one command; a claim counted by a clock, which the card does not have.
+
+**Why the change is unblinded on the card.** A grant that a stranger's tap might
+use can only be made safe by making it unable to write anything but the card's own
+change. With the factor on the card and nowhere else, the only `C` the card writes
+under the grant is one it worked out itself from the mint's answer, for its own
+opening, nonce and amount. The proof is checked because a `C_` for another opening,
+or a corrupted one, would otherwise be written as change that the mint will not
+take; it is checked on the card because nobody else can check it without the factor.
+
+**Why the grant is the time in the field and not one selection.** A phone may select
+the card twice in one tap, and a grant cleared by the second selection would send the
+till back for the PIN at every change tap.
+
+**Why ten askings.** The card has no clock, and the one duration it owns is a
+signature's work; ten askings make the claim seconds of holding the card, which the
+holder sees, in the way a payment's wait does.
+
+**Cost accepted:** the card cannot tell that the key it is given is the mint's, so a
+stranger who takes the tap after a payment can spoil that payment's change, though it
+takes nothing ([`SECURITY-MODEL.md`](SECURITY-MODEL.md) #17); binding the key at the
+payment would close it and is not built. `LOAD_CHANGE` is some of a second of the
+card's work. The openings keep their blinded message, 264 bytes of the constructor's
+arrays more, inside the 300 more the chip was measured to take. A till that writes
+change as pieces of its own, without an opening, needs the PIN or the owner's grant.
 
 ---
 

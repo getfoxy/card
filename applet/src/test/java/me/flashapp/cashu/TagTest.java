@@ -503,7 +503,7 @@ class TagTest {
         assertEquals(0x6999, selectTag().getSW(), "the tag application refuses its name");
         ResponseAPDU card = selectCard();
         assertEquals(SW_OK, card.getSW(), "the card's own name is selected");
-        assertArrayEquals(new byte[] { 0x01, 0x14 }, card.getData(), "and answers its version, 1.20");
+        assertArrayEquals(new byte[] { 0x01, 0x15 }, card.getData(), "and answers its version, 1.21");
         assertEquals(1, infoTag().getData()[42], "and says the tag is off");
         assertEquals(0x6999, selectTag().getSW(), "the tag asks at each selection, and it is still off");
         selectCard();

@@ -1,0 +1,444 @@
+import javax.smartcardio.Card;
+import javax.smartcardio.CardChannel;
+import javax.smartcardio.CardTerminal;
+import javax.smartcardio.CommandAPDU;
+import javax.smartcardio.TerminalFactory;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.math.BigInteger;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.MessageDigest;
+import java.security.Signature;
+import java.security.interfaces.ECPublicKey;
+import java.security.spec.ECGenParameterSpec;
+import java.util.Arrays;
+
+/**
+ * Software 1.21 on the chip: a PIN first, the owner's claim, the card's own change unblinded on the card (LOAD_CHANGE) and the
+ * tap after a payment that loads that change and nothing else. What jCardSim cannot say is how long the card's own work takes, and
+ * the two figures this run is for are printed: how long a claim takes from its first asking to the owner set, and how long one
+ * LOAD_CHANGE takes (two RSA operations, two key agreements and three generic mappings, and the hex of four points).
+ *
+ *   select (01 15 or later); GET_INFO;
+ *   on a card with no PIN: LOAD_PROOF, SPEND_ALL_BEGIN and SET_OWNER refused with 6A97;
+ *   set up as a phone does: SET_PIN, VERIFY_PIN, SET_CARD, then SET_OWNER asked again while the card says "not yet" (timed);
+ *   a new tap and the PIN; a piece loaded; a payment of it that makes two change outputs for the card (each timed); GET_CHANGE;
+ *   a new tap with no PIN: GET_INFO byte 29 is 0, LOAD_PROOF and CLEAR_SPENT are 6982; LOAD_CHANGE with a proof that does not
+ *   hold is 6A80; the two openings' change by LOAD_CHANGE, with no PIN (each timed), the piece's C checked here against the mint's
+ *   own signature on the opening's secret; GET_DLEQ for it reads 00;
+ *   the next tap: nothing more to load with no PIN; then the change paid off, the places freed and the card reset.
+ *
+ * This run is its own mint: it makes up a key k, signs the card's blinded messages with it (C_ = k*B_) and proves it (NUT-12), so
+ * the change it writes is real to this run and to nobody else; the card cannot tell a mint's key from another, which is what the
+ * run relies on. It makes up an owner key as well and uses it once. Nothing is kept.
+ *
+ * It refuses to begin on a card that is not blank (an owner, a record or any piece), so it cannot disturb a card in use, and it ends
+ * with the card blank. A run that stops part way leaves test pieces on the card: install the software again.
+ *
+ *   sh tools/chip/changecheck.sh                 the card in the reader, by PC/SC
+ *   sh tools/chip/changecheck.sh 127.0.0.1:47470 a card behind a bridge or the simulator's server (tools/chip/run.sh, tools/cardsim/run.sh)
+ *
+ * Needs GlobalPlatformPro's jar (gp.jar) for its PC/SC binding, found through GP_JAR or next to this file. Exits 0 if every check
+ * held and 1 if one did not, 2 if the card is not blank, not 1.21 or later, or cannot be reached. It sends nothing a phone does
+ * not send.
+ */
+public final class ChangeCheck {
+    private static final String AID = "F0464F58594341524401";
+    private static final byte[] KEYSET = hex("0059534ce0bfa19a");
+    private static final byte[] PIN = { '1', '2', '3', '4' };
+
+    private static final BigInteger P = new BigInteger("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F", 16);
+    private static final BigInteger N = new BigInteger("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16);
+    private static final BigInteger[] G = {
+        new BigInteger("79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798", 16),
+        new BigInteger("483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8", 16) };
+
+    /** One command and its answer, status word last. */
+    interface Link {
+        byte[] send(byte[] command) throws Exception;
+        /** The card taken out of the field and put back: a new tap, nothing of the last one kept. */
+        void retap() throws Exception;
+        void close() throws Exception;
+    }
+
+    private static Link link;
+    private static int checks = 0, failed = 0;
+
+    public static void main(String[] args) throws Exception {
+        try {
+            link = args.length > 0 ? bridge(args[0]) : reader();
+        } catch (Exception e) {
+            System.out.println("cannot reach the card: " + e.getMessage());
+            System.exit(2);
+        }
+        int code = 0;
+        try {
+            code = run();
+        } finally {
+            link.close();
+        }
+        System.exit(code);
+    }
+
+    private static int run() throws Exception {
+        byte[] selected = select();
+        if (sw(selected) != 0x9000 || selected.length != 4 || selected[0] != 1 || (selected[1] & 0xFF) < 0x15) {
+            System.out.println("the card's applet is not software 1.21 or later: " + toHex(selected));
+            return 2;
+        }
+        byte[] info = data(send(0xB0, 0x01, 0, 0, null, 0), 0x9000);
+        if (info == null || info.length != 30 || info[16] != 0 || info[11] != 0 || info[3] != 0 || info[4] != 0) {
+            System.out.println("the card is not blank (an owner, a record or a piece is on it): nothing was done. Make it blank first.");
+            return 2;
+        }
+        System.out.println("the card is blank, on software 1." + (info[1] & 0xFF) + ". Checking a PIN first, the claim and the card's own change.");
+
+        // a PIN first (a card a run left with a PIN cannot show it; SET_PIN replaces that PIN)
+        if (info[7] == 0) {
+            say("LOAD_PROOF on a card with no PIN is 6A97", sw(send(0xB0, 0x30, 0, 0, piece(8, 1), 0)) == 0x6A97);
+            say("SPEND_ALL_BEGIN on it is 6A97", sw(send(0xB0, 0x22, 0, 0, new byte[] { 0 }, 4)) == 0x6A97);
+            say("SET_OWNER on it is 6A97", sw(send(0xB0, 0x43, 0, 0, uncompressed(ownerKey()), -1)) == 0x6A97);
+        } else {
+            System.out.println("      the card has a PIN from an earlier run: the refusals of a card with no PIN are not tried");
+        }
+
+        // set up as a phone sets a card up
+        say("SET_PIN on a card with no owner", sw(send(0xB0, 0x41, 0, 0, PIN, -1)) == 0x9000);
+        say("SET_OWNER with the PIN set and not given is 6982", sw(send(0xB0, 0x43, 0, 0, uncompressed(ownerKey()), -1)) == 0x6982);
+        say("VERIFY_PIN", sw(send(0xB0, 0x40, 0, 0, PIN, -1)) == 0x9000);
+        say("SET_CARD", sw(send(0xB0, 0x32, 0, 0, record(), -1)) == 0x9000);
+        KeyPair owner = ownerKey();
+        byte[] ownerPub = uncompressed(owner);
+        long began = System.nanoTime();
+        int notYet = 0;
+        byte[] claimed = null;
+        for (int asked = 1; asked <= 20; asked++) {
+            byte[] r = send(0xB0, 0x43, 0, 0, ownerPub, -1);
+            if (sw(r) == 0x6A98 && r.length == 2) { notYet++; continue; }
+            claimed = r;
+            break;
+        }
+        long claimMs = (System.nanoTime() - began) / 1000000;
+        say("nineteen 'keep holding' (6A98), and the claim at the twentieth asking", notYet == 19 && claimed != null && sw(claimed) == 0x9000 && claimed.length == 2);
+        System.out.println("      THE CLAIM took " + claimMs + " ms from the first asking to the owner set (" + (notYet > 0 ? claimMs / (notYet + 1) : 0) + " ms an asking)");
+        say("the card has an owner", data(send(0xB0, 0x01, 0, 0, null, 0), 0x9000)[16] == 1);
+        say("no payment in the tap that claimed it: SPEND_ALL_BEGIN is 6985", sw(send(0xB0, 0x22, 0, 0, new byte[] { 0 }, 4)) == 0x6985);
+
+        // a new tap: a piece, and a payment of it that makes change for the card
+        retapWithPin();
+        byte[] key = data(send(0xB0, 0x10, 0, 0, null, 0), 0x9000);
+        say("a piece of 100 goes on under the PIN", Arrays.equals(data(send(0xB0, 0x30, 0, 0, piece(100, 2), 0), 0x9000), new byte[] { 0 }));
+        say("SPEND_ALL_BEGIN of it", sw(send(0xB0, 0x22, 0, 0, new byte[] { 0 }, 4)) == 0x9000);
+        BigInteger k = new BigInteger(1, sha256("a mint made up for one run".getBytes(StandardCharsets.US_ASCII))).mod(N);
+        byte[] mintKey = compressed(mul(k, G));
+        long[] changeMs = new long[2];
+        byte[][] blinded = new byte[2][];
+        long[] amounts = { 30, 20 };
+        for (int i = 0; i < 2; i++) {
+            began = System.nanoTime();
+            blinded[i] = data(send(0xB0, 0x26, 0, 0, cat(u32(amounts[i]), mintKey), 33), 0x9000);
+            changeMs[i] = (System.nanoTime() - began) / 1000000;
+        }
+        say("two change outputs for the card, 33 bytes each", blinded[0] != null && blinded[0].length == 33 && blinded[1] != null && blinded[1].length == 33);
+        System.out.println("      SPEND_ALL_CHANGE took " + changeMs[0] + " ms and " + changeMs[1] + " ms");
+        byte[] signed = sign();
+        say("the payment is signed", signed != null && signed.length == 64);
+        byte[] page = data(send(0xB0, 0x19, 0, 0, null, 0), 0x9000);
+        say("GET_CHANGE: two records of 83 bytes", page != null && page.length == 167 && page[0] == 2);
+        byte[][] rec = { Arrays.copyOfRange(page, 1, 84), Arrays.copyOfRange(page, 84, 167) };
+        for (int i = 0; i < 2; i++) {
+            say("record " + i + ": its number, amount, keyset and the blinded message the card answered",
+                rec[i][0] == i && be32(rec[i], 1) == amounts[i] && Arrays.equals(Arrays.copyOfRange(rec[i], 5, 13), KEYSET)
+                && Arrays.equals(Arrays.copyOfRange(rec[i], 17, 50), blinded[i]) && Arrays.equals(Arrays.copyOfRange(rec[i], 50, 83), mintKey));
+        }
+
+        // the next tap, no PIN: the change and nothing else
+        link.retap();
+        say("selected in the tap after the payment", sw(select()) == 0x9000);
+        say("GET_INFO's byte 29 says change is owed, to anyone", data(send(0xB0, 0x01, 0, 0, null, 0), 0x9000)[29] == 1);
+        say("LOAD_PROOF with no PIN is 6982", sw(send(0xB0, 0x30, 0, 0, piece(8, 3), 0)) == 0x6982);
+        say("CLEAR_SPENT with no PIN is 6982", sw(send(0xB0, 0x31, 0, 0, null, 1)) == 0x6982);
+        BigInteger forger = new BigInteger(1, sha256("a key the card was not told".getBytes(StandardCharsets.US_ASCII))).mod(N);
+        say("LOAD_CHANGE under another key, with that key's own good proof, is 6A80", sw(send(0xB0, 0x53, 0, 0, mintAnswer(forger, rec[0], BigInteger.valueOf(5)), 1)) == 0x6A80);
+        byte[] bad = mintAnswer(k, rec[0], BigInteger.valueOf(7));
+        bad[193] ^= 1;
+        began = System.nanoTime();
+        int refused = sw(send(0xB0, 0x53, 0, 0, bad, 1));
+        long refusedMs = (System.nanoTime() - began) / 1000000;
+        say("LOAD_CHANGE with a proof that does not hold is 6A80", refused == 0x6A80);
+        long[] loadMs = new long[2];
+        for (int i = 0; i < 2; i++) {
+            byte[] answer = mintAnswer(k, rec[i], BigInteger.valueOf(11 + i));
+            began = System.nanoTime();
+            byte[] r = send(0xB0, 0x53, i, 0, answer, 83);
+            loadMs[i] = (System.nanoTime() - began) / 1000000;
+            byte[] answered = data(r, 0x9000);
+            say("LOAD_CHANGE of opening " + i + " with no PIN answers the place and the piece (83 bytes)", answered != null && answered.length == 83);
+            if (answered == null || answered.length != 83) continue;
+            byte[] place = { answered[0] };
+            byte[] slot = data(send(0xB0, 0x13, place[0], 0, null, 0), 0x9000);
+            byte[] nonce = Arrays.copyOfRange(slot, 13, 45);
+            BigInteger[] y = hashToCurve(secret(nonce, key));
+            say("its C is the mint's signature on the opening's secret, the card's factor taken off",
+                Arrays.equals(Arrays.copyOfRange(slot, 45, 78), compressed(mul(k, y))) && be32(slot, 9) == amounts[i]);
+            byte[] dleq = data(send(0xB0, 0x1A, place[0], 0xFF, null, 0), 0x9000);
+            say("and it keeps the mint's proof with it (GET_DLEQ 01 and 96 bytes)", dleq != null && dleq.length == 97 && dleq[0] == 1);
+        }
+        System.out.println("      LOAD_CHANGE took " + loadMs[0] + " ms and " + loadMs[1] + " ms (refused for its proof: " + refusedMs + " ms)");
+        byte[] left = data(send(0xB0, 0x19, 0, 0, null, 0), 0x9000);
+        say("no opening is left", left != null && left.length == 1 && left[0] == 0);
+
+        // the change pays; the card is emptied and reset
+        retapWithPin();
+        say("the owner's grant for this tap", sw(send(0xB0, 0x45, 0, 0, ownerData(owner, "FoxyCard/load", new byte[0]), -1)) == 0x9000);
+        say("the two change pieces are paid", sw(send(0xB0, 0x22, 0, 0, new byte[] { 1, 2 }, 4)) == 0x9000 && sign() != null);
+        say("CLEAR_SPENT frees the three places", Arrays.equals(data(send(0xB0, 0x31, 0, 0, null, 1), 0x9000), new byte[] { 3 }));
+        say("RESET_CARD by the owner's proof", sw(send(0xB0, 0x51, 0, 0xAD, ownerData(owner, "FoxyCard/reset", new byte[0]), -1)) == 0x9000);
+        byte[] blank = data(send(0xB0, 0x01, 0, 0, null, 0), 0x9000);
+        say("the card is blank again: no owner, no record, nothing on it, no PIN",
+            blank != null && blank.length == 30 && blank[16] == 0 && blank[11] == 0 && blank[3] == 0 && blank[4] == 0 && blank[7] == 0);
+
+        System.out.println(checks + " checks, " + failed + " failed.");
+        return failed == 0 ? 0 : 1;
+    }
+
+    // ---- the mint of this run, and the card's secret --------------------------------------------------------------------
+
+    /** LOAD_CHANGE's data for a GET_CHANGE record: C_ = k*B_ (65), K = k*G (65), and NUT-12's proof made with the nonce p (e, s). */
+    private static byte[] mintAnswer(BigInteger k, byte[] record, BigInteger p) throws Exception {
+        BigInteger[] b = decompress(Arrays.copyOfRange(record, 17, 50));
+        BigInteger[] c = mul(k, b), key = mul(k, G);
+        StringBuilder text = new StringBuilder();
+        for (BigInteger[] pt : new BigInteger[][] { mul(p, G), mul(p, b), key, c }) text.append(toHex(point65(pt)).toLowerCase());
+        byte[] e = sha256(text.toString().getBytes(StandardCharsets.US_ASCII));
+        BigInteger s = p.add(new BigInteger(1, e).multiply(k)).mod(N);
+        return cat(point65(c), point65(key), e, bytes32(s));
+    }
+
+    /** A piece's secret as the card builds it for a piece with no date: ["P2PK",{"nonce":"..","data":"<card key>","tags":[["sigflag","SIG_ALL"]]}]. */
+    private static byte[] secret(byte[] nonce, byte[] cardKey) {
+        return ("[\"P2PK\",{\"nonce\":\"" + toHex(nonce).toLowerCase() + "\",\"data\":\"" + toHex(cardKey).toLowerCase()
+            + "\",\"tags\":[[\"sigflag\",\"SIG_ALL\"]]}]").getBytes(StandardCharsets.UTF_8);
+    }
+
+    /** NUT-00: the point a secret hashes to, with the even y. */
+    private static BigInteger[] hashToCurve(byte[] secret) throws Exception {
+        byte[] msg = sha256(cat("Secp256k1_HashToCurve_Cashu_".getBytes(StandardCharsets.US_ASCII), secret));
+        for (long counter = 0; ; counter++) {
+            byte[] x = sha256(cat(msg, new byte[] { (byte) counter, (byte) (counter >> 8), (byte) (counter >> 16), (byte) (counter >> 24) }));
+            BigInteger[] pt = lift(new BigInteger(1, x), false);
+            if (pt != null) return pt;
+        }
+    }
+
+    private static BigInteger[] lift(BigInteger x, boolean odd) {
+        if (x.compareTo(P) >= 0) return null;
+        BigInteger v = x.modPow(BigInteger.valueOf(3), P).add(BigInteger.valueOf(7)).mod(P);
+        BigInteger y = v.modPow(P.add(BigInteger.ONE).shiftRight(2), P);
+        if (!y.multiply(y).mod(P).equals(v)) return null;
+        if (y.testBit(0) != odd) y = P.subtract(y);
+        return new BigInteger[] { x, y };
+    }
+
+    private static BigInteger[] decompress(byte[] b33) { return lift(new BigInteger(1, Arrays.copyOfRange(b33, 1, 33)), b33[0] == 3); }
+
+    private static BigInteger[] add(BigInteger[] a, BigInteger[] b) {
+        if (a == null) return b;
+        if (b == null) return a;
+        BigInteger l;
+        if (a[0].equals(b[0])) {
+            if (!a[1].equals(b[1])) return null;
+            l = BigInteger.valueOf(3).multiply(a[0].pow(2)).multiply(a[1].shiftLeft(1).modInverse(P)).mod(P);
+        } else {
+            l = b[1].subtract(a[1]).multiply(b[0].subtract(a[0]).modInverse(P)).mod(P);
+        }
+        BigInteger x = l.pow(2).subtract(a[0]).subtract(b[0]).mod(P);
+        return new BigInteger[] { x, l.multiply(a[0].subtract(x)).subtract(a[1]).mod(P) };
+    }
+
+    private static BigInteger[] mul(BigInteger k, BigInteger[] pt) {
+        BigInteger[] r = null, q = pt;
+        for (k = k.mod(N); k.signum() > 0; k = k.shiftRight(1)) {
+            if (k.testBit(0)) r = add(r, q);
+            q = add(q, q);
+        }
+        return r;
+    }
+
+    private static byte[] point65(BigInteger[] pt) { return cat(new byte[] { 4 }, bytes32(pt[0]), bytes32(pt[1])); }
+
+    private static byte[] compressed(BigInteger[] pt) { return cat(new byte[] { (byte) (pt[1].testBit(0) ? 3 : 2) }, bytes32(pt[0])); }
+
+    private static byte[] bytes32(BigInteger n) {
+        byte[] b = n.toByteArray(), out = new byte[32];
+        int len = Math.min(b.length, 32);
+        System.arraycopy(b, b.length - len, out, 32 - len, len);
+        return out;
+    }
+
+    private static byte[] sha256(byte[] in) throws Exception { return MessageDigest.getInstance("SHA-256").digest(in); }
+
+    // ---- what a phone sends -----------------------------------------------------------------------------------------------
+
+    private static byte[] select() throws Exception { return send(0x00, 0xA4, 0x04, 0x00, hex(AID), 0); }
+
+    private static void retapWithPin() throws Exception {
+        link.retap();
+        say("selected again in a new tap", sw(select()) == 0x9000);
+        say("VERIFY_PIN in it", sw(send(0xB0, 0x40, 0, 0, PIN, -1)) == 0x9000);
+    }
+
+    /** SPEND_ALL_SIGN, again for as long as the card says "not yet" (9000 and two bytes). The signature, or null. */
+    private static byte[] sign() throws Exception {
+        for (int i = 0; i < 1100; i++) {
+            byte[] r = send(0xB0, 0x24, 0, 0, null, 64);
+            if (sw(r) != 0x9000) return null;
+            if (r.length != 4) return Arrays.copyOf(r, r.length - 2);
+        }
+        return null;
+    }
+
+    /** The owner's proof for a command: its length, a signature (ECDSA, P-256, SHA-256, DER) over label, the nonce just given and the value, then the value. */
+    private static byte[] ownerData(KeyPair owner, String label, byte[] value) throws Exception {
+        byte[] nonce = data(send(0xB0, 0x44, 0, 0, null, 16), 0x9000);
+        Signature s = Signature.getInstance("SHA256withECDSA");
+        s.initSign(owner.getPrivate());
+        s.update(label.getBytes(StandardCharsets.US_ASCII));
+        s.update(nonce);
+        s.update(value);
+        byte[] der = s.sign();
+        return cat(new byte[] { (byte) der.length }, der, value);
+    }
+
+    private static KeyPair ownerKey() throws Exception {
+        KeyPairGenerator g = KeyPairGenerator.getInstance("EC");
+        g.initialize(new ECGenParameterSpec("secp256r1"));
+        return g.generateKeyPair();
+    }
+
+    private static byte[] uncompressed(KeyPair pair) {
+        java.security.spec.ECPoint w = ((ECPublicKey) pair.getPublic()).getW();
+        return cat(new byte[] { 4 }, bytes32(w.getAffineX()), bytes32(w.getAffineY()));
+    }
+
+    /** SET_CARD's data: unit, no refund key, the 65 bytes the card does not read, the mint's length and the mint. */
+    private static byte[] record() {
+        byte[] mint = "https://mint.example.com/Bitcoin".getBytes(StandardCharsets.US_ASCII);
+        return cat(new byte[] { 0 }, new byte[33], new byte[65], new byte[] { (byte) mint.length }, mint);
+    }
+
+    /** A piece as LOAD_PROOF takes it: keyset (8), amount (4), nonce (32), C (33: a point's first byte and the seed after it), date (4, none). */
+    private static byte[] piece(long amount, int seed) {
+        byte[] p = new byte[81];
+        System.arraycopy(KEYSET, 0, p, 0, 8);
+        System.arraycopy(u32(amount), 0, p, 8, 4);
+        for (int i = 0; i < 32; i++) p[12 + i] = (byte) (0x60 + seed + i);
+        p[44] = 0x02;
+        for (int i = 0; i < 32; i++) p[45 + i] = (byte) (seed + 7);
+        return p;
+    }
+
+    private static byte[] u32(long v) { return new byte[] { (byte) (v >> 24), (byte) (v >> 16), (byte) (v >> 8), (byte) v }; }
+
+    private static long be32(byte[] b, int at) {
+        return ((long) (b[at] & 0xFF) << 24) | ((b[at + 1] & 0xFF) << 16) | ((b[at + 2] & 0xFF) << 8) | (b[at + 3] & 0xFF);
+    }
+
+    // ---- the talk ---------------------------------------------------------------------------------------------------------
+
+    /** One command: CLA, INS, P1, P2, the data (null for none) and Le (-1 for none, 0 for 256). The answer, status word last. */
+    private static byte[] send(int cla, int ins, int p1, int p2, byte[] data, int le) throws Exception {
+        int lc = data == null ? 0 : data.length;
+        byte[] c = new byte[4 + (lc > 0 ? 1 + lc : 0) + (le >= 0 ? 1 : 0)];
+        c[0] = (byte) cla; c[1] = (byte) ins; c[2] = (byte) p1; c[3] = (byte) p2;
+        int at = 4;
+        if (lc > 0) { c[at++] = (byte) lc; System.arraycopy(data, 0, c, at, lc); at += lc; }
+        if (le >= 0) c[at] = (byte) le;
+        return link.send(c);
+    }
+
+    private static int sw(byte[] answer) {
+        return answer.length < 2 ? -1 : ((answer[answer.length - 2] & 0xFF) << 8) | (answer[answer.length - 1] & 0xFF);
+    }
+
+    /** What an answer carries, if it was that status word; otherwise null. */
+    private static byte[] data(byte[] answer, int wanted) {
+        return sw(answer) == wanted ? Arrays.copyOf(answer, answer.length - 2) : null;
+    }
+
+    private static void say(String what, boolean held) {
+        checks++;
+        if (!held) failed++;
+        System.out.println((held ? "  ok    " : "  FAIL  ") + what);
+    }
+
+    private static Link reader() throws Exception {
+        TerminalFactory factory = TerminalFactory.getInstance("PC/SC", null, new jnasmartcardio.Smartcardio());
+        for (CardTerminal t : factory.terminals().list()) {
+            if (!t.isCardPresent()) continue;
+            final Card card = t.connect("*");
+            return new Link() {
+                Card now = card;
+                CardChannel to = card.getBasicChannel();
+                public byte[] send(byte[] command) throws Exception { return to.transmit(new CommandAPDU(command)).getBytes(); }
+                public void retap() throws Exception { now.disconnect(true); now = t.connect("*"); to = now.getBasicChannel(); }
+                public void close() throws Exception { now.disconnect(true); }
+            };
+        }
+        throw new IllegalStateException("no card in any reader");
+    }
+
+    /** A card behind the lines of tools/chip/ChipBridge.java or the simulator's server (tap, apdu HEX, end). */
+    private static Link bridge(String hostAndPort) throws Exception {
+        int colon = hostAndPort.lastIndexOf(':');
+        final Socket socket = new Socket(hostAndPort.substring(0, colon), Integer.parseInt(hostAndPort.substring(colon + 1)));
+        final BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.US_ASCII));
+        final OutputStream out = socket.getOutputStream();
+        if (!"ok".equals(talk(in, out, "tap"))) throw new IllegalStateException("the card does not answer a tap");
+        return new Link() {
+            public byte[] send(byte[] command) throws Exception {
+                String a = talk(in, out, "apdu " + toHex(command));
+                if (a.equals("gone") || a.equals("none") || a.equals("what")) throw new IllegalStateException("the card went (" + a + ")");
+                return hex(a);
+            }
+            public void retap() throws Exception {
+                talk(in, out, "end");
+                if (!"ok".equals(talk(in, out, "tap"))) throw new IllegalStateException("the card does not answer a new tap");
+            }
+            public void close() throws Exception { talk(in, out, "end"); socket.close(); }
+        };
+    }
+
+    private static String talk(BufferedReader in, OutputStream out, String line) throws Exception {
+        out.write((line + "\n").getBytes(StandardCharsets.US_ASCII));
+        out.flush();
+        String a = in.readLine();
+        if (a == null) throw new IllegalStateException("the other end closed");
+        return a.trim();
+    }
+
+    private static byte[] cat(byte[]... parts) {
+        int n = 0;
+        for (byte[] p : parts) n += p.length;
+        byte[] out = new byte[n];
+        int at = 0;
+        for (byte[] p : parts) { System.arraycopy(p, 0, out, at, p.length); at += p.length; }
+        return out;
+    }
+
+    private static byte[] hex(String s) {
+        byte[] out = new byte[s.length() / 2];
+        for (int i = 0; i < out.length; i++) out[i] = (byte) Integer.parseInt(s.substring(i * 2, i * 2 + 2), 16);
+        return out;
+    }
+
+    private static String toHex(byte[] b) {
+        StringBuilder out = new StringBuilder();
+        for (byte x : b) out.append(String.format("%02X", x & 0xFF));
+        return out.toString();
+    }
+}

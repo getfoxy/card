@@ -22,9 +22,11 @@ import java.util.Arrays;
  * limit, so the one thing the suite cannot show is that the card gives the bytes when SET_CARD asks for them after the install.
  * This is a short run that shows it, on the card itself, by what a phone would see:
  *
- *   select; GET_INFO in its three forms (30, 42 and 43 bytes) and the version 01 14;
+ *   select; GET_INFO in its three forms (30, 42 and 43 bytes) and the version, 01 14 or later;
  *   GET_DLEQ before any SET_CARD (00, no exception);
- *   set up as a phone does, the owner last: SET_CARD, the command that reserves the store (its time is printed), then SET_OWNER;
+ *   set up as a phone does, the owner last: the PIN, SET_CARD, the command that reserves the store (its time is printed), then
+ *   SET_OWNER, asked again while the card says "not yet" (software 1.21 claims an owner under the PIN by ten askings in a row;
+ *   1.20 takes it at the first), and a new tap, as a card claimed in a tap pays in the next (1.21);
  *   one piece loaded WITH a proof (LOAD_PROOF, P1 = 1), read back (01 and the 96 bytes);
  *   another loaded plain, read back (00); two places in one GET_DLEQ; the refusals (a proof of zeros, a wrong length);
  *   both paid in one payment (the chip signs), then GET_DLEQ for the spent places (00) and CLEAR_SPENT;
@@ -50,8 +52,11 @@ public final class ProofStoreCheck {
     /** One command and its answer, status word last. */
     interface Link {
         byte[] send(byte[] command) throws Exception;
+        /** The card taken out of the field and put back: a new tap, nothing of the last one kept. */
+        void retap() throws Exception;
         void close() throws Exception;
     }
+    private static final byte[] PIN = { '1', '2', '3', '4' };
 
     private static Link link;
     private static int checks = 0, failed = 0;
@@ -78,7 +83,7 @@ public final class ProofStoreCheck {
             System.out.println("the card's applet does not answer SELECT: " + toHex(selected));
             return 2;
         }
-        say("SELECT answers the version 01 " + String.format("%02X", selected[1]) + " (1.20 is 01 14)", (selected[1] & 0xFF) >= 0x14);
+        say("SELECT answers the version 01 " + String.format("%02X", selected[1]) + " (1.20 is 01 14, 1.21 is 01 15)", (selected[1] & 0xFF) >= 0x14);
         byte[] info = data(send(0xB0, 0x01, 0, 0, null, 0), 0x9000);
         if (info == null || info.length != 30 || info[16] != 0 || info[11] != 0 || info[3] != 0 || info[4] != 0) {
             System.out.println("the card is not blank (an owner, a record or a piece is on it): nothing was done. Make it blank first.");
@@ -89,19 +94,25 @@ public final class ProofStoreCheck {
         // GET_INFO in its three forms, and what it says of the version
         byte[] i1 = data(send(0xB0, 0x01, 1, 0, null, 0), 0x9000), i2 = data(send(0xB0, 0x01, 2, 0, null, 0), 0x9000);
         say("GET_INFO is 30 bytes, 42 with P1 = 1, 43 with P1 = 2", info.length == 30 && i1 != null && i1.length == 42 && i2 != null && i2.length == 43);
-        say("P1 = 2 begins with the 42 of P1 = 1, and its version is 01 14", i1 != null && i2 != null && Arrays.equals(i1, Arrays.copyOf(i2, 42)) && info[0] == 1 && info[1] == 0x14);
+        say("P1 = 2 begins with the 42 of P1 = 1, and its version is SELECT's", i1 != null && i2 != null && Arrays.equals(i1, Arrays.copyOf(i2, 42)) && info[0] == 1 && info[1] == selected[1]);
 
         // before any SET_CARD: no store, and no exception
         say("GET_DLEQ before any SET_CARD answers 00", Arrays.equals(data(send(0xB0, 0x1A, 0, 0xFF, null, 0), 0x9000), NONE));
         say("GET_DLEQ for a place there is not (128) is 6A83", sw(send(0xB0, 0x1A, 128, 0xFF, null, 0)) == 0x6A83);
 
-        // set up as a phone sets a card up, the owner last (a key made here): the record first, which is the command that reserves the store
+        // set up as a phone sets a card up, the owner last (a key made here): the PIN, then the record, which is the command that reserves the store
+        say("SET_PIN on a card with no owner", sw(send(0xB0, 0x41, 0, 0, PIN, -1)) == 0x9000);
+        say("VERIFY_PIN", sw(send(0xB0, 0x40, 0, 0, PIN, -1)) == 0x9000);
         long began = System.nanoTime();
         int setCard = sw(send(0xB0, 0x32, 0, 0, record(), -1));
         System.out.println("      SET_CARD took " + (System.nanoTime() - began) / 1000000 + " ms (the first, which reserves 12,288 bytes after the install)");
         say("SET_CARD goes through, with or without the room for proofs", setCard == 0x9000);
         KeyPair owner = ownerKey();
-        say("SET_OWNER", sw(send(0xB0, 0x43, 0, 0, uncompressed(owner), -1)) == 0x9000);
+        say("SET_OWNER, asked again while the card says not yet", claim(uncompressed(owner)));
+        // a card claimed in a tap pays in the next (1.21): a new tap, the PIN again
+        link.retap();
+        say("selected again in a new tap", sw(send(0x00, 0xA4, 0x04, 0x00, hex(AID), 0)) == 0x9000);
+        say("VERIFY_PIN in the new tap", sw(send(0xB0, 0x40, 0, 0, PIN, -1)) == 0x9000);
 
         // one piece with a proof, read back
         byte[] p0 = piece(2, 1), proof0 = proof(1);
@@ -140,8 +151,8 @@ public final class ProofStoreCheck {
         System.out.println("      RESET_CARD took " + (System.nanoTime() - began) / 1000000 + " ms (it zeros the 12,288 bytes of the store)");
         say("RESET_CARD by the owner's proof", reset == 0x9000);
         byte[] blank = data(send(0xB0, 0x01, 0, 0, null, 0), 0x9000);
-        say("the card is blank again: no owner, no record, nothing on it, the same software",
-            blank != null && blank.length == 30 && blank[16] == 0 && blank[11] == 0 && blank[3] == 0 && blank[4] == 0 && blank[1] == 0x14);
+        say("the card is blank again: no owner, no record, nothing on it, no PIN, the same software",
+            blank != null && blank.length == 30 && blank[16] == 0 && blank[11] == 0 && blank[3] == 0 && blank[4] == 0 && blank[7] == 0 && blank[1] == selected[1]);
         say("and GET_DLEQ reads 00", Arrays.equals(data(send(0xB0, 0x1A, 0, 0xFF, null, 0), 0x9000), NONE));
 
         System.out.println(checks + " checks, " + failed + " failed.");
@@ -149,6 +160,20 @@ public final class ProofStoreCheck {
     }
 
     // ---- what a phone sends -----------------------------------------------------------------------------------------------
+
+    /** SET_OWNER on a card with no owner, sent again while it answers "not yet" (9000 and 00 01), ten times at most. Whether it ended in the claim. */
+    private static boolean claim(byte[] key) throws Exception {
+        long began = System.nanoTime();
+        for (int asked = 1; asked <= 10; asked++) {
+            byte[] r = send(0xB0, 0x43, 0, 0, key, -1);
+            if (sw(r) != 0x9000) return false;
+            if (r.length == 2) {
+                System.out.println("      the claim took " + asked + " asking" + (asked == 1 ? "" : "s") + ", " + (System.nanoTime() - began) / 1000000 + " ms");
+                return true;
+            }
+        }
+        return false;
+    }
 
     /** A payment of those places and no outputs: BEGIN, then SIGN for as long as the card says "not yet" (9000 and two bytes). The signature, or null. */
     private static byte[] pay(int[] places) throws Exception {
@@ -256,8 +281,11 @@ public final class ProofStoreCheck {
             final Card card = t.connect("*");
             final CardChannel channel = card.getBasicChannel();
             return new Link() {
-                public byte[] send(byte[] command) throws Exception { return channel.transmit(new CommandAPDU(command)).getBytes(); }
-                public void close() throws Exception { card.disconnect(true); }       // a reset, as tools/chip/CardReset.java does: nothing of this run's tap is left
+                Card now = card;
+                CardChannel to = channel;
+                public byte[] send(byte[] command) throws Exception { return to.transmit(new CommandAPDU(command)).getBytes(); }
+                public void retap() throws Exception { now.disconnect(true); now = t.connect("*"); to = now.getBasicChannel(); }
+                public void close() throws Exception { now.disconnect(true); }       // a reset, as tools/chip/CardReset.java does: nothing of this run's tap is left
             };
         }
         throw new IllegalStateException("no card in any reader");
@@ -277,6 +305,10 @@ public final class ProofStoreCheck {
                 String a = talk(in, out, "apdu " + toHex(command));
                 if (a.equals("gone") || a.equals("none") || a.equals("what")) throw new IllegalStateException("the card went (" + a + ")");
                 return hex(a);
+            }
+            public void retap() throws Exception {
+                talk(in, out, "end");
+                if (!"ok".equals(talk(in, out, "tap"))) throw new IllegalStateException("the card does not answer a new tap");
             }
             public void close() throws Exception { talk(in, out, "end"); socket.close(); }
         };

@@ -12,12 +12,15 @@ section 4. In short:
   signs its hash; nothing a reader sends reaches the signer.
 - `SIGN_ARBITRARY` is removed. `AUTH` proves the card is the card, over a
   tagged hash no piece's secret can equal.
-- Nothing is loaded onto a card with no owner, or onto a card with no PIN but by
-  the owner's grant. (Software 1.16 makes the PIN optional. A card set up with
-  none pays without one, under its limits. A card with a PIN has a no-PIN
-  allowance: what it signs for in a day without the PIN, counted in the daily
-  limit's window. Over it the card answers `6A94` and the PIN is asked for the
-  whole payment.)
+- Nothing is loaded onto a card with no owner or no PIN. (Software 1.21 makes the
+  PIN the first thing a card has: a card with none takes nothing and pays nothing,
+  `6A97`. From 1.16 to 1.20 a card could be set up with none and paid without
+  one. A card with a PIN has a no-PIN allowance: what it signs for in a day
+  without the PIN, counted in the daily limit's window. Over it the card answers
+  `6A94` and the PIN is asked for the whole payment.)
+- The tap after a payment loads that payment's own change and nothing else, and
+  the card unblinds that change itself (`LOAD_CHANGE`, 1.21): no reader is given
+  the blinding factors of the card's change.
 - The card keeps a daily limit in permanent memory: the most it will sign for in
   one day, in sats (0 is none, and a new card has none). It keeps the day itself:
   a clock that only moves forward, the time written in the newest Bitcoin block
@@ -134,8 +137,9 @@ fails here. On the J3R180 used here the applet installed the first time.
 
 A card straight from the install has no PIN and no owner. It holds nothing and
 cannot be loaded, but any reader in range can give it a PIN and an owner of its
-own choosing (`SET_PIN`, `SET_OWNER`). Set it up (the PIN, the record, then the
-owner: spec 5.6) before it leaves your hands.
+own choosing (`SET_PIN`, `SET_OWNER`; from 1.21 the owner only under that PIN and
+by ten askings in a row, seconds of holding). Set it up (the PIN, the record, then
+the owner: spec 5.6) before it leaves your hands.
 
 After that, the phone: Foxy (https://github.com/getfoxy/iOS) built with the NFC
 entitlement (`tools/flashcard.entitlements` there), MENU, FLASHCARD, TAP CARD.

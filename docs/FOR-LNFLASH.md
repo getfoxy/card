@@ -20,8 +20,10 @@ tested.
 **Which version this describes.** The note was written when the applet was at
 version 1.1. Its figures for `GET_INFO` (30 bytes), the slots (128) and what a
 payment signs (one signature for all its pieces) are those of software 1.20, as
-are the clock (1.15) and the optional PIN (1.16); other tables may still show
-1.1. For the rest,
+are the clock (1.15) and the no-PIN allowance (1.16); other tables may still show
+1.1. Software 1.21 (section 9) makes a PIN the first thing a card has, closes the
+tap after a payment to the payment's own change, unblinds that change on the card,
+and claims an owner slowly. For the rest,
 `docs/FOXY-CARD-SPEC.md` and `docs/FOXY-CARD-DAILY-LIMIT.md` are what is built.
 
 ## 1. What we would like you to look at
@@ -162,7 +164,7 @@ newest hash of a block header taken (a time key up to 1.14), the clock and the
 day, and the mint's address (up to 80 bytes). Apart from it the card keeps a
 65-byte owner public key, which nothing reads out. The applet's version was 1.1
 (`SELECT` answers `01 01`) and the format byte 3 when this was written; they are
-1.20 (`01 14`) and 4 now.
+1.21 (`01 15`) and 4 now.
 
 **The owner and its proof.** The holder's phone works the owner's private key out
 for each card as HMAC-SHA256 with the 64-byte BIP-39 seed as the key, over
@@ -349,11 +351,33 @@ visit, where the owner has set one.
   one, because it goes to the mint before saying paid.
 - The PIN crosses a few centimetres of air in the clear. Nothing of the owner
   does.
-- A card with no owner can be claimed by any reader. It holds nothing and cannot
-  be loaded.
+- A card with no owner can be claimed by a reader. It holds nothing and cannot
+  be loaded, and from 1.21 a claim wants the card's PIN given in the tap and ten
+  askings in a row, seconds of holding, and is never made in a tap that paid.
+- A locked card still pays, under its PIN and its no-PIN allowance; locking
+  freezes its settings and every write.
+- The reader that is first after a payment can spoil that payment's change by
+  answering for the mint with a key of its own: the card checks the mint's proof
+  against the key it is given and cannot tell that key is the mint's (section 9).
 - A cash card that is lost is lost money.
 
-## 9. Where it is
+## 9. What a 2.0 should carry from 1.21
+
+The rules are in FOXY-CARD-DAILY-LIMIT.md, "1.21 in one place". What a 2.0 card should carry from them:
+
+1. **A PIN before any money.** No card holds value without a PIN; every load wants the PIN given in the tap, and
+   nothing waives it, the owner's grant included.
+2. **Change the card unblinds itself, bound to the mint's key at payment.** SPEND_ALL_CHANGE names the change amount and
+   the mint's key for it; LOAD_CHANGE refuses any other key, checks the mint's proof and takes the blinding factor off
+   on the card. The factor never leaves the card, so a reader in the next tap can load the real change and nothing else,
+   and no grant is needed for it.
+3. **A reset, or a new record, waits until no change is owed.**
+4. **An owner claimed in a tap of its own**, under the PIN, never in a tap that paid, after a held count of askings
+   answered with a status word that is not `9000`.
+5. **A no-PIN allowance counted on the whole of what is spent and refilled by the PIN**, not by a clock.
+6. **The holder may set the per-payment limit and the allowance with the PIN** until the card has an owner.
+
+## 10. Where it is
 
 Two public repositories.
 

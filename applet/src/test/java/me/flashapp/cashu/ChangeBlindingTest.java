@@ -41,7 +41,7 @@ class ChangeBlindingTest {
         byte[] changeOpen = (byte[]) openings.get(applet);
         long date = CashuAppletTest.readUint32(CashuAppletTest.buildProof(CashuAppletTest.KEYSET, 100, 1), 77);
         for (int i = 0; i < 200; i++) {
-            int open = (i % 8) * 80;
+            int open = (i % 8) * CashuApplet.OPEN_LEN;
             byte[] buf = new byte[261];
             try {
                 blind.invoke(applet, (short) 0, (short) open, buf);

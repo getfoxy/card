@@ -4,7 +4,19 @@ JavaCard Cashu Applet — AID: `D2 76 00 00 85 01 02`
 
 All commands use `CLA = B0` unless noted. All multi-byte integers are big-endian.
 
+This is upstream's command reference, with Foxy's software noted where it differs.
+Foxy's applet has an AID of its own (`F0 46 4F 58 59 43 41 52 44`) and a wire of its
+own; for every command of it, `docs/FOXY-CARD-DAILY-LIMIT.md` section 8 is the
+reference, and where this page and that one differ, that one is what is built. Foxy's
+software 1.21 (`SELECT` answers `01 15`) gives a card its PIN before anything goes on
+it or leaves it, lets the tap after a payment load that payment's own change and
+nothing else, unblinds the card's own change on the card ([LOAD_CHANGE](#load_change-0x53--software-121)),
+and claims an owner slowly ([SET_OWNER](#set_owner-0x43--software-121)).
+
 ---
+
+
+> **1.21:** the rules in FOXY-CARD-DAILY-LIMIT.md, section "1.21 in one place", win over anything below that still describes the tap after a payment as a grant, a claim answered `00 01`, loads under the owner's grant, or a no-PIN allowance renewed by the day.
 
 ## SELECT APPLICATION
 
@@ -66,12 +78,14 @@ Returns applet version, capabilities, and slot statistics. Always available with
 | 2 | PIN protection available |
 | 3–7 | Reserved (0) |
 
-**In Foxy's software** the answer is longer than these eight bytes (see `docs/FOXY-CARD-SPEC.md` 5.2). Asked with P1 = 1 the answer is 42 bytes. From 1.19, asked with P1 = 2 it is those 42 bytes and one more, the 43rd, which says whether the NFC tag is on: `00` on, `01` off. From 1.20 `SELECT` answers `01 14` and those three answers are otherwise byte for byte what they were; nothing in them says whether the card has room for the mint's proofs (see [GET_DLEQ](#get_dleq-0x1a--software-120)).
+**In Foxy's software** the answer is longer than these eight bytes (see `docs/FOXY-CARD-SPEC.md` 5.2). Asked with P1 = 1 the answer is 42 bytes. From 1.19, asked with P1 = 2 it is those 42 bytes and one more, the 43rd, which says whether the NFC tag is on: `00` on, `01` off. From 1.20 `SELECT` answers `01 14` and those three answers are otherwise byte for byte what they were; nothing in them says whether the card has room for the mint's proofs (see [GET_DLEQ](#get_dleq-0x1a--software-120)). From 1.21 `SELECT` answers `01 15`, and byte 29 (whether this tap may still load change with no PIN) is said only to a reader that has given the PIN or the owner's grant in the tap, and is `00` to any other. Byte 7 is as above; on a 1.21 card a PIN state of 0 is a card that holds nothing and pays nothing.
 
 **PIN state 2 is not "no PIN".** A blocked card still has a PIN; it can never
 be verified again (`VERIFY_PIN` answers `6983`), so every PIN-gated command
 answers `6982` permanently. There is no unblock path in this profile. A reader
-must treat 2 as "a PIN exists", never as 0.
+must treat 2 as "a PIN exists", never as 0. (In Foxy's software the owner's phone
+unblocks it, `CHANGE_PIN` with the owner's proof, and the owner's grant still frees a
+blocked card's spent slots with `CLEAR_SPENT`.)
 
 ---
 
@@ -175,6 +189,24 @@ Lightweight bulk status read. Returns a 1-byte status for every slot (0=empty, 1
 | Le | 20 (32 bytes, one per slot) |
 | Response | 32 bytes: one status byte per slot |
 
+In Foxy's software the card has 128 slots, and the answer is **128 bytes**, one status byte per slot (ask with Le `00`).
+
+---
+
+### GET_CHANGE (0x19) — software 1.12, record changed in 1.21
+
+The openings of the change the card made for itself (`SPEND_ALL_CHANGE`) and has not yet been handed, three to a page. No PIN. It writes nothing but this: an opening whose piece is on the card by now is let go first.
+
+| Field | Value |
+|-------|-------|
+| CLA | B0 |
+| INS | 19 |
+| P1 | The page, from 0 |
+| P2 | 00 |
+| Le | 00 (256) |
+
+**Response.** A count (1), then for each opening, 50 bytes: its number (1, the P1 of [LOAD_CHANGE](#load_change-0x53--software-121)), the amount (4), the keyset (8), the date (4) and the blinded message `B_` (33, compressed). Never the nonce or the blinding factor: the card unblinds its change itself. Up to 1.20 a record was 80 bytes, the amount, keyset, date, nonce and blinding factor.
+
 ---
 
 ### GET_DLEQ (0x1A) — software 1.20
@@ -201,7 +233,7 @@ Gives back the mint's proof (NUT-12) that the card keeps with an unspent piece: 
 
 ## Category 0x2x — Spend (PIN required if PIN is set — Profile B+)
 
-If a PIN is set, the reader must call `VERIFY_PIN (0x40)` within the same NFC session before any spend or sign command (D13). "A PIN is set" includes the blocked state (GET_INFO byte 7 = 2): `VERIFY_PIN` can never succeed there, so every spend and sign command answers `6982` permanently. Cards provisioned without a PIN keep tap-and-go behaviour. The PIN session flag is transient: cleared on card deselect / tap end, and by any failed PIN check (see [Session State](#session-state-transient)).
+If a PIN is set, the reader must call `VERIFY_PIN (0x40)` within the same NFC session before any spend or sign command (D13). "A PIN is set" includes the blocked state (GET_INFO byte 7 = 2): `VERIFY_PIN` can never succeed there, so every spend and sign command answers `6982` permanently. Cards provisioned without a PIN keep tap-and-go behaviour. (In Foxy's software a payment is `SPEND_ALL_BEGIN`, `SPEND_ALL_OUTPUTS`, `SPEND_ALL_CHANGE` and `SPEND_ALL_SIGN`, `22` to `26`, and the PIN, or the no-PIN allowance, is asked at `SPEND_ALL_SIGN`; from 1.21 a card with no PIN refuses all five with `6A97`, and a card claimed in this time in the field refuses them with `6985`.) The PIN session flag is transient: cleared on card deselect / tap end, and by any failed PIN check (see [Session State](#session-state-transient)).
 
 ### SPEND_PROOF (0x20)
 
@@ -283,7 +315,7 @@ session.
 
 ## Category 0x3x — Write (PIN required if PIN is set)
 
-If PIN is set, the reader must call `VERIFY_PIN (0x40)` within the same NFC session before calling write commands. "PIN is set" includes the blocked state (GET_INFO byte 7 = 2), in which every write command answers `6982` permanently. The PIN session flag is transient: cleared on card deselect / tap end, and by any failed PIN check (see [Session State](#session-state-transient)).
+If PIN is set, the reader must call `VERIFY_PIN (0x40)` within the same NFC session before calling write commands. "PIN is set" includes the blocked state (GET_INFO byte 7 = 2), in which every write command answers `6982` permanently. (In Foxy's software the owner's grant, `ALLOW_LOAD`, stands in for the PIN for `LOAD_PROOF`, `LOAD_CHANGE` and `CLEAR_SPENT`; on a blocked card it still opens `CLEAR_SPENT` and not the loads. From 1.21 a card with no PIN refuses all three with `6A97`.) The PIN session flag is transient: cleared on card deselect / tap end, and by any failed PIN check (see [Session State](#session-state-transient)).
 
 ### LOAD_PROOF (0x30)
 
@@ -300,6 +332,8 @@ Stores a new proof in the next available empty slot. Used during card top-up (fu
 | Le | 01 |
 | Response | 1-byte slot index assigned |
 
+**In Foxy's software** a piece is **81 bytes**: those 77 and its date (4, big-endian, 0 for none), and one command takes one, two or three pieces end to end (Lc `51`, `A2` or `F3`), answered with the slot of each piece stored. It needs a PIN set and given in this tap, or the owner's grant (`ALLOW_LOAD`), an owner and a card record; the tap after a payment does not open it (1.21: that tap loads the payment's own change, by [LOAD_CHANGE](#load_change-0x53--software-121)). Several pieces are taken in order, each as one alone would be: if the first cannot be stored the command is refused with its word; if a later one cannot, the answer is the slots of those before it.
+
 **Errors:**
 
 | SW | Meaning |
@@ -307,14 +341,27 @@ Stores a new proof in the next available empty slot. Used during card top-up (fu
 | 6982 | Security condition not satisfied (PIN set or blocked, and not verified in this session) |
 | 6986 | Card locked (`LOCK_CARD`) — writes disabled |
 | 6A84 | No space — all slots occupied |
+| 6A97 | Foxy, 1.21: the card has no PIN; a card is given its PIN first (checked before anything but the lock) |
+| 6A90 | Foxy: the card has no owner |
+| 6A8C | Foxy: the card has no record (`SET_CARD` has not run) |
+| 6700 | Foxy: a length that is not one, two or three pieces of 81 bytes (with P1 = 1: not 177) |
+| 6A8E | Foxy: a dated piece on a card with no refund key |
+| 6A80 | Foxy: a `C` that is not a compressed point, an amount of 0, or (P1 = 1) a proof of 96 zero bytes |
+| 6A94 | Foxy: a piece whose nonce is already in a slot, spent or not; checked last, before anything is written |
+
+In Foxy's software the words come in this order: `6986`, `6A97`, `6982`, `6A90`, `6A8C`, `6A84`, `6700`, and then, for each piece, `6A84`, `6A8E`, `6A80`, `6A94`.
 
 **Write order.** The card stores the 77 bytes, then marks the slot unspent
 (D14, applet 0.4 and later; a card whose `SELECT` answers below `00 04` may
 mark it first). A card that leaves the field mid-command leaves the slot empty
-or holding the whole proof, never part of one marked unspent. The card does not
-check for duplicates, so after a `LOAD_PROOF` whose answer was lost the proof
-may or may not be on the card: read the slots (`GET_SLOT_STATUS`, `GET_PROOF`)
-before sending it again.
+or holding the whole proof, never part of one marked unspent. Upstream's card
+does not check for duplicates, so after a `LOAD_PROOF` whose answer was lost the
+proof may or may not be on the card: read the slots (`GET_SLOT_STATUS`,
+`GET_PROOF`) before sending it again. Foxy's card refuses a piece whose nonce is
+in any slot (`6A94`), so sending it again is safe, and the answer says it is
+there already. In Foxy's software the slot's text for hashing and its record in
+the store of the mint's proofs are written before its data, and the status byte
+is the last write.
 
 **With P1 = 1 (Foxy's software 1.20): one piece and the mint's proof for it.** The data is exactly 177 bytes: the 81 bytes of a piece (`docs/FOXY-CARD-SPEC.md` 5.1; keyset, amount, nonce, `C`, date) and then `e ‖ s ‖ r`, 96 bytes. The answer is two bytes: the slot, then `01` if the proof was kept and `00` if the card has no room for proofs and went on without it. Any other length is `6700`; a proof of 96 zero bytes is `6A80` (zeros are what "no proof" is kept as); every other check, word and effect is that of a load of one piece, in the same order. A P1 other than 1 is as it was: one to three pieces of 81 bytes, the slot of each as the answer, and each piece stored that way is kept with no proof. The proof is written into the slot's record before the slot's data, and the status byte is still the last write.
 
@@ -322,7 +369,7 @@ before sending it again.
 
 ### CLEAR_SPENT (0x31)
 
-Garbage-collects all spent proof slots, freeing them for new proofs. Called after a top-up cycle to reclaim slot space. Requires PIN.
+Garbage-collects all spent proof slots, freeing them for new proofs. Called after a top-up cycle to reclaim slot space. Requires PIN. (In Foxy's software: the PIN given in this tap, or the owner's grant, which frees a blocked card's slots too; `6A97` on a card with no PIN; the tap after a payment does not open it, 1.21. From 1.16 to 1.20 a card with no PIN was freed by whoever held it, and the tap after a payment freed any card's.)
 
 | Field | Value |
 |-------|-------|
@@ -339,6 +386,7 @@ Garbage-collects all spent proof slots, freeing them for new proofs. Called afte
 |----|---------|
 | 6982 | Security condition not satisfied (PIN set or blocked, and not verified in this session) |
 | 6986 | Card locked (`LOCK_CARD`) — writes disabled |
+| 6A97 | Foxy, 1.21: the card has no PIN |
 
 **Write order.** Each spent slot's data is zeroed, then the slot is marked
 empty (D14, applet 0.4 and later). A tear leaves a slot still spent, which the
@@ -351,6 +399,41 @@ fails the card file's slot checks ([`CARD-FILE.md`](CARD-FILE.md#slot)). The
 slot checks catch a zeroed amount and a `C` that is no longer a point. A tear
 that zeroed only keyset or nonce bytes, or part of `C` whose x still lands on
 the curve, passes them, and `dump` writes that slot as spent.
+
+---
+
+### LOAD_CHANGE (0x53) — software 1.21
+
+One opening of the card's own change (`SPEND_ALL_CHANGE`) made into the piece it was for. The data is what the mint answered for the opening's blinded message `B_`. The card checks the mint's NUT-12 proof against `K` and its own `B_` (`R1 = s·G − e·K`, `R2 = s·B_ − e·C_`, and `e` must be SHA-256 of `R1`, `R2`, `K` and `C_`, each uncompressed, as lowercase hex text), takes off its own blinding factor (`C = C_ − r·K`), and writes the piece as `LOAD_PROOF` writes one, with the opening's keyset, amount, nonce and date and that `C`, a record of zeros in the store of the mint's proofs, and the status byte last. The opening is let go. The blinding factor never leaves the card.
+
+| Field | Value |
+|-------|-------|
+| CLA | B0 |
+| INS | 53 |
+| P1 | The opening's number (0 to 7), as [GET_CHANGE](#get_change-0x19--software-112-record-changed-in-121) gives it |
+| P2 | 00 |
+| Lc | C2 (194 bytes) |
+| Data | `C_` (65, `04 ‖ x ‖ y`) + `K`, the mint's key for the opening's amount (65, the same form) + `e` (32) + `s` (32) |
+| Le | 01 |
+| Response | 1-byte slot index the piece went into |
+
+**Who may:** the PIN given in this tap, or the owner's grant (`ALLOW_LOAD`), or this tap being the one after the payment that made the opening, once for that opening (`docs/FOXY-CARD-DAILY-LIMIT.md` 8.2).
+
+**Errors** (in the order they are checked):
+
+| SW | Meaning |
+|----|---------|
+| 6986 | Card locked (`LOCK_CARD`) |
+| 6A97 | The card has no PIN |
+| 6A83 | P1 is past the last opening (7) |
+| 6982 | Neither the PIN, nor the owner's grant, nor the grant of the tap after the payment for this opening |
+| 6A88 | The opening is not waiting for its piece |
+| 6A94 | The opening's piece is on the card already; the opening is let go |
+| 6A84 | No empty slot |
+| 6700 | Any length but 194 |
+| 6A80 | A point that is not on the curve or not in the `04` form, or a proof that does not hold |
+
+The card cannot tell that `K` is the mint's key: a key made up with a proof that holds for it is taken, and the piece is one the mint will not take (`docs/FOXY-CARD-SPEC.md` 5.10).
 
 ---
 
@@ -400,6 +483,36 @@ Sets the provisioning PIN. May only be called **once** (during card personalizat
 | 6986 | Card locked (`LOCK_CARD`) |
 | 6700 | Wrong data length (PIN must be 4–8 bytes) |
 
+In Foxy's software `SET_PIN` sets or replaces the PIN, and unblocks, on a card with no owner and nothing unspent, and is the first thing a card is given (1.21); on a card with an owner it is `6A91`, and the owner uses `CHANGE_PIN` with the owner's proof. From 1.16 to 1.20 a card with an owner and no PIN took one under the owner's grant; no such card can be made now.
+
+### SET_OWNER (0x43) — software 1.21
+
+Gives a card its owner's key, a P-256 public key, 65 bytes uncompressed (`docs/FOXY-CARD-SPEC.md` 5.6). On a card with an owner the old owner's proof comes first and it is made at once. On a card with no owner it is a **claim**, and from 1.21 a claim is slow and under the PIN.
+
+| Field | Value |
+|-------|-------|
+| CLA | B0 |
+| INS | 43 |
+| P1 | 00 |
+| P2 | 00 |
+| Data | The owner key, `04 ‖ X ‖ Y` (65); with an owner, proof length (1) and the old owner's proof first |
+| Response | On a claim, `00 01` ("not yet") to each of the first nine askings in a row; nothing to the tenth, which sets the owner |
+
+**The claim.** The PIN must be set and given in this tap, and no payment signed in this time in the field. The same key is asked for ten times in a row; each of the first nine is answered `9000` and `00 01` after a signature's work of the card's own, thrown away, as a payment's wait does it. A different key, or any other command between (a `SELECT` among them), begins the count again. After a claim, no payment is signed in that time in the field.
+
+**Errors:**
+
+| SW | Meaning |
+|----|---------|
+| 6986 | Card locked |
+| 6A97 | A claim on a card with no PIN |
+| 6982 | A claim with the PIN not given in this tap |
+| 6985 | A claim in a time in the field in which a payment was signed |
+| 6A91 | A card with an owner, with no good proof |
+| 6A8D | Anything unspent is on the card |
+| 6700 | A key that is not 65 bytes |
+| 6A80 | A key that does not begin `04`, or is not a point |
+
 ---
 
 ### CHANGE_PIN (0x42)
@@ -439,7 +552,9 @@ it the same way.
 
 ### LOCK_CARD (0x50)
 
-Permanently disables all write operations. Useful for lost/stolen card mitigation if the card is recovered. **Irreversible.** Requires PIN when one is set; a blocked PIN counts as set, so a blocked card cannot be locked.
+Permanently disables all write operations. **Irreversible.** Requires PIN when one is set; a blocked PIN counts as set, so a blocked card cannot be locked. P1 is not read.
+
+**A locked card still pays.** Locking freezes the card's settings and every write (`6986`); it does not stop a payment. In Foxy's software a locked card pays under its PIN and up to its no-PIN allowance, and its limit, its allowance and its PIN can no longer be changed; locking also needs the owner's proof, and only `RESET_CARD`, with the owner's proof and the PIN, takes a locked card back. It is not a way to make a lost card safe.
 
 | Field | Value |
 |-------|-------|
@@ -538,6 +653,7 @@ The capability container (`E103`, 15 bytes) is `00 0F 20 00 3B 00 34 04 06 E1 04
 | 6A 83 | Record not found (slot out of range) |
 | 6A 84 | Not enough memory (no empty slots) |
 | 6A 88 | Referenced data not found (slot empty) |
+| 6A 97 | Foxy, 1.21: the card has no PIN; a load, a payment or an owner's claim is refused until it is given one |
 | 6D 00 | Instruction not supported |
 | 6E 00 | Class not supported |
 | 6F 00 | No precise diagnosis (hardware / crypto error) |

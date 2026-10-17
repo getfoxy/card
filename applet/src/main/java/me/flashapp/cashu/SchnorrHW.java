@@ -437,12 +437,52 @@ final class SchnorrHW {
      * bytes uncompressed. For a change output's blinding (1.12).
      */
     void addToG(byte[] s, short sOff, byte[] h, short hOff, byte[] out, short outOff) {
+        addTo(s, sOff, G, (short) 0, h, hOff, out, outOff);
+    }
+
+    /**
+     * out = [s]g + h by the chip: addToG with the key's generator set to the
+     * point g (65 bytes, uncompressed) first. The generic mapping multiplies
+     * whatever generator its key has, which is what makes it the addition of
+     * any two points (measured on the chip). Every use of the mapping sets the
+     * generator it means, so none is left over from another. For LOAD_CHANGE
+     * (1.21): a blinding factor taken off, and a mint's proof checked.
+     */
+    void addTo(byte[] s, short sOff, byte[] g, short gOff, byte[] h, short hOff, byte[] out, short outOff) {
+        tmpPriv.setG(g, gOff, (short) 65);
         tmpPriv.setS(s, sOff, (short) 32);
         gm.init(tmpPriv);
         short len = gm.generateSecret(h, hOff, (short) 65, out, outOff);
         if (len != (short) 65 || out[outOff] != (byte) 0x04) {
             ISOException.throwIt(CashuApplet.SW_CRYPTO_ERROR);
         }
+    }
+
+    /**
+     * out = [k]p by the chip's key agreement, 65 bytes (04 || x || y): `k` 32
+     * bytes under n, `p` a point on the curve, 65 bytes uncompressed. For
+     * LOAD_CHANGE (1.21). The agreement multiplies the point it is given, and
+     * not the key's generator, so what addTo leaves there does not matter here
+     * or to sign().
+     */
+    void mul(byte[] k, short kOff, byte[] p, short pOff, byte[] out, short outOff) {
+        tmpPriv.setS(k, kOff, (short) 32);
+        ecdh.init(tmpPriv);
+        short len = ecdh.generateSecret(p, pOff, (short) 65, out, outOff);
+        if (len != (short) 65 || out[outOff] != (byte) 0x04) {
+            ISOException.throwIt(CashuApplet.SW_CRYPTO_ERROR);
+        }
+    }
+
+    /**
+     * The temp key's scalar set to a public number (G's x, which is under n),
+     * for a caller whose arithmetic stopped part way: the key is persistent,
+     * and what addTo or mul last put in it stays there until the next use. For
+     * LOAD_CHANGE (1.21), whose first step puts -r there, r being the factor
+     * that never leaves the card while its change is owed.
+     */
+    void forget() {
+        tmpPriv.setS(G, (short) 1, (short) 32);
     }
 
     /**

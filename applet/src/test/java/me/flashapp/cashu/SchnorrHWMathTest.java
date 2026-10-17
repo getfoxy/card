@@ -196,11 +196,15 @@ class SchnorrHWMathTest {
      * same bytes asked for after the install, so SET_CARD reserves them. What this test exists to catch, an allocation that repeats on
      * every command until the card's persistent memory is gone, cannot come of it: it is guarded so that it happens once in a card's
      * life (`if (dleq == null)`), and a request the card refuses allocates nothing and leaves the store null. The statement is found
-     * ignoring white space, once, inside the method named; an allocation beside it is still refused.
+     * ignoring white space, once, inside the method named; an allocation beside it is still refused. 1.21 has a second, made the same
+     * way beside it: the mint's key for each opening of change (`openKeys`, 264 bytes), which would take the constructor past the
+     * most the chip has been measured to install.
      */
     private static final String[][] ONCE_ONLY_ALLOCATIONS = {
         { "CashuApplet.java", "private void processSetCard(",
           "if (dleq == null) { try { dleq = new byte[(short)(MAX_PROOFS * DLEQ_LEN)]; } catch (SystemException e) { dleq = null; } }" },
+        { "CashuApplet.java", "private void processSetCard(",
+          "if (openKeys == null) { try { openKeys = new byte[(short)(CHANGE_MOST * KEY_LEN)]; } catch (SystemException e) { openKeys = null; } }" },
     };
 
     /**
@@ -360,42 +364,47 @@ class SchnorrHWMathTest {
      * 1.20 reserves the store of the mint's proofs in SET_CARD, and nowhere else: the constructors name it nowhere, the one allocation
      * is the guarded one in SET_CARD, it comes before the transaction that writes the record and outside any, and nothing else assigns
      * the store. (The chip refuses an applet whose constructor asks for that much more; no simulator does, so the source is read.)
+     * 1.21's room for the openings' keys (`openKeys`) is held to the same, each array on its own.
      */
     @Test
-    @DisplayName("the store of the mint's proofs is reserved in SET_CARD, guarded, before and outside its transaction, and no constructor or other method assigns it")
+    @DisplayName("the store of the mint's proofs and the room for the openings' keys are reserved in SET_CARD, each guarded, before and outside its transaction, and no constructor or other method assigns either")
     void theProofStoreIsReservedInSetCardAndNowhereElse() throws Exception {
         String src = stripCommentsAndCharLiterals(new String(
             java.nio.file.Files.readAllBytes(mainSourceDir().resolve("CashuApplet.java")), java.nio.charset.StandardCharsets.UTF_8));
         int[] constructor = bodyRange(src, "private CashuApplet()");
-        org.junit.jupiter.api.Assertions.assertFalse(src.substring(constructor[0], constructor[1]).contains("dleq"),
-            "the constructor does not name the store: asked for there, the chip refuses to install the applet");
         int[] setCard = bodyRange(src, "private void processSetCard(");
         String body = src.substring(setCard[0], setCard[1]);
-        int guard = body.indexOf("if (dleq == null)");
-        int allocation = body.indexOf("dleq = new byte[");
         int begin = body.indexOf("JCSystem.beginTransaction()");
-        org.junit.jupiter.api.Assertions.assertTrue(guard > 0 && guard < allocation && allocation < begin,
-            "reserved once, behind its guard, before the transaction that writes the record");
-        org.junit.jupiter.api.Assertions.assertTrue(!body.substring(0, allocation).contains("beginTransaction"),
-            "and outside any transaction");
-        // every assignment to the store: the allocation, and the null the catch leaves it as
-        java.util.regex.Matcher assigned = java.util.regex.Pattern.compile("(?<![\\w.])dleq\\s*=(?!=)").matcher(src);
-        int assignments = 0;
-        while (assigned.find()) {
-            assignments++;
-            org.junit.jupiter.api.Assertions.assertTrue(assigned.start() > setCard[0] && assigned.start() < setCard[1],
-                "the store is assigned only in SET_CARD, near: ..." + src.substring(Math.max(0, assigned.start() - 60), Math.min(src.length(), assigned.start() + 40)).replaceAll("\\s+", " "));
+        for (String store : new String[] { "dleq", "openKeys" }) {
+            org.junit.jupiter.api.Assertions.assertFalse(src.substring(constructor[0], constructor[1]).contains(store),
+                "the constructor does not name " + store + ": asked for there, the chip refuses to install the applet");
+            int guard = body.indexOf("if (" + store + " == null)");
+            int allocation = body.indexOf(store + " = new byte[");
+            org.junit.jupiter.api.Assertions.assertTrue(guard > 0 && guard < allocation && allocation < begin,
+                store + " is reserved once, behind its guard, before the transaction that writes the record");
+            org.junit.jupiter.api.Assertions.assertTrue(!body.substring(0, allocation).contains("beginTransaction"),
+                "and outside any transaction");
+            // every assignment to it: the allocation, and the null the catch leaves it as
+            java.util.regex.Matcher assigned = java.util.regex.Pattern.compile("(?<![\\w.])" + store + "\\s*=(?!=)").matcher(src);
+            int assignments = 0;
+            while (assigned.find()) {
+                assignments++;
+                org.junit.jupiter.api.Assertions.assertTrue(assigned.start() > setCard[0] && assigned.start() < setCard[1],
+                    store + " is assigned only in SET_CARD, near: ..." + src.substring(Math.max(0, assigned.start() - 60), Math.min(src.length(), assigned.start() + 40)).replaceAll("\\s+", " "));
+            }
+            org.junit.jupiter.api.Assertions.assertEquals(2, assignments, store + ": the allocation, and the null the catch leaves it as");
         }
-        org.junit.jupiter.api.Assertions.assertEquals(2, assignments, "the allocation, and the null the catch leaves it as");
     }
 
     /**
-     * The persistent arrays the constructors make, by their sizes: 29,806 bytes in 1.19, and the same in 1.20. The chip took +300 bytes
-     * more in a constructor and refused +12,288 (measured, docs/FOXY-CARD-HARDWARE.md), where the 12,288 bytes of the mint's proofs are
-     * given when asked for after the install. A figure past this one has to be measured on a card first.
+     * The persistent arrays the constructors make, by their sizes: 29,806 bytes in 1.19, and the same in 1.20; 30,069 in 1.21, which keeps
+     * each opening's blinded message beside it (33 bytes for each of eight) and no longer has the one-byte note of change owed: 263 more
+     * and inside the 300 measured. The chip took +300 bytes more in a constructor and refused +12,288 (measured,
+     * docs/FOXY-CARD-HARDWARE.md), where the 12,288 bytes of the mint's proofs are given when asked for after the install, and so, in 1.21,
+     * are the 264 of the openings' keys. A figure past this one has to be measured on a card first.
      */
     @Test
-    @DisplayName("the constructors make 29,806 bytes of persistent arrays, 1.19's figure: the 12,288 of the mint's proofs are not among them, for the chip refuses a constructor that asks for that much more")
+    @DisplayName("the constructors make 30,069 bytes of persistent arrays, 1.19's 29,806 with the 264 of the openings' blinded messages and without the byte of the change note (1.21), within the 300 more the chip took: the 12,288 of the mint's proofs and the 264 of the openings' keys are not among them")
     void theConstructorsAskForNoMorePersistentMemoryThanTheBuildThatInstalls() throws Exception {
         String applet = stripCommentsAndCharLiterals(new String(
             java.nio.file.Files.readAllBytes(mainSourceDir().resolve("CashuApplet.java")), java.nio.charset.StandardCharsets.UTF_8));
@@ -413,10 +422,12 @@ class SchnorrHWMathTest {
                 arrays++;
             }
         }
-        org.junit.jupiter.api.Assertions.assertEquals(29_806, total,
-            "the persistent arrays the constructors make are the 29,806 bytes of the build that installs (1.19's, and 1.20's: the store of the mint's proofs is made after install). "
-            + "A larger figure has to be measured on a card first: +300 bytes installed, +12,288 did not.");
-        org.junit.jupiter.api.Assertions.assertEquals(20, arrays, "the parse found the 17 arrays of CashuApplet's constructor and the 3 of SchnorrHW's");
+        org.junit.jupiter.api.Assertions.assertEquals(30_069, total,
+            "the persistent arrays the constructors make are 30,069 bytes: 1.19's and 1.20's 29,806 (the store of the mint's proofs is made after install), "
+            + "264 for the blinded message kept with each of the eight openings of change, and the byte of the change note gone (1.21).");
+        org.junit.jupiter.api.Assertions.assertTrue(total <= 29_806 + 300,
+            "and within the 300 bytes more than 1.19's that a constructor was measured to take on the chip. A larger figure has to be measured on a card first: +300 bytes installed, +12,288 did not.");
+        org.junit.jupiter.api.Assertions.assertEquals(19, arrays, "the parse found the 16 arrays of CashuApplet's constructor and the 3 of SchnorrHW's");
         org.junit.jupiter.api.Assertions.assertTrue(total + 12_288 > 29_806 + 300, "and the store is the kind of figure the chip refuses there");
     }
 
@@ -796,7 +807,7 @@ class SchnorrHWMathTest {
     }
 
     @Test
-    @DisplayName("RAM budget: the two constructors ask for no more than 941 bytes of CLEAR_ON_DESELECT, 8 of CLEAR_ON_RESET, in no more than 16 arrays: the figures of 1.12, which are 1.7's and a payment's change and net (1.15 asks for 6 on reset: the time the terminal told, 4, and the tap's two flags)")
+    @DisplayName("RAM budget: the two constructors ask for no more than 941 bytes of CLEAR_ON_DESELECT, 8 of CLEAR_ON_RESET, in no more than 16 arrays: the figures of 1.12, which are 1.7's and a payment's change and net (1.21 asks for 941 and 7 in 15: the change grant is gone, the tap's flags are three bytes, and a byte for an owner's claim is cleared on deselect)")
     void transientMemoryIsWithinTheBuildThatInstallsOnTheChip() throws Exception {
         int[] asked = transientMemoryAskedFor();
         String why = " These are the figures of 1.12 (941 bytes that are cleared on deselect, 8 on reset, in 16 arrays: 1.7's 931 in 14, and the change and the net of a payment). "
@@ -805,9 +816,9 @@ class SchnorrHWMathTest {
         org.junit.jupiter.api.Assertions.assertTrue(asked[1] <= RAM_ON_RESET_MOST, "CLEAR_ON_RESET is " + asked[1] + " bytes, over " + RAM_ON_RESET_MOST + "." + why);
         org.junit.jupiter.api.Assertions.assertTrue(asked[2] <= RAM_ARRAYS_MOST, "transient arrays are " + asked[2] + ", over " + RAM_ARRAYS_MOST + "." + why);
         // a parse that found nothing would prove nothing
-        org.junit.jupiter.api.Assertions.assertEquals(16, asked[2], "the parse found the 14 of CashuApplet and the 2 of SchnorrHW");
-        org.junit.jupiter.api.Assertions.assertEquals(941, asked[0], "and they add up: CashuApplet 397 and SchnorrHW 544");
-        org.junit.jupiter.api.Assertions.assertEquals(6, asked[1], "1.15: the time the terminal told (4) and the tap's two flags (2); 1.14 kept six bytes for a clock told twice, and eight with the flags");
+        org.junit.jupiter.api.Assertions.assertEquals(15, asked[2], "the parse found the 13 of CashuApplet and the 2 of SchnorrHW");
+        org.junit.jupiter.api.Assertions.assertEquals(941, asked[0], "and they add up: CashuApplet 397 and SchnorrHW 544 (1.21: the change grant, one byte, is gone, and the count of an owner's claim, one byte, came in beside the nonce's)");
+        org.junit.jupiter.api.Assertions.assertEquals(7, asked[1], "1.21: the time the terminal told (4) and the tap's three flags (3), kept for the time in the field; 1.15 to 1.20 asked for 6, and 1.12 for 8");
     }
 
     @Test
@@ -820,7 +831,7 @@ class SchnorrHWMathTest {
         org.junit.jupiter.api.Assertions.assertEquals(129, evaluated("(short)(MAX + 1)", k));
         int[] asked = transientMemoryAskedFor();
         org.junit.jupiter.api.Assertions.assertTrue(asked[0] + 100 > RAM_ON_DESELECT_MOST, "a hundred bytes more is over");
-        org.junit.jupiter.api.Assertions.assertTrue(asked[2] + 1 > RAM_ARRAYS_MOST, "and so is one array more");
+        org.junit.jupiter.api.Assertions.assertTrue(asked[2] + 2 > RAM_ARRAYS_MOST, "and so are two arrays more (1.21 has one fewer than the measured most)");
     }
 
     /**

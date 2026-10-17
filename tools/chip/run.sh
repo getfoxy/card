@@ -6,6 +6,7 @@
 #   sh tools/chip/run.sh [port] [look]     47470 unless said; "look" lets only reading commands through
 #   sh tools/chip/reset.sh                 a card the reader has given up on, reset without being taken out
 #   sh tools/chip/proofstore.sh            software 1.20's store of the mint's proofs, checked on a blank card (ProofStoreCheck.java)
+#   sh tools/chip/changecheck.sh           software 1.21: a PIN first, the claim and LOAD_CHANGE, timed, on a blank card (ChangeCheck.java)
 #
 # Needs a JDK (11 or later) and GlobalPlatformPro's jar for its PC/SC binding:
 # GP_JAR, or gp.jar beside this script.

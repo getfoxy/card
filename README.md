@@ -11,10 +11,14 @@ What differs from upstream:
 - A spend takes no message from the reader: the card builds the slot's secret
   and signs its hash. `SIGN_ARBITRARY` is gone, and `AUTH` proves the card is
   the card.
-- Nothing is loaded onto a card with no owner, or onto one with no PIN but by
-  the owner's grant. The PIN is optional (1.16): a card set up with none pays
-  without one, and a card with one has a no-PIN allowance, what it will sign for
-  in a day without the PIN; over it, the PIN is asked for the whole payment.
+- Nothing is loaded onto a card with no owner or no PIN: a card is given its PIN
+  first (1.21), and a card with none takes nothing and pays nothing (`6A97`).
+  A card has a no-PIN allowance, what it will sign for in a day without the PIN;
+  over it, the PIN is asked for the whole payment. (From 1.16 to 1.20 a card
+  could be set up with no PIN, and paid without one.)
+- The card's own change is made and unblinded on the card (1.12, 1.21): the tap
+  after a payment loads that payment's change with no PIN, once for each piece,
+  and nothing else, and no reader is given the blinding factors.
 - The card has an owner, a P-256 public key worked out on the holder's phone
   from its seed. Only that phone can change the PIN, unblock the card, set the
   limit or add funds with no PIN.
@@ -133,14 +137,17 @@ Full reference: [`spec/APDU.md`](spec/APDU.md).
 | `B0` | `12` | GET_PROOF_COUNT | — | Count of non-empty slots |
 | `B0` | `13` | GET_PROOF | — | Full proof at a slot index |
 | `B0` | `14` | GET_SLOT_STATUS | — | One status byte per slot |
+| `B0` | `19` | GET_CHANGE | — | The openings of the card's own change not yet loaded: number, amount, keyset, date and blinded message (1.21; never the blinding factor) |
 | `B0` | `1A` | GET_DLEQ | — | The mint's proof kept with an unspent piece, for one place or two (1.20) |
 | `B0` | `22`–`24` | SPEND_ALL_BEGIN / OUTPUTS / SIGN | ✔ (if set) | One signature for a whole payment (NUT-11 `SIG_ALL`): the places, the swap's outputs, then every place marked spent and one 64-byte signature |
 | `B0` | `25` | SPEND_ALL_AGAIN | ✔ (if set) | The last signature given, again |
 | `B0` | `21` | SIGN_ARBITRARY | ✔ (if set) | Sign 32 bytes, consuming no proof |
 | `B0` | `30` | LOAD_PROOF | ✔ | Store a proof in the next free slot (P1 = 1: one piece and the mint's proof for it, 1.20) |
 | `B0` | `31` | CLEAR_SPENT | ✔ | Reclaim spent slots |
+| `B0` | `43` | SET_OWNER | ✔ (a claim) / owner's proof | Give the card its owner key; on a card with none, a claim under the PIN, ten askings in a row (1.21) |
+| `B0` | `53` | LOAD_CHANGE | ✔, or the tap after the payment | One opening of the card's own change made a piece: the card checks the mint's proof and unblinds it itself (1.21) |
 | `B0` | `40`–`42` | VERIFY/SET/CHANGE_PIN | — / ✔ | PIN management |
-| `B0` | `50` | LOCK_CARD | ✔ | Irreversibly disable writes |
+| `B0` | `50` | LOCK_CARD | ✔ | Irreversibly disable writes and freeze the settings; a locked card still pays |
 | `B0` | `51` | RESET_CARD | owner's proof (+ PIN if locked) | Wipe the card to a new one, with a new key, for another person to set up (1.17) |
 | `B0` | `52` | SET_TAG | owner's proof | Switch the card's NFC tag (one web address, the same on every card) off or on (1.19) |
 
