@@ -47,7 +47,7 @@ import javacardx.crypto.*;
  *   0x40  VERIFY_PIN       — verify the PIN
  *   0x41  SET_PIN          — set or replace the PIN on an open card (no owner, nothing unspent)
  *   0x42  CHANGE_PIN       — the owner's proof and the new PIN: no old PIN, any state
- *   0x43  SET_OWNER        — give the card its owner key: an open card claimed under its PIN, asked for twenty times in a row (6A98 "keep holding" to each but the last); or the old owner's proof; nothing unspent
+ *   0x43  SET_OWNER        — give the card its owner key: an open card claimed under its PIN, asked for six times in a row (6A98 "keep holding" to each but the last); or the old owner's proof; nothing unspent
  *   0x44  GET_NONCE        — a fresh nonce for the owner's proof
  *   0x45  ALLOW_LOAD       — the owner's proof, for this tap: the log, the receipts and the limit on one payment read, and a second payment not slowed; it opens no load (1.21)
  *   0x50  LOCK_CARD        — freeze the card's settings and refuse every write (PIN, and the owner's proof); a locked card still pays under its PIN and allowance, and still takes its own change
@@ -170,7 +170,7 @@ public class CashuApplet extends Applet implements TagSwitch {
     // checks the proof and takes its own blinding factor off, so that factor never leaves the card while the change is owed
     // (GET_CHANGE gives the blinded message in its place). Bound so, the change is the one piece that can be written, and any
     // reader may write it, with no PIN, on a locked card too. Neither SET_CARD nor RESET_CARD is taken while change is owed. An
-    // open card is claimed (SET_OWNER) only under its PIN, only by twenty askings in a row, each a signature's work and each
+    // open card is claimed (SET_OWNER) only under its PIN, only by six askings in a row, each a signature's work and each
     // but the last answered 6A98, and never in the tap a payment is signed in, nor a payment after a claim in the same tap. The
     // PIN form of SET_LIMIT sets the limit on one payment and the no-PIN allowance on a card with no owner. The no-PIN allowance
     // counts the whole of the pieces a payment spends, and renews when the PIN is given, not when the day turns.
@@ -505,7 +505,7 @@ public class CashuApplet extends Applet implements TagSwitch {
      * takes about ten seconds of the card held still: long enough that the holder sees it happen, and a till handed the PIN
      * for a payment cannot do it in passing.
      */
-    static final short CLAIM_ASKINGS = (short) 20;
+    static final short CLAIM_ASKINGS = (short) 6;
     /**
      * Whether the no-PIN allowance renews when the PIN is given (1.21) and not when the day turns (1.16 to 1.20). With true,
      * what has been paid with no PIN is counted until a VERIFY_PIN goes through, and no day ends it: a card in a stranger's

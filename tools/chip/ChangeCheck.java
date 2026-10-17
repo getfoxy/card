@@ -116,14 +116,14 @@ public final class ChangeCheck {
         long began = System.nanoTime();
         int notYet = 0;
         byte[] claimed = null;
-        for (int asked = 1; asked <= 20; asked++) {
+        for (int asked = 1; asked <= 6; asked++) {
             byte[] r = send(0xB0, 0x43, 0, 0, ownerPub, -1);
             if (sw(r) == 0x6A98 && r.length == 2) { notYet++; continue; }
             claimed = r;
             break;
         }
         long claimMs = (System.nanoTime() - began) / 1000000;
-        say("nineteen 'keep holding' (6A98), and the claim at the twentieth asking", notYet == 19 && claimed != null && sw(claimed) == 0x9000 && claimed.length == 2);
+        say("five 'keep holding' (6A98), and the claim at the sixth asking", notYet == 5 && claimed != null && sw(claimed) == 0x9000 && claimed.length == 2);
         System.out.println("      THE CLAIM took " + claimMs + " ms from the first asking to the owner set (" + (notYet > 0 ? claimMs / (notYet + 1) : 0) + " ms an asking)");
         say("the card has an owner", data(send(0xB0, 0x01, 0, 0, null, 0), 0x9000)[16] == 1);
         say("no payment in the tap that claimed it: SPEND_ALL_BEGIN is 6985", sw(send(0xB0, 0x22, 0, 0, new byte[] { 0 }, 4)) == 0x6985);

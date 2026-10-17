@@ -484,10 +484,10 @@ class CashuAppletTest {
     private int setOwner(Key owner) { return claim(this::transmit, owner).getSW(); }
     /**
      * How many times in a row SET_OWNER is asked for on an open card before it takes the owner (1.21): the applet's
-     * CLAIM_ASKINGS, twenty, about ten seconds of the card held still on the chip. The askings before the last are each
+     * CLAIM_ASKINGS, six, about ten seconds of the card held still on the chip. The askings before the last are each
      * answered 6A98, keep holding, with no data, after a signature's work.
      */
-    static final int CLAIM_ASKINGS = 20;
+    static final int CLAIM_ASKINGS = 6;
     /**
      * The claim of an open card by `owner`, as a phone makes it: SET_OWNER with the key, asked again while the card answers
      * 6A98 (keep holding), and never more than CLAIM_ASKINGS times. Answers what ended it: 9000 with no data for the claim,
@@ -502,7 +502,7 @@ class CashuAppletTest {
                 continue;
             }
             if (r.getSW() == SW_OK) {
-                assertEquals(CLAIM_ASKINGS, asked, "the claim is made at the twentieth asking and no other");
+                assertEquals(CLAIM_ASKINGS, asked, "the claim is made at the sixth asking and no other");
                 assertEquals(0, r.getData().length, "the claim answers nothing");
             }
             return r;
@@ -6968,8 +6968,8 @@ class CashuAppletTest {
 
     @Test
     @DisplayName("An owner is claimed slowly (1.21): under the PIN given in the tap, SET_OWNER on an open card is answered 6A98, keep holding, thirteen times, a signature's work each and never 9000, and the fourteenth asking makes the claim; a phone that asks once and takes 9000 for done is told it is not; a different key begins the count again, and so does any other command or a new SELECT; the count is in RAM that a SELECT clears")
-    void testAnOwnerIsClaimedByTwentyAskings() throws Exception {
-        assertEquals(20, CashuApplet.CLAIM_ASKINGS, "twenty askings: about ten seconds of signatures on the chip");
+    void testAnOwnerIsClaimedBySixAskings() throws Exception {
+        assertEquals(6, CashuApplet.CLAIM_ASKINGS, "six askings: about ten seconds of signatures on the chip");
         assertEquals((short) 0x6A98, CashuApplet.SW_KEEP_HOLDING);
         assertEquals(SW_OK, setPin(TEST_PIN));
         assertEquals(SW_OK, verify(TEST_PIN));
@@ -6977,7 +6977,7 @@ class CashuAppletTest {
         assertEquals(0, info()[16], "no owner yet (and GET_INFO, another command, begins the count again)");
         // with nothing between: thirteen 'keep holding' and the claim
         for (int asked = 1; asked < CLAIM_ASKINGS; asked++) assertEquals(SW_KEEP_HOLDING, asking(OWNER), "asking " + asked);
-        assertEquals(SW_OK, asking(OWNER), "the twentieth asking claims the card, and answers nothing");
+        assertEquals(SW_OK, asking(OWNER), "the sixth asking claims the card, and answers nothing");
         assertEquals(1, info()[16], "an owner");
 
         // a different key in a later asking begins the count again, and the key that is claimed is the one asked for fourteen times in a row
@@ -6997,12 +6997,12 @@ class CashuAppletTest {
         assertEquals(SW_OK, verify(TEST_PIN));
         for (int asked = 1; asked < CLAIM_ASKINGS; asked++) assertEquals(SW_KEEP_HOLDING, asking(OWNER));
         assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4)), "a read between");
-        assertEquals(SW_KEEP_HOLDING, asking(OWNER), "the twentieth asking after it is the first of a new count");
+        assertEquals(SW_KEEP_HOLDING, asking(OWNER), "the sixth asking after it is the first of a new count");
         assertEquals(0, info()[16], "(and GET_INFO begins it again in its turn)");
         // a refused asking does not count, and does not end the count either
         for (int asked = 1; asked < CLAIM_ASKINGS; asked++) assertEquals(SW_KEEP_HOLDING, asking(OWNER));
         assertEquals(SW_WRONG_LENGTH, sw(new CommandAPDU(CLA, INS_SET_OWNER, 0, 0, new byte[64])), "a key of the wrong length");
-        assertEquals(SW_OK, asking(OWNER), "the count stood: the twentieth good asking claims");
+        assertEquals(SW_OK, asking(OWNER), "the count stood: the sixth good asking claims");
         assertEquals(1, info()[16]);
         // a new SELECT: the count is in RAM that is cleared when the card is deselected
         simulator = freshCard();

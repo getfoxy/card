@@ -67,10 +67,10 @@ what 1.21 does, and they win.
 4. **Change owed blocks a reset.** SET_CARD and RESET_CARD answer `6A8D` while any opening is pending, so the refund key
    cannot move and no change is wiped while the card is owed it.
 5. **The owner's claim is a tap of its own.** On a card with a PIN and no owner, SET_OWNER needs the PIN given in this
-   tap; it is refused in a tap that paid, and no payment follows a claim in the same tap. Each of the first nineteen
-   askings answers `6A98` (keep holding) after the same work a payment's wait costs, about ten seconds on the chip in all
-   (about half a second an asking, measured);
-   the twentieth makes the claim. Another command or another key starts the count again. A phone shows KEEP HOLDING,
+   tap; it is refused in a tap that paid, and no payment follows a claim in the same tap. Each of the first five
+   askings answers `6A98` (keep holding) after the same work a payment's wait costs, about three seconds on the chip and four by a phone
+   (about half a second an asking on the chip, measured);
+   the sixth makes the claim. Another command or another key starts the count again. A phone shows KEEP HOLDING,
    counting up. `6A98` is not `9000`, so a phone that asks once never takes it for done.
 6. **The no-PIN allowance is a bucket that the PIN refills.** No-PIN payments draw it down by the whole of the pieces
    they spend, change included, so a reader with no PIN cannot strand more than the allowance. It returns to full each
