@@ -101,6 +101,11 @@ at) with thirty-three lines more, as a first candidate. Neither size has been tr
 the chip, and the file is 2,560 bytes past any that has. Its constructors make what
 1.22's made, and its book (75 bytes) is asked for by the first `SET_CARD`, beside the
 mint's proofs and the openings' keys.
+On the chip it installed at the first try, at 24,390 bytes (70 past a multiple of
+256, the residue 1.22 installed at), in about two seconds, and both chip checks
+held (175 and 36 checks): a guest's hold of ten askings 4.7 s, the claim 2.8 s,
+SET_LIMIT with its rate 84 ms, SET_CARD with the reclaim 74 ms, three new pieces
+with a new keyset 221 ms.
 
 What the software does: `CashuApplet.sizeTheFile` is never called and is in
 the package for its length alone, about six bytes a line, so that a build
