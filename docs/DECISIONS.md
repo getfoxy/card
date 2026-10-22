@@ -465,6 +465,12 @@ which the chip has.
   signature's work each, never in a tap that signed a payment, and no payment
   follows a claim in that tap.
 
+*As built* (this entry is the decision as first made): 1.21 has no grant for the tap after a
+payment; it binds each opening's key at the payment, any reader writes the card's own change
+under that key in any tap with no PIN, and a till's own pieces want the PIN alone
+([`FOXY-CARD-DAILY-LIMIT.md`](FOXY-CARD-DAILY-LIMIT.md) 8.2), so the binding the cost below
+calls "not built" is built, and the strand it opened is closed in 1.22 ([D17](#d17)).
+
 **Rejected:** a no-PIN card that a gift is loaded onto (left for later, not built);
 the grant of 1.20, which any reader could use for any piece; giving the phone `r`
 and letting it finish the change, which is what let any reader do so; a check of
@@ -500,7 +506,7 @@ change as pieces of its own, without an opening, needs the PIN or the owner's gr
 
 ## <a id="d17"></a>D17 — A holder with no phone: set up and loaded under the PIN, the history read as a guest, held for
 
-**Decided:** in software 1.22 ([`FOXY-CARD-DAILY-LIMIT.md`](FOXY-CARD-DAILY-LIMIT.md), "1.22 in one place"):
+**Decided:** in software 1.22 ([`FOXY-CARD-DAILY-LIMIT.md`](FOXY-CARD-DAILY-LIMIT.md) 8.4, and 8.2 for change owed):
 
 - A card with a PIN and no owner takes `SET_CARD`, `LOAD_PROOF` and `CLEAR_SPENT` under the PIN given in the tap,
   and refuses them without it (`6982`). The first phone that sends money to a holder with no phone sets the card
@@ -511,6 +517,14 @@ change as pieces of its own, without an opening, needs the PIN or the owner's gr
   tap that read them. Once answered, the history is open to the PIN for the rest of that time in the field.
 - The balance, the pieces and `GET_INFO` stay open to any reader, with no hold.
 - A card with an owner is 1.21's; the claim is 1.21's, and only of an empty card.
+- A card with no owner that is set up keeps its PIN, and once used is rewritten (its record,
+  its numbers, its PIN) only in a held tap; a blocked PIN is replaced only with nothing owed,
+  and the history goes with it.
+- Change owed is mended or given up where a PIN can be given: the mint's answer is taken
+  under another key under the PIN and the holder's own say (the owner's grant, or the
+  held history), in a tap that paid nothing, and one opening may be given up by
+  `RESET_CARD` with P1 = 1. With the PIN blocked and change owed, neither can be done,
+  and change bound to a wrong key stays owed for good (only the bound key loads it).
 
 **Rejected:** making the loading phone the owner (it is a friend's or a stranger's, and an owner can change the
 PIN without the old one); holding the balance or the pieces as well (a till needs them to be paid, and a payment

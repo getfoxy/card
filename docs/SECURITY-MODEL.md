@@ -20,24 +20,24 @@ get around it rather than through it.
 | # | Threat | Protected? | Notes |
 |---|---|---|---|
 | 1 | Passive read of card memory | **Partially** | An attacker gets keyset id, amount, nonce and `C` — the secret string is never stored on the card, but it is reconstructible from the nonce plus the card pubkey, so treat it as leaked too. What does not leak is the private key, so the proofs stay unspendable. Balance and history leak. From software 1.20 a reader also gets the mint's proof for each unspent piece that has one, and so its blinding factor (#16). From 1.21 it no longer gets the blinding factor of the change the card made for itself and has not yet loaded (#17). |
-| 2 | Hostile reader spends the card | **Once a PIN is set** | `SPEND_PROOF` and `SIGN_ARBITRARY` are gated on `VERIFY_PIN` in the same session (D13), and a failed PIN check ends that session. A card with no PIN set — the factory state — can be drained by anyone in NFC range, so the holder must set one before carrying value. Three wrong tries block the card; the gate keeps refusing in the blocked state (ENG-615 closed a bug where it stopped), and there is no unblock path (D13). That dead end is its own threat: see #14. |
+| 2 | Hostile reader spends the card | **Once a PIN is set** | `SPEND_PROOF` and `SIGN_ARBITRARY` are gated on `VERIFY_PIN` in the same session (D13), and a failed PIN check ends that session. A card with no PIN set — the factory state — can be drained by anyone in NFC range, so the holder must set one before carrying value. Three wrong tries block the card; the gate keeps refusing in the blocked state (ENG-615 closed a bug where it stopped), and there is no unblock path (D13). That dead end is its own threat: see #14. In the Foxy fork a card with no PIN holds nothing and pays nothing (`6A97`, software 1.21), every load wants the PIN given in the tap, and a payment is asked its PIN at its signature, a card with a PIN paying up to its no-PIN allowance without it (1.16; counted on the whole of the pieces and renewed when the PIN is given, 1.21). |
 | 3 | Card lost or destroyed | ❌ **By design** | No seed, no backup, no recovery. See [D5](DECISIONS.md#d5). |
 | 4 | Cloning the chip | **Yes** | Cloning EEPROM copies the proofs but not the key; a clone cannot sign. Cards should be CC EAL 5+ to resist invasive extraction. |
 | 5 | Offline double-spend from copied data | ❌ **No** | Fundamental. An offline merchant cannot know a proof was already melted. See below. |
-| 6 | Replaying a signature on another proof | **Yes** | The signed message is `sha256(secret)`, unique per proof. A signature does not transfer. |
+| 6 | Replaying a signature on another proof | **Yes** | The signed message is `sha256(secret)`, unique per proof. A signature does not transfer. In the Foxy fork (format 4, software 1.4) one signature covers a whole payment: its message is every piece's secret and `C` and every output of the swap, so it is good for those pieces and those outputs and no others. |
 | 7 | Malicious mint tagging users | **Yes** | NUT-12 DLEQ, verified client-side. See [D11](DECISIONS.md#d11). |
 | 8 | Mint insolvency | **Monitored, not prevented** | The mint is trusted for solvency. See below. |
 | 9 | Malicious terminal | **Partially** | Cannot forge proofs or spend them elsewhere. Can lie about the amount, or take the tap and never settle — ordinary merchant risk. |
 | 10 | Fault injection to recover the key | **Mitigated** | Aux randomness in the nonce prevents the two-signatures-same-`k` recovery. See [D9](DECISIONS.md#d9). |
-| 11 | Tear-off (card pulled mid-write) | **Yes, by write order** (applet 0.4 on); not yet on silicon | Every slot write changes the data first and commits the status byte last, as a single byte the JCRE writes atomically ([D14](DECISIONS.md#d14)). A card whose `SELECT` answers below `00 04` may write the status byte first and needs the CAP reinstalled. A torn `LOAD_PROOF` leaves the slot empty and a torn `CLEAR_SPENT` leaves it spent; neither state is counted in the balance or signed for. The empty slot's bytes are never read. The half-cleared spent slot still answers `GET_PROOF`, as status `02` with some fields zeroed, and its data is not a proof: a reader that uses a spent slot's data must check it ([`spec/APDU.md`](../spec/APDU.md#clear_spent-0x31)), and `cardctl dump` skips one that fails. `SPEND_PROOF` writes only the status byte, before it signs ([D7](DECISIONS.md#d7)): a tear after the burn loses that signature, which flash-pos re-derives with `SIGN_ARBITRARY` (`resignWitness`). The order is enforced by a source scan and the torn states are tested in jCardSim; no card has been pulled mid-write. |
+| 11 | Tear-off (card pulled mid-write) | **Yes, by write order** (applet 0.4 on); not yet on silicon | Every slot write changes the data first and commits the status byte last, as a single byte the JCRE writes atomically ([D14](DECISIONS.md#d14)). A card whose `SELECT` answers below `00 04` may write the status byte first and needs the CAP reinstalled. A torn `LOAD_PROOF` leaves the slot empty and a torn `CLEAR_SPENT` leaves it spent; neither state is counted in the balance or signed for. The empty slot's bytes are never read. The half-cleared spent slot still answers `GET_PROOF`, as status `02` with some fields zeroed, and its data is not a proof: a reader that uses a spent slot's data must check it ([`spec/APDU.md`](../spec/APDU.md#clear_spent-0x31)), and `cardctl dump` skips one that fails. `SPEND_PROOF` writes only the status byte, before it signs ([D7](DECISIONS.md#d7)): a tear after the burn loses that signature, which flash-pos re-derives with `SIGN_ARBITRARY` (`resignWitness`). In the Foxy fork a payment signs first, in RAM, then commits in one transaction the note that its places are spent, the day's count, the log and the signature kept for `SPEND_ALL_AGAIN`, and only then marks the places and answers: a tear before the commit burns nothing, and one after it is finished by the card's next command, and the signature is asked for again (`SPEND_ALL_AGAIN`). The order is enforced by a source scan and the torn states are tested in jCardSim; no card has been pulled mid-write. |
 | 12 | Counterfeit physical cards | **Not a concern** | Value is bound to the chip's key. A look-alike with no valid chip holds nothing. |
 | 13 | Supply-chain / pre-personalised cards | ⚠️ **Unaddressed** | Nothing currently attests that a card's key was generated on-card by an untampered applet. |
 | 14 | Hostile reader blocks the PIN (3 unauthenticated APDUs) | **A nuisance on a card with an owner**; ❌ **No** on a card with a PIN and no owner | `VERIFY_PIN` needs no authentication, so three wrong PINs from any reader in NFC range block the card. A card with an owner is opened again by its owner's phone: `CHANGE_PIN` takes the owner's proof in place of the old PIN, sets a new one and resets the tries ([spec](FOXY-CARD-SPEC.md) 5.6), so nothing is lost and the card cannot pay until its owner taps it. A card that was given a PIN and money but no owner has no such path: `SET_PIN` unblocks only a card with nothing unspent and no change owed, so its balance is stranded. From software 1.22 that is the card of a holder with no phone, which is loaded with no owner. (A blocked card with nothing owed takes a new PIN from anyone, and its log and receipts go with the old PIN, so that the new PIN reads none of the old one's.) See below. |
 | 15 | Reading the NFC tag (software 1.19) | **Nothing of the card to read** | Any reader, with no PIN, gets the same bytes from every card: one web address. It names no card, key, owner or balance. A card on factory keys can have the tag's applet replaced by one carrying another address; rotating the card manager keys closes that. See below. |
 | 16 | A piece on the card that the mint never made (software 1.20) | **Checked by the reader, not by the card** | The card keeps the mint's NUT-12 proof for a piece and gives it back; it checks nothing. A reader that checks it, with the mint's keys, sees that a made-up `C` is not real, and a piece copied from another card is not real here. It does not show that a real piece is unspent. Reading the proof gives away `r`, which ties a piece to the request that made it if the mint is given it. See below. |
-| 17 | A stranger's tap after a payment (software 1.21) | **Bounded to the card's own change** | Up to 1.20 the next tap after any payment, by any reader, could load any piece and free the spent places with no PIN, until a load used the grant up. From 1.21 that tap may only turn the card's own openings of change into pieces (`LOAD_CHANGE`), each once, and only in that tap; the card unblinds them itself, with a blinding factor no reader is given. A stranger who takes that tap can still spoil the change of the payment before it (a key it made up, with a proof that holds for it: the card cannot tell a key is the mint's), and takes nothing. From 1.21 the key is bound at the payment and a stranger's key is refused; from 1.22 another key is taken only under the PIN (#22). See below. |
+| 17 | A stranger's tap after a payment (software 1.21) | **Bounded to the card's own change, under the key bound at the payment** | Up to 1.20 the next tap after any payment, by any reader, could load any piece and free the spent places with no PIN, until a load used the grant up. From 1.21 no tap opens a load: every load wants the PIN, and the one thing any reader may write with no PIN is the card's own change (`LOAD_CHANGE`), in any tap, each opening once, under the mint's key the paying reader named at the payment. The card unblinds it itself, with a blinding factor no reader is given while the change is owed. A stranger's key is refused (`6A80`), so a stranger can neither put a piece of its own on nor spoil the change; another key is taken only under the PIN and the holder's own say (#22). See below. |
 | 18 | A reader claims a card nobody owns (software 1.21) | **Slowed, under the PIN** | A card with no owner and nothing on it is claimed by whoever sets its owner first (from 1.22 a card with no owner may hold money, and is claimed only once it is empty again). From 1.21 a claim wants the card's PIN given in the tap and six askings in a row, a signature's work each, some three seconds of the card held to the reader, and is never made in a tap that signed a payment. A reader that has been given the PIN can still claim an open card in that time; what is closed is the claim in the instant of a tap. |
-| 19 | A locked card | **Still pays** | `LOCK_CARD` freezes every write and every setting; a locked card pays under its PIN and up to its no-PIN allowance as before, and its limit, its allowance and its PIN can no longer be changed. A lock is not a way to make a lost card safe. |
+| 19 | A locked card | **Still pays** | `LOCK_CARD` freezes every write and every setting but one; a locked card pays under its PIN and up to its no-PIN allowance as before, still takes its own change (`LOAD_CHANGE`: receiving what it is owed changes no setting), and its limit, its allowance and its PIN can no longer be changed. A lock is not a way to make a lost card safe. |
 | 20 | A till that was given the PIN reads the history of a card with no owner (software 1.22) | **Not in the paying tap, and no payment in the reading tap** | On a card with a PIN and no owner (a holder with no phone) the log and the receipts are the PIN's, and held for: ten askings in a row, `6A98` to each but the last, some five seconds of the card held still. A till that saw the PIN cannot read the history in the tap it was paid in (`6985`, before any asking is counted), nor take a payment in a tap in which it read the history (`6985` to every payment command for the rest of that time in the field). With the PIN, and the card held for the seconds of a tap of its own, it can. The balance and the pieces are not held for: any reader may read them, as before, and so does what is not the history: the dates and amounts in the openings of change owed (`GET_CHANGE`), GET_INFO's bytes 21 to 28 and 38 to 41, and the places of spent pieces (`GET_PIECES`). The limit on one payment is told to the PIN in a held tap on such a card (a guest has no owner's grant to see it by), so a till that keeps the PIN learns it in a tap of its own, which signs nothing, and can ask for just under it; the hold does not stop a till that keeps the PIN, only one that is handed it for a payment, and the log does not mark a tap whose history was read. A card with an owner is as 1.21: the log to the PIN, the receipts to the owner's grant. |
 | 21 | A reader replaces the PIN of a card with no owner, or rewrites it, after it has been emptied (software 1.22) | **Closed: the PIN it has, and a hold once used** | A card with no owner can be spent to nothing, or owe change, while it holds a holder's history. Without a rule, anyone could then put a PIN of their own on it (it was open while empty, as a card that holds nothing must be), read the history, write a refund key of their own into its record, take the change it was owed and claim it. From 1.22, once the record is set, `SET_PIN` wants the PIN the card has given in the tap, nothing unspent and no change owed; a blocked PIN is replaced only with nothing owed, and the log and receipts go with it. On a card that has been used, `SET_CARD`, the PIN form of `SET_LIMIT` and `SET_PIN` also want the history held for in the tap (`6985` in a tap that paid), so a till that was handed the PIN cannot, in the tap that took the money, put its own refund key, a large no-PIN allowance or another mint on the card. Still open: a till that keeps the PIN can hold a tap of its own and rewrite the card there (as it can read the history, 20); the record it wrote is the card's record, for the holder's phone to see. |
 | 22 | A till binds the card's change to a key that is not the mint's (software 1.21; closed in 1.22) | **Closed for the strand; the change of that payment is still the holder's to bring back** | At `SPEND_ALL_CHANGE` the paying reader names the mint's key for the change, and the card keeps it with the opening; it cannot tell the key is the mint's. A till that names its own key, or nonsense, made the real change unloadable for good: the mint's answer is under the real key, `LOAD_CHANGE` refused it (`6A80`), and the change owed kept `SET_CARD` and `RESET_CARD` (and on a card with no owner `SET_PIN` and the PIN form of `SET_LIMIT`) at `6A8D` for ever. From 1.22 `LOAD_CHANGE` takes another key under the PIN given in a tap that signed no payment, with the holder's own say in the tap as well (the owner's grant, `ALLOW_LOAD`; on a card with no owner the history held for), and still checks the mint's proof under the key it is given, so the holder's phone brings the mint's real answer (NUT-09 restore, from the opening's `B_`) and the money is back; and `RESET_CARD` with P1 = 1 gives up one opening by number (the owner's proof; on a card with no owner the PIN and the history held for in the tap), so that a card whose change the till never took to the mint can be reset or written again. A stranger has no PIN and can do neither. The PIN alone is not enough, because a till has it: with the PIN alone a till could bind an earlier payment's opening, still waiting, to a key of its own and be paid in the same tap; a till has no owner's grant, and a held tap keeps every payment out of the rest of that time in the field. What remains: on a card with no owner, a reader that keeps the PIN can hold a tap of its own and load a piece under a key of its own making (with a proof that holds for it) for any opening still waiting, and so spoil the holder's change, as it can give that opening up (#20's trust in the PIN); on a card with an owner, only the owner's own phone can. It takes nothing. The piece it leaves is one the mint will not take, and a phone that checks the mint's proof (`GET_DLEQ`) against the mint's keys sees it. Giving an opening up is the owner's choice, and its money is gone. A card with no owner whose PIN is blocked cannot give an opening up, and stays as it was (#14). See below. |
@@ -109,15 +109,16 @@ holder's first job. (In the Foxy fork from software 1.21 a card with no PIN
 holds nothing and pays nothing: every load and payment command answers `6A97`
 until it has one.)
 
-**Software 1.16 moved the gate, and made the PIN optional.** In the Foxy fork a
-spend is asked its PIN at the signature (`SPEND_ALL_SIGN`), not when it is begun,
-because what leaves the card is only known there. A card with a PIN signs without
-it only up to the no-PIN allowance the owner has set (a day's worth, counted in
-the daily limit's window), and answers `6A94` over it, for the whole payment; a
-blocked card has no allowance, and the answer is the same. A card with no PIN
-signs, under its daily limit and its limit on one payment, and is cash to whoever
-holds it. Neither writes anything but a signature: the PIN is asked before the
-limits, so a reader with no PIN cannot fill the card's log.
+**Software 1.16 moved the gate.** In the Foxy fork a payment is asked its PIN at
+the signature (`SPEND_ALL_SIGN`), not when it is begun, because what leaves the
+card is only known there. A card with a PIN signs without it only up to the no-PIN
+allowance the holder has set, and answers `6A94` over it, for the whole payment; a
+blocked card has no allowance, and the answer is the same. Since 1.21 the allowance
+counts the whole of a payment's pieces and is renewed when the PIN is given, not by
+the day: a stranger with the card gets one allowance at most. A refusal for want of
+the PIN writes nothing: the PIN is asked before the limits, so a reader with no PIN
+cannot fill the card's log. (From 1.16 to 1.20 the PIN was optional, a card with no
+PIN signed for whoever held it, and the allowance was a day's worth.)
 `FOXY-CARD-DAILY-LIMIT.md` 6f has the whole.
 
 **Software 1.21 makes the PIN the first thing.** The card of 1.16 to 1.20 with no
@@ -152,12 +153,14 @@ the holder loses nothing, and the card cannot pay until its owner has tapped
 it. Wrong-PIN spam is therefore a nuisance, and one coil at a venue can still
 put every such card out of use for the day.
 
-*With a PIN and no owner*: there is no way back. `SET_PIN` replaces a PIN only
-on a card with no owner and nothing unspent, and nothing but the card key can
-sign for the card's proofs (the P2PK secret carries only a `sigflag` tag, with
-no refund key and no locktime, and D5's recovery proposal is not merged). Three
-wrong PINs then destroy the balance. Do not put money on a card that has a PIN
-and no owner.
+*With a PIN and no owner*: there is no way back for the money. `SET_PIN` replaces
+a blocked PIN only on a card with nothing unspent and no change owed, and nothing
+but the card key can sign for the card's proofs where its record has no refund key
+(the P2PK secret then carries only a `sigflag` tag, with no locktime, which is how
+Foxy's phone sets cards up; D5's recovery proposal is not merged). Three wrong PINs
+then destroy the balance. Since software 1.22 such a card is the card of a holder
+with no phone, loaded under its PIN, and this is the risk it carries
+([D17](DECISIONS.md#d17)).
 
 This paragraph used to say that no card could be unblocked. That was true
 before the owner's proof existed and is not true now.
@@ -228,17 +231,18 @@ that card's key.
 `B'`, and given `r`, whoever has the mint's record of that issue can recompute `B'` and `C'`
 from the piece and tie the piece to the request that made it. That is so of any NUT-12 token
 that carries `r`; here, any reader can read `r` for every unspent piece that has a proof,
-with no PIN. (Up to 1.20 `GET_CHANGE` also gave it for the change the card made for itself;
-from 1.21 those factors never leave the card, and the card's own change keeps no proof in
-the store: #17.) A reader that hands `r` to the mint lets the mint make the tie; one that checks on its own
+with no PIN. That includes a piece of the card's own change once it is on the card:
+`LOAD_CHANGE` keeps the mint's `e` and `s` and the card's own `r` as its proof. While the
+change is owed its factor never leaves the card (#17; up to 1.20 `GET_CHANGE` gave it to any
+reader). A reader that hands `r` to the mint lets the mint make the tie; one that checks on its own
 side and sends the proof nowhere does not. The money is as safe as it was: a piece is
 spent only with the card's signature, and nothing here gives that.
 
 **The store.** One persistent array of 12,288 bytes, reserved by the first `SET_CARD` and
 not at install, because the chip will not install an applet that asks for that much more in
 its constructor (`FOXY-CARD-HARDWARE.md`). A card that is refused it works without. A place
-that is unspent holds its own proof or zeros and never another piece's: `LOAD_PROOF` writes
-the record before the place's data and the status byte last, `CLEAR_SPENT` and the payment
+that is unspent holds its own proof or zeros and never another piece's: `LOAD_PROOF` and
+`LOAD_CHANGE` write the record before the place's data and the status byte last, `CLEAR_SPENT` and the payment
 commands write nothing to the store, and `RESET_CARD` zeros it. A card taken away in a load
 leaves an empty place with a record beside it, which nothing serves.
 
@@ -254,27 +258,22 @@ answer could finish the piece.
 
 From 1.21:
 
-- A payment notes the openings of change it made, a bit each, in its own transaction. The
-  first `SELECT` of the next time in the field takes the note into that tap and clears it.
-  In that tap `LOAD_CHANGE` of a noted opening needs no PIN, once. Nothing else opens: no
-  `LOAD_PROOF`, no `CLEAR_SPENT`, no older opening. The tap ends, and the grant with it.
-- `GET_CHANGE` gives each opening's number, amount, keyset, date and blinded message, and
-  never its nonce or blinding factor. `LOAD_CHANGE` takes the mint's blinded signature, the
-  mint's key and its NUT-12 proof, checks the proof against the card's own blinded message,
-  and takes the blinding factor off on the card. So the only piece the grant can put on is a
-  piece of the card's own opening, with the opening's own nonce and amount.
-- `GET_INFO`'s byte 29 says change may be loaded only to the PIN or the owner's grant.
+- No tap opens a load. `LOAD_PROOF` and `CLEAR_SPENT` want the PIN given in the tap, from any
+  reader, the owner's phone included.
+- The paying reader names, at `SPEND_ALL_CHANGE`, the mint's key for each output of change, and
+  the card keeps it with the opening. `GET_CHANGE` gives each opening's number, amount, keyset,
+  date, blinded message and that key, to anyone, and never its nonce or blinding factor.
+- `LOAD_CHANGE` takes the mint's blinded signature, the mint's key and its NUT-12 proof, from any
+  reader, in any tap, with no PIN, and refuses a key other than the bound one (`6A80`). It checks
+  the proof against the card's own blinded message and takes the blinding factor off on the card.
+  So the only piece any reader can put on with no PIN is the piece of one of the card's own
+  openings, with the opening's own nonce and amount, signed under the key bound at the payment.
+- `GET_INFO`'s byte 29 says to anyone whether change is owed, as `GET_CHANGE` lists it to anyone.
 
-What is left: the card cannot tell that the key it is given is the mint's. A stranger whose
-reader is the first after a payment can make up a key, sign the opening's blinded message
-with it, prove that with a proof that holds, and so write a piece under the card's own
-opening that the mint will not take. That spends the holder's change of that payment; it
-takes nothing and adds nothing of the stranger's. Binding the key at the payment, when the
-till that has the PIN asks for the change, would close it.
-
-1.21 bound it, and that opened the other side (#22): a till that bound an opening to a key of
-its own left change that nothing could ever load, and a card that could never be reset or
-written again. 1.22 keeps the binding against every reader without the PIN, and gives the
+What is left: the card cannot tell that the bound key is the mint's. A till that binds an
+opening to a key of its own, or to nonsense, leaves change that the mint's real answer cannot
+fit (#22). Up to 1.21 nothing could load it, and the change owed kept the card from being reset
+or written again. 1.22 keeps the binding against every reader without the PIN, and gives the
 holder two ways out. Under the PIN and the holder's own say (the owner's grant, or on a card
 with no owner the history held for), in a tap that signed no payment, `LOAD_CHANGE` takes the
 mint's answer under the key the phone names, checking the mint's proof under that key as it
@@ -304,13 +303,21 @@ owner, the owner's own phone can. It takes nothing.
   not the card's and is tested where the reader is
 - The blocked PIN (applet 0.3): every gated command refuses, before and after
   further PIN attempts, and a failed PIN check ends the session
-- A PIN first, the tap after a payment, the card's own change and the claim (1.21):
-  every load and payment command and a claim refused on a card with no PIN; the
-  tap after a payment loading that payment's change once for each opening and
-  nothing else, and gone at the next tap; `LOAD_CHANGE` writing `C = k·Y` as an
-  independent computation has it, and refusing every answer that is not the mint's
-  signature on that opening; `GET_CHANGE` never giving a nonce or a blinding factor;
-  the claim's ten askings, its restart and its exclusion of a payment
+- A PIN first, the card's own change and the claim (1.21): every load and payment
+  command and a claim refused on a card with no PIN; no load opened by the owner's
+  grant or any tap but under the PIN; any reader, in any tap, writing the card's own
+  change under the key bound at the payment, once for each opening, and nothing
+  else; a key made up after the payment refused; `LOAD_CHANGE` writing `C = k·Y` as an
+  independent computation has it, keeping the mint's proof with it, and refusing every
+  answer that is not the mint's signature on that opening; `GET_CHANGE` never giving a
+  nonce or a blinding factor; the claim's six askings, its restart and its exclusion of
+  a payment
+- A holder with no phone (1.22): set-up, loads and freeing under the PIN on a card
+  with no owner; the guest's ten askings, their restart, no history in a paying tap
+  and no payment in a reading tap; the PIN kept, a used card rewritten only after a
+  hold, the limit on one payment told only in a held tap; change owed mended under
+  the PIN and the holder's say (the PIN alone mends nothing) and given up by the
+  let-go, with the log's mark
 - DLEQ verification, including the tagging attack it exists to catch
 - NUT-11 witness checks: wrong key, wrong proof, corrupted signature, `n_sigs`
 
@@ -339,10 +346,12 @@ An earlier card, a J3R452 on applet 0.1, ran the read and sign path on
 2026-09-01 ([its report](HARDWARE_TEST_REPORT_2026-09-01.j3r452.md)).
 
 **Not yet run on silicon:**
-- Software 1.21: its install at its own size, `LOAD_CHANGE` and how long it takes
-  (estimated about a second through a contact reader from the figures measured
-  for each operation), the claim's seconds, and the grant across two selections
-  in one tap from a phone
+- Software 1.21 and 1.22 beyond the install of a 1.21 build: `LOAD_CHANGE` and
+  how long it takes (estimated about a second through a contact reader from the
+  figures measured for each operation), the claim's seconds and the guest's,
+  and a till's binding mended or given up. `tools/chip/changecheck.sh` is the
+  run for them, and prints the three times. The 1.22 build's install at its own
+  size has not been tried
 - The tag's switch (1.19): `SET_TAG` on a card, and with it the shareable lookup
   between two applets of one package
 - A blocked PIN on any build: neither ENG-615 nor its 0.3 fix (the
@@ -377,8 +386,8 @@ a few hundred taps. Treat simulator results accordingly — see
    closed unmerged, is the starting point; see [D5](DECISIONS.md#d5) for the
    flaw to fix first. A refund path would also rescue a blocked card's balance
    (#14).
-4. **Card attestation** (#13) — no proof a key was generated on-card by genuine
-   firmware.
+4. **Card attestation** (#13) — no proof a key was generated on-card by a genuine
+   applet.
 5. **Side-channel review** of `SchnorrHW` — the modular arithmetic was written
    for correctness, with no constant-time analysis.
 6. **Trustless proof of reserves** — upgrade the attestation to signed

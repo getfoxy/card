@@ -11,11 +11,18 @@ This is a design. Nothing in it is built. It is written against software 1.20
 (`build/wallet/08a-flashcard.js`, `08c-units.js`, `21a-flashcard.js`,
 `build/app/26f-flashcard.js`). The software it describes is 1.23.
 
-Its rows were written against 1.21. The software it is built on is 1.22 (`FOXY-CARD-DAILY-LIMIT.md`, "1.22 in one place"), and
-where a row below says a card with no owner takes no load, is `6A90` to a load, or has its record, its PIN or its limit open
-to any reader, the 1.22 rules win: a card with a PIN and no owner is loaded, set up and numbered under the PIN given in the
-tap, keeps its PIN, and once used is rewritten only after the history is held for; its history is the PIN's, held for. The row for a load of a label other
-than `0, A` on a card with no owner is to be read the same way, and is not settled here.
+Its rows were written against 1.21 as the documents then described it. The software it would
+be built on is 1.22 (`FOXY-CARD-DAILY-LIMIT.md` 8.2 to 8.4), which differs from that in what lets
+a piece on:
+every load wants the PIN given in the tap, and neither the owner's grant nor the tap after a
+payment opens one (1.21); a card with no PIN takes nothing (`6A97`); the card's own change goes
+back by `LOAD_CHANGE`, under the key bound at the payment, with no PIN; and a card with a PIN
+and no owner is loaded, set up and numbered under its PIN, keeps its PIN, is rewritten once used
+only after its history is held for, and its history is the PIN's, held for (1.22). The rows
+below that name the owner's grant, the change grant or a card with no PIN as a way to load, or
+say that a card with no owner takes no load (`6A90`), are the design's as written; how the
+table's gate maps onto 1.22's authorities, and the row for a label other than `0, A` on a card
+with no owner, are not settled here.
 
 ## 0. Why
 
@@ -209,8 +216,10 @@ labelled length `6700`: a new phone that sent a label to an old card by mistake
 is refused, and nothing is written (10.1).
 
 **Who may enter a keyset, and as which balance.** The load itself is let
-through as it is today (`requireLoadAuthority`: the PIN verified in this tap,
-the owner's grant, the tap after a payment, or anyone on a card with no PIN).
+through as the applet lets it (as this was written: the PIN verified in this
+tap, the owner's grant, the tap after a payment, or anyone on a card with no PIN;
+as 1.22 is built, `requireLoadAuthority`, the PIN given in this tap and nothing else, and
+`LOAD_CHANGE` for the card's own change).
 Entering a keyset is held tighter, because a wrong entry would put money in the
 wrong balance for as long as a piece of that keyset is on the card:
 
@@ -461,7 +470,7 @@ byte but for the version and byte 8. With **P1 = 3** (1.23) it answers 73:
 | 45 to 48 | unit B's daily limit |
 | 49 to 52 | unit B's window start |
 | 53 to 56 | unit B's spent today |
-| 57 to 60 | unit B's limit on one payment: with the owner's grant in this tap, and zeros to anyone else, as bytes 30 to 33 are for unit A (LIMIT 6a) |
+| 57 to 60 | unit B's limit on one payment: with the owner's grant in this tap (on a card with no owner, to the PIN given in a held tap, 1.22), and zeros to anyone else, as bytes 30 to 33 are for unit A (LIMIT 6a) |
 | 61 to 64 | unit B's no-PIN allowance, to anyone |
 | 65 to 68 | unit B's signed with no PIN in its window, to anyone |
 | 69 | entries in use |
@@ -648,7 +657,7 @@ a line that says "1,000 signed for" without its unit says nothing.
   one byte for each of the sixteen), written in the receipt's own transaction.
   `GET_LOG` with **P1 = 3** (1.23) answers as P1 = 1 does with each receipt one
   byte longer, its 77 and its balance packed: 4 + 3 × 78 = 238 bytes. Same gate
-  as P1 = 1 (the owner's grant; with no PIN, anyone). P1 = 1 is the 77-byte form
+  as P1 = 1 (the owner's grant; on a card with no owner, the PIN in a held tap, 1.22; with no PIN, anyone). P1 = 1 is the 77-byte form
   it is. A receipt from before the book has `00` there.
 
 A card of 1.20 answers `GET_LOG` P1 = 2 and 3 with `6A86`.
@@ -1137,13 +1146,13 @@ terminal that has the PIN takes up to each unit's limits in a day; the receiver
 always asks the mint. And one thing it costs: a card of two balances is two
 limits' worth to a thief in a day, where a card of one is one (17).
 
-**A mismatch between the documents and the applet, found writing this.**
-`FOXY-CARD-SPEC.md` 5.3 rule 5 and LIMIT 6f say a card with no PIN is loaded
-only by the owner's grant or in the tap after a payment. The applet
-(`requireLoadAuthority` returns at once on a card with no PIN), the `LOAD_PROOF`
-rows of SPEC 5.2 and LIMIT 8, and `ProofStoreTest` ("a card with no PIN at all")
-say anyone who holds it. This design follows the applet. Threat 20 is smaller if
-the rule of 5.3 is the one built (13, decision 3).
+**A mismatch between the documents and the applet, found writing this** (history:
+settled by 1.21). `FOXY-CARD-SPEC.md` 5.3 rule 5 and LIMIT 6f said a card with no
+PIN is loaded only by the owner's grant or in the tap after a payment; the applet
+of 1.20 (`requireLoadAuthority` returned at once on a card with no PIN), the
+`LOAD_PROOF` rows of SPEC 5.2 and LIMIT 8, and `ProofStoreTest` said anyone who
+holds it. Since 1.21 nobody loads a card with no PIN (`6A97`), and the documents
+and the applet agree. Threat 20 is smaller for it (13, decision 3).
 
 ## 12. Size, and what can ship first
 
@@ -1221,10 +1230,10 @@ About 4 to 5 days, phone only.
 2. **Three mints and sixteen entries**, four of them open to entries made without
    the owner (3.2, 3.3). Fewer mints is fewer entries and a smaller book; more
    than four mints does not fit one answer.
-3. **Who loads a card with no PIN.** The applet lets anyone who holds it; the
-   SPEC says only the owner's grant or the tap after a payment (11). Building the
-   SPEC's rule would close junk pieces and squatted keysets on cards with no PIN.
-   The documents and the applet should agree either way.
+3. **Who loads a card with no PIN.** Settled by 1.21 (history): nobody (`6A97`),
+   and the documents and the applet agree. Up to 1.20 the applet let anyone who
+   held it, and the SPEC said only the owner's grant or the tap after a payment
+   (11).
 4. **The format byte, 4 or 5 by what the card holds** (designed), so a phone of
    today keeps using a 1.23 card of one balance. The other way is 5 on every
    1.23 card: simpler, and every phone of today refuses every new card.

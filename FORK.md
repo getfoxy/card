@@ -8,19 +8,24 @@ neither can be mistaken for the other.
 What changed and why is in [`docs/FOXY-CARD-SPEC.md`](docs/FOXY-CARD-SPEC.md),
 section 4. In short:
 
-- `SPEND_PROOF` takes no message. The card rebuilds the slot's own secret and
-  signs its hash; nothing a reader sends reaches the signer.
+- A payment takes no message but its outputs. The card rebuilds every piece's
+  secret itself and signs the whole swap once (NUT-11 `SIG_ALL`, since 1.4;
+  `SPEND_PROOF` is gone); nothing a reader sends reaches the signer but the
+  outputs it names.
 - `SIGN_ARBITRARY` is removed. `AUTH` proves the card is the card, over a
   tagged hash no piece's secret can equal.
-- Nothing is loaded onto a card with no owner or no PIN. (Software 1.21 makes the
-  PIN the first thing a card has: a card with none takes nothing and pays nothing,
-  `6A97`. From 1.16 to 1.20 a card could be set up with none and paid without
-  one. A card with a PIN has a no-PIN allowance: what it signs for in a day
-  without the PIN, counted in the daily limit's window. Over it the card answers
-  `6A94` and the PIN is asked for the whole payment.)
-- The tap after a payment loads that payment's own change and nothing else, and
-  the card unblinds that change itself (`LOAD_CHANGE`, 1.21): no reader is given
-  the blinding factors of the card's change.
+- Nothing is loaded onto a card with no PIN, and every load wants the PIN given
+  in the tap. (Software 1.21 makes the PIN the first thing a card has: a card with
+  none takes nothing and pays nothing, `6A97`. From 1.16 to 1.20 a card could be
+  set up with none and paid without one. A card with a PIN has a no-PIN allowance:
+  what it signs for without the PIN until the PIN is given again (a day's worth
+  up to 1.20). Over it the card answers `6A94` and the PIN is asked for the whole
+  payment.)
+- The card makes its own change and unblinds it itself (`LOAD_CHANGE`, 1.21),
+  bound to the mint's key named at the payment: any reader may write it back, in
+  any tap, with no PIN, and no reader is given the blinding factors of the card's
+  change while it is owed. Change bound to a key that is not the mint's can be
+  mended under the PIN, or given up (1.22).
 - The card keeps a daily limit in permanent memory: the most it will sign for in
   one day, in sats (0 is none, and a new card has none). It keeps the day itself:
   a clock that only moves forward, the time written in the newest Bitcoin block
@@ -39,13 +44,16 @@ section 4. In short:
 - The card has an owner: a P-256 public key, worked out on the holder's phone
   from its seed and given to the card last in the set-up tap. No secret is on the
   card or in the air. `CHANGE_PIN` (which needs no old PIN and unblocks a blocked
-  card), the owner's `SET_LIMIT`, `SET_OWNER`, `SET_CARD`, `ALLOW_LOAD` (adding
-  funds with no PIN) and `LOCK_CARD` each need an ECDSA signature by the owner
+  card), the owner's `SET_LIMIT`, `SET_OWNER`, `SET_CARD`, `ALLOW_LOAD` (the
+  owner's grant, which reads the card's history and loads nothing since 1.21),
+  `LOCK_CARD`, `RESET_CARD` and `SET_TAG` each need an ECDSA signature by the owner
   key over a label, a nonce from `GET_NONCE` and the value being set. `LOCK_CARD`
   also needs a PIN set and verified: on a card with no PIN any reader could once
   lock it for good.
 - A card is cash. It holds what is put on it. A card with an owner is its owner's,
-  empty or not; a card with none is open while it is empty and cannot be loaded.
+  empty or not. A card with no owner and no PIN is open, and holds nothing; a card
+  with a PIN and no owner is the card of a holder with no phone (1.22), set up and
+  loaded under its PIN, its history held for its PIN.
   Lose the card and the money is gone; a forgotten PIN or a blocked card is put
   right from the owner's phone, and if the owner loses their twelve words the PIN
   and the limit can never be changed.
@@ -54,7 +62,7 @@ section 4. In short:
 - The card records the mint its pieces are at.
 - The card keeps the mint's NUT-12 proof with each piece that comes with one, for a
   phone to read and check (software 1.20, `GET_DLEQ`); it checks nothing itself.
-- 64 slots of 82 bytes.
+- 128 slots of 82 bytes (64 before 1.7).
 
 The instructions and what each carries are in the spec's section 5.2, the owner
 and its proofs in 5.6, and the daily limit and the clock in 5.7; the whole text
@@ -138,7 +146,7 @@ fails here. On the J3R180 used here the applet installed the first time.
 A card straight from the install has no PIN and no owner. It holds nothing and
 cannot be loaded, but any reader in range can give it a PIN and an owner of its
 own choosing (`SET_PIN`, `SET_OWNER`; from 1.21 the owner only under that PIN and
-by ten askings in a row, seconds of holding). Set it up (the PIN, the record, then
+by six askings in a row, seconds of holding). Set it up (the PIN, the record, then
 the owner: spec 5.6) before it leaves your hands.
 
 After that, the phone: Foxy (https://github.com/getfoxy/iOS) built with the NFC
