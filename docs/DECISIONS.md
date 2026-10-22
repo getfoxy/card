@@ -4,7 +4,7 @@ Each entry records a call that was made, what was rejected, and why. If you are
 about to change one of these, read the entry first — most were made against a
 real alternative, and several were made *after* getting it wrong once.
 
-Anchors are stable (`#d1` … `#d16`); other docs link to them.
+Anchors are stable (`#d1` … `#d17`); other docs link to them.
 
 ---
 
@@ -461,7 +461,7 @@ which the chip has.
 - The card unblinds its own change (`LOAD_CHANGE`): it checks the mint's NUT-12
   proof against the key it is given and its own blinded message, and takes its own
   blinding factor off. `GET_CHANGE` gives the blinded message and never the factor.
-- An owner is claimed under the PIN given in the tap, by ten askings in a row, a
+- An owner is claimed under the PIN given in the tap, by six askings in a row, a
   signature's work each, never in a tap that signed a payment, and no payment
   follows a claim in that tap.
 
@@ -483,9 +483,10 @@ take; it is checked on the card because nobody else can check it without the fac
 the card twice in one tap, and a grant cleared by the second selection would send the
 till back for the PIN at every change tap.
 
-**Why ten askings.** The card has no clock, and the one duration it owns is a
-signature's work; ten askings make the claim seconds of holding the card, which the
-holder sees, in the way a payment's wait does.
+**Why six askings.** The card has no clock, and the one duration it owns is a
+signature's work; six askings make the claim seconds of holding the card, which the
+holder sees, in the way a payment's wait does. (The history of a card with no owner,
+from 1.22, is held for with ten, for about five seconds: `HISTORY_ASKINGS`.)
 
 **Cost accepted:** the card cannot tell that the key it is given is the mint's, so a
 stranger who takes the tap after a payment can spoil that payment's change, though it
@@ -494,6 +495,39 @@ payment would close it and is not built. `LOAD_CHANGE` is some of a second of th
 card's work. The openings keep their blinded message, 264 bytes of the constructor's
 arrays more, inside the 300 more the chip was measured to take. A till that writes
 change as pieces of its own, without an opening, needs the PIN or the owner's grant.
+
+---
+
+## <a id="d17"></a>D17 — A holder with no phone: set up and loaded under the PIN, the history read as a guest, held for
+
+**Decided:** in software 1.22 ([`FOXY-CARD-DAILY-LIMIT.md`](FOXY-CARD-DAILY-LIMIT.md), "1.22 in one place"):
+
+- A card with a PIN and no owner takes `SET_CARD`, `LOAD_PROOF` and `CLEAR_SPENT` under the PIN given in the tap,
+  and refuses them without it (`6982`). The first phone that sends money to a holder with no phone sets the card
+  up and loads it, under the holder's PIN, and does not become its owner. The record holds no refund key or one
+  the loading phone supplies, and the design.
+- On such a card the log and the receipts are the PIN's, held for by ten askings in a row, each but the last
+  answered `6A98` after a signature's work, as the owner's claim is; never in a tap that paid, and no payment in a
+  tap that read them. Once answered, the history is open to the PIN for the rest of that time in the field.
+- The balance, the pieces and `GET_INFO` stay open to any reader, with no hold.
+- A card with an owner is 1.21's; the claim is 1.21's, and only of an empty card.
+
+**Rejected:** making the loading phone the owner (it is a friend's or a stranger's, and an owner can change the
+PIN without the old one); holding the balance or the pieces as well (a till needs them to be paid, and a payment
+would be slowed for nothing that a stranger cannot learn by trying); the receipts left to the grant alone (a card
+with no owner has no grant, and the holder could never see them); a hold counted by a clock (the card has none);
+a hold for each read (the log and every page of receipts would cost five seconds each).
+
+**Why ten askings, and a tap of its own.** A till is handed the PIN for a payment, and a reader with the PIN and a
+card held near it in passing should not leave with the holder's history: when and for how much the card was used.
+Ten askings of about half a second on the chip are some five seconds of the card held still, which the holder sees,
+and a payment's tap and a reading tap are kept apart both ways, as a payment and a claim are (D16).
+
+**Cost accepted:** a reader that has the PIN and holds the card for the seconds the hold takes, in a tap of its own,
+reads the history; the hold makes the read slow and seen, not impossible. A card with money and no owner has no
+owner to unblock it: three wrong PINs strand its money ([`SECURITY-MODEL.md`](SECURITY-MODEL.md) #14). Its numbers
+are set with the PIN only while it is empty, and it is tied to a phone only while it is empty. A refund key the
+loading phone supplies lets that phone, and not the holder, take back a lost card's dated pieces.
 
 ---
 

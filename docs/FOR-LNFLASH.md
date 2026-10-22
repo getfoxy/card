@@ -106,7 +106,7 @@ since, the fault is in our reading.
 | 1 | A blocked PIN used to open every gated command. **Fixed in 0.4** (`requirePinIfSet` treats blocked as set). | Kept, with a test that walks every gated command through every PIN state. |
 | 2 | `SPEND_PROOF` signs 32 bytes the reader supplies. The card does not check that they are the hash of the slot's own secret, so a reader chooses what is signed, and the slot marked spent need not be the piece that was spent. | `SPEND` takes a slot number and nothing else. The card builds that slot's secret from its own key and the slot's fields, hashes it, signs in RAM, marks the slot spent, and only then sends the signature (signing after the burn lost the piece whenever the card was pulled away mid-signature). |
 | 3 | `SIGN_ARBITRARY` signs any 32 bytes with the card's key and burns no slot. With the PIN, a reader can sign for every piece on the card and leave every slot reading unspent. | Removed. Proving the card is the card has its own command (section 4). |
-| 4 | A card with no PIN accepts loads and spends from any reader in range. | Nothing is loaded onto a card until a PIN is set and verified, nor onto a card with no owner. A card with no owner is open while it is empty: any reader can give it a PIN, a record and an owner, but it holds nothing and cannot be loaded. A card with an owner is its owner's, empty or not, so a terminal that has the PIN and empties a card cannot then claim it. Ours are set up before they leave our hands. |
+| 4 | A card with no PIN accepts loads and spends from any reader in range. | Nothing is loaded onto a card until a PIN is set and given in the tap. A card with no owner is open while it has no PIN and nothing on it: any reader can give it a PIN, a record and an owner. From 1.22 a card with a PIN and no owner (a holder with no phone) is loaded under that PIN like any other, and keeps its PIN: a new one is set only under the old, with the history held for once the card has been used, and a blocked one only with nothing owed. A card with an owner is its owner's, empty or not, so a terminal that has the PIN and empties a card cannot then claim it. Ours are set up before they leave our hands. |
 | 5 | A reader with the PIN can spend every slot in one tap. By design, but the holder has typed their PIN into somebody else's terminal. | Our first answer was a limit on what one PIN entry may spend. **It did not hold:** a terminal that has the PIN presents it again between spends, which reset the count, or sets the limit to nothing, because the PIN alone could. It is removed. Our second, an allowance that only went down and only an owner's proof raised, held against a terminal but stopped a card whose owner's phone was not at hand. The card now keeps a limit per day, with a day of its own: a clock (`now`) that only moves forward and is the time in the newest Bitcoin block header the card has been shown. Every spend adds the whole piece signed to what has been signed today, in the same transaction that burns the slot; a piece that would take today past the limit is refused before anything is signed; only the owner's proof sets or removes the limit. A terminal that has the PIN cannot start a new day by telling the card a later time: it has to bring a header of that time, and the card believes a header only for its work. (Up to 1.14 the time was signed by a key built into our app, so it was not secret, and the limit bound only honest terminals.) A card is cash. |
 | 6 | The card does not say which mint its pieces are at (an open question in your notes). | A card record names the mint. |
 | 7 | No DLEQ on the card, so a piece cannot be checked without the mint. | Our receiver is always online and always swaps before saying paid. And from software 1.20 the card keeps the mint's NUT-12 proof (`e`, `s` and the blinding factor `r`, 96 bytes) with each piece that comes with one, and gives it back, so that a phone can check a piece offline. The card checks nothing and never uses it. |
@@ -140,7 +140,7 @@ Class `B0` as yours. AID: package `F0 46 4F 58 59 43 41 52 44`, applet the same 
 | `35` SET_TIME | none | gone in 1.15 (`6D00`). It took a time under an ECDSA signature by a time key in the record |
 | `36` SET_HEADER | none | a Bitcoin block header, 80 bytes. No key, no PIN, no owner. The card hashes it twice with SHA-256 and the hash must be at or under the target its own `bits` name, at or under a floor built into the applet, and, once the card has taken a header, at or under four times the target of the hardest taken (`6A93` otherwise; `6A80` for `bits` no header could carry). A header with a later time moves the card's clock forward; answers its `now` |
 | `37` TELL_TIME | none | the terminal's own clock, 4 bytes. A note for the receipts and the log, trusted for nothing |
-| `41` SET_PIN | the PIN, once (`6985` if one exists) | sets or replaces the PIN, and unblocks, on a card with no owner and nothing unspent only. A card with an owner refuses it (`6A91`), unless it has no PIN and the owner's grant is in the tap (ADD PIN, 1.16) |
+| `41` SET_PIN | the PIN, once (`6985` if one exists) | sets or replaces the PIN, and unblocks, on a card with no owner and nothing unspent only. A card with an owner refuses it (`6A91`), unless it has no PIN and the owner's grant is in the tap (ADD PIN, 1.16). From 1.22 a card with no owner whose record is set keeps its PIN: the PIN it has in this tap, nothing owed, and once used the history held for ("1.22 in one place", rules 9 and 10). |
 | `42` CHANGE_PIN | old PIN length, old PIN, new PIN | proof length, proof, new PIN. The owner's proof; no old PIN, no session, any PIN state, any funds. Resets the tries |
 | `43` SET_OWNER | none | the owner's public key, 65 bytes uncompressed. On a card with no owner while it is empty, with no proof; on a card with an owner, only with the old owner's proof and only while it is empty (`6A8D` otherwise, `6A91` without a good proof) |
 | `44` GET_NONCE | none | no data; answers a fresh 16 bytes held in RAM. No PIN; `6A90` on a card with no owner |
@@ -192,7 +192,7 @@ one fails (`6A91`). Nothing of the owner crosses the air: no secret is on the
 card or sent to it, and the page never holds one. A card is set up in one tap:
 `SET_PIN`, `VERIFY_PIN`, `SET_CARD`, then `SET_OWNER` last, so that no step
 needs a proof and a set-up cut off anywhere is finished by the next. A card
-with no owner cannot be loaded, and is open while it is empty.
+with no owner is open while it has no PIN. From 1.22 one with a PIN may be loaded, under the PIN, and is the card of a holder with no phone.
 
 **The clock.** `SET_HEADER` shows the card a Bitcoin block header. The card
 keeps `now`, the time in the newest header it has taken, which only moves
@@ -351,9 +351,10 @@ visit, where the owner has set one.
   one, because it goes to the mint before saying paid.
 - The PIN crosses a few centimetres of air in the clear. Nothing of the owner
   does.
-- A card with no owner can be claimed by a reader. It holds nothing and cannot
-  be loaded, and from 1.21 a claim wants the card's PIN given in the tap and ten
-  askings in a row, seconds of holding, and is never made in a tap that paid.
+- A card with no owner can be claimed by a reader once it is empty (from 1.22 it
+  may hold money, and is loaded under its PIN). From 1.21 a claim wants the
+  card's PIN given in the tap and six askings in a row, seconds of holding, and
+  is never made in a tap that paid.
 - A locked card still pays, under its PIN and its no-PIN allowance; locking
   freezes its settings and every write.
 - The reader that is first after a payment can spoil that payment's change by
@@ -361,9 +362,10 @@ visit, where the owner has set one.
   against the key it is given and cannot tell that key is the mint's (section 9).
 - A cash card that is lost is lost money.
 
-## 9. What a 2.0 should carry from 1.21
+## 9. What a 2.0 should carry from 1.21 and 1.22
 
-The rules are in FOXY-CARD-DAILY-LIMIT.md, "1.21 in one place". What a 2.0 card should carry from them:
+The rules are in FOXY-CARD-DAILY-LIMIT.md, "1.21 in one place" and "1.22 in one place". What a 2.0 card should carry
+from them:
 
 1. **A PIN before any money.** No card holds value without a PIN; every load wants the PIN given in the tap, and
    nothing waives it, the owner's grant included.
@@ -376,6 +378,16 @@ The rules are in FOXY-CARD-DAILY-LIMIT.md, "1.21 in one place". What a 2.0 card 
    answered with a status word that is not `9000`.
 5. **A no-PIN allowance counted on the whole of what is spent and refilled by the PIN**, not by a clock.
 6. **The holder may set the per-payment limit and the allowance with the PIN** until the card has an owner.
+7. **A card for a holder with no phone** (1.22). A card with a PIN and no owner is set up and loaded under the PIN
+   given in the tap: the record, the pieces and the freeing of spent places, refused without it. The first phone that
+   sends such a card money sets it up (the PIN twice, the currency, the no-PIN allowance, the per-payment limit) and
+   loads it, and does not become its owner. Its record holds no refund key (a cash card) or one that phone supplies,
+   and the design. Tying the card to a phone of the holder's own is the held claim of rule 4, on an empty card.
+8. **The guest's history, held for** (1.22). On a card with a PIN and no owner the log and the receipts are the PIN's,
+   read on a friend's phone as a guest, and held for: a count of askings, each but the last answered with the same
+   status word as the claim's and after the same throwaway work, so that it takes seconds the holder sees. Never in a
+   tap that paid, and no payment in a tap that read it, so that a till handed the PIN for a payment does not read the
+   holder's history in the same tap. The balance and the pieces are not held for: a till needs them to be paid.
 
 ## 10. Where it is
 

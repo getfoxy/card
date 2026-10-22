@@ -18,14 +18,21 @@ import java.security.spec.ECGenParameterSpec;
 import java.util.Arrays;
 
 /**
- * Software 1.21 on the chip: a PIN first, the owner's claim, the card's own change unblinded on the card (LOAD_CHANGE) and the
- * tap after a payment that loads that change and nothing else. What jCardSim cannot say is how long the card's own work takes, and
- * the two figures this run is for are printed: how long a claim takes from its first asking to the owner set, and how long one
- * LOAD_CHANGE takes (two RSA operations, two key agreements and three generic mappings, and the hex of four points).
+ * Software 1.21 and 1.22 on the chip: a PIN first, a card set up and loaded with no owner (a holder with no phone) and its history
+ * read as a guest, the owner's claim, the card's own change unblinded on the card (LOAD_CHANGE) and the tap after a payment that
+ * loads that change and nothing else. What jCardSim cannot say is how long the card's own work takes, and the three figures this
+ * run is for are printed: how long the guest's held read of the history takes from its first asking to the log, how long a claim
+ * takes from its first asking to the owner set, and how long one LOAD_CHANGE takes (two RSA operations, two key agreements and
+ * three generic mappings, and the hex of four points).
  *
- *   select (01 15 or later); GET_INFO;
+ *   select (01 16 or later); GET_INFO;
  *   on a card with no PIN: LOAD_PROOF, SPEND_ALL_BEGIN and SET_OWNER refused with 6A97;
- *   set up as a phone does: SET_PIN, VERIFY_PIN, SET_CARD, then SET_OWNER asked again while the card says "not yet" (timed);
+ *   a holder with no phone (1.22): SET_PIN; SET_CARD and LOAD_PROOF without the PIN 6982; VERIFY_PIN; SET_CARD with no refund key;
+ *   SET_LIMIT's PIN form with eight bytes; a piece loaded with no owner; the log asked for again while the card says 6A98, ten
+ *   askings (timed); the receipts at once; SPEND_ALL_BEGIN 6985 in that tap; a new tap: the piece paid, and the log and the
+ *   receipts 6985 in it; a new tap: an asking, another command, and the count begun again; CLEAR_SPENT under the PIN;
+ *   a new tap, a used card taken up again: SET_PIN 6982 (a stranger's), VERIFY_PIN, SET_PIN 6982 (not held for), the log held for, SET_PIN,
+ *   VERIFY_PIN, SET_CARD, then SET_OWNER asked again while the card says "not yet" (timed);
  *   a new tap and the PIN; a piece loaded; a payment of it that makes two change outputs for the card (each timed); GET_CHANGE;
  *   a new tap with no PIN: GET_INFO byte 29 is 0, LOAD_PROOF and CLEAR_SPENT are 6982; LOAD_CHANGE with a proof that does not
  *   hold is 6A80; the two openings' change by LOAD_CHANGE, with no PIN (each timed), the piece's C checked here against the mint's
@@ -43,7 +50,7 @@ import java.util.Arrays;
  *   sh tools/chip/changecheck.sh 127.0.0.1:47470 a card behind a bridge or the simulator's server (tools/chip/run.sh, tools/cardsim/run.sh)
  *
  * Needs GlobalPlatformPro's jar (gp.jar) for its PC/SC binding, found through GP_JAR or next to this file. Exits 0 if every check
- * held and 1 if one did not, 2 if the card is not blank, not 1.21 or later, or cannot be reached. It sends nothing a phone does
+ * held and 1 if one did not, 2 if the card is not blank, not 1.22 or later, or cannot be reached. It sends nothing a phone does
  * not send.
  */
 public final class ChangeCheck {
@@ -86,8 +93,8 @@ public final class ChangeCheck {
 
     private static int run() throws Exception {
         byte[] selected = select();
-        if (sw(selected) != 0x9000 || selected.length != 4 || selected[0] != 1 || (selected[1] & 0xFF) < 0x15) {
-            System.out.println("the card's applet is not software 1.21 or later: " + toHex(selected));
+        if (sw(selected) != 0x9000 || selected.length != 4 || selected[0] != 1 || (selected[1] & 0xFF) < 0x16) {
+            System.out.println("the card's applet is not software 1.22 or later: " + toHex(selected));
             return 2;
         }
         byte[] info = data(send(0xB0, 0x01, 0, 0, null, 0), 0x9000);
@@ -95,7 +102,7 @@ public final class ChangeCheck {
             System.out.println("the card is not blank (an owner, a record or a piece is on it): nothing was done. Make it blank first.");
             return 2;
         }
-        System.out.println("the card is blank, on software 1." + (info[1] & 0xFF) + ". Checking a PIN first, the claim and the card's own change.");
+        System.out.println("the card is blank, on software 1." + (info[1] & 0xFF) + ". Checking a PIN first, a card with no owner, the claim and the card's own change.");
 
         // a PIN first (a card a run left with a PIN cannot show it; SET_PIN replaces that PIN)
         if (info[7] == 0) {
@@ -106,8 +113,62 @@ public final class ChangeCheck {
             System.out.println("      the card has a PIN from an earlier run: the refusals of a card with no PIN are not tried");
         }
 
-        // set up as a phone sets a card up
-        say("SET_PIN on a card with no owner", sw(send(0xB0, 0x41, 0, 0, PIN, -1)) == 0x9000);
+        // a holder with no phone (1.22): the phone that first sends the card money sets it up under the holder's PIN and loads it
+        say("SET_PIN, the holder's", sw(send(0xB0, 0x41, 0, 0, PIN, -1)) == 0x9000);
+        say("SET_CARD with the PIN set and not given is 6982", sw(send(0xB0, 0x32, 0, 0, record(), -1)) == 0x6982);
+        say("LOAD_PROOF with the PIN set and not given is 6982", sw(send(0xB0, 0x30, 0, 0, piece(8, 21), 0)) == 0x6982);
+        say("VERIFY_PIN", sw(send(0xB0, 0x40, 0, 0, PIN, -1)) == 0x9000);
+        say("SET_CARD under the PIN, no refund key: a cash card", sw(send(0xB0, 0x32, 0, 0, record(), -1)) == 0x9000);
+        say("SET_LIMIT's PIN form, eight bytes: the limit on one payment and the no-PIN allowance",
+            sw(send(0xB0, 0x33, 0, 0, cat(u32(1000), u32(0)), -1)) == 0x9000);
+        say("a piece of 8 goes on under the PIN, with no owner", Arrays.equals(data(send(0xB0, 0x30, 0, 0, piece(8, 21), 0), 0x9000), new byte[] { 0 }));
+        byte[] owned = data(send(0xB0, 0x01, 0, 0, null, 0), 0x9000);
+        say("and the card has no owner", owned != null && owned[16] == 0 && owned[3] == 1);
+        say("SET_LIMIT's PIN form with a piece on the card is 6A8D", sw(send(0xB0, 0x33, 0, 0, u32(0), -1)) == 0x6A8D);
+        long held = System.nanoTime();
+        int holding = 0;
+        byte[] log = null;
+        for (int asked = 1; asked <= 10; asked++) {
+            byte[] r = send(0xB0, 0x18, 0, 0, null, 0);
+            if (sw(r) == 0x6A98 && r.length == 2) { holding++; continue; }
+            log = r;
+            break;
+        }
+        long heldMs = (System.nanoTime() - held) / 1000000;
+        say("the guest's log: nine 'keep holding' (6A98), and the log at the tenth asking", holding == 9 && log != null && sw(log) == 0x9000 && log.length == 2 + 16 + 20);
+        System.out.println("      THE GUEST'S HOLD took " + heldMs + " ms from the first asking to the log (" + (holding > 0 ? heldMs / (holding + 1) : 0) + " ms an asking)");
+        byte[] receipts = send(0xB0, 0x18, 1, 0, null, 0);
+        say("the receipts at once, in the tap that held for the log", sw(receipts) == 0x9000 && receipts.length == 2 + 4);
+        say("no payment in the tap that read the history: SPEND_ALL_BEGIN is 6985", sw(send(0xB0, 0x22, 0, 0, new byte[] { 0 }, 4)) == 0x6985);
+        retapWithPin();
+        say("the piece is paid, from a card with no owner", sw(send(0xB0, 0x22, 0, 0, new byte[] { 0 }, 4)) == 0x9000 && sign() != null);
+        say("the log in the tap that paid is 6985", sw(send(0xB0, 0x18, 0, 0, null, 0)) == 0x6985);
+        say("and the receipts", sw(send(0xB0, 0x18, 1, 0, null, 0)) == 0x6985);
+        retapWithPin();
+        say("the log: a first asking, 6A98", sw(send(0xB0, 0x18, 0, 0, null, 0)) == 0x6A98);
+        say("GET_BALANCE between: any reader's, no hold", sw(send(0xB0, 0x11, 0, 0, null, 4)) == 0x9000);
+        int again = 0;
+        for (int asked = 1; asked <= 9; asked++) if (sw(send(0xB0, 0x18, 0, 0, null, 0)) == 0x6A98) again++;
+        say("the count began again: nine more askings are each 6A98", again == 9);
+        say("and the tenth answers the log", sw(send(0xB0, 0x18, 0, 0, null, 0)) == 0x9000);
+        say("CLEAR_SPENT under the PIN, with no owner, frees the place", Arrays.equals(data(send(0xB0, 0x31, 0, 0, null, 1), 0x9000), new byte[] { 1 }));
+
+        // a new tap, set up as a phone sets a card up
+        link.retap();
+        say("selected again in a new tap", sw(select()) == 0x9000);
+        say("SET_PIN on a card that is set up and has been used, without the PIN given: 6982 (a stranger's PIN)", sw(send(0xB0, 0x41, 0, 0, PIN, -1)) == 0x6982);
+        say("VERIFY_PIN, the holder's", sw(send(0xB0, 0x40, 0, 0, PIN, -1)) == 0x9000);
+        say("SET_PIN under the PIN, the history not held for: 6982", sw(send(0xB0, 0x41, 0, 0, PIN, -1)) == 0x6982);
+        int holdingAgain = 0;
+        byte[] logAgain = null;
+        for (int asked = 1; asked <= 10; asked++) {
+            byte[] r = send(0xB0, 0x18, 0, 0, null, 0);
+            if (sw(r) == 0x6A98 && r.length == 2) { holdingAgain++; continue; }
+            logAgain = r;
+            break;
+        }
+        say("the history held for, as a guest", holdingAgain == 9 && logAgain != null && sw(logAgain) == 0x9000);
+        say("SET_PIN under the PIN and the hold, on a card with no owner", sw(send(0xB0, 0x41, 0, 0, PIN, -1)) == 0x9000);
         say("SET_OWNER with the PIN set and not given is 6982", sw(send(0xB0, 0x43, 0, 0, uncompressed(ownerKey()), -1)) == 0x6982);
         say("VERIFY_PIN", sw(send(0xB0, 0x40, 0, 0, PIN, -1)) == 0x9000);
         say("SET_CARD", sw(send(0xB0, 0x32, 0, 0, record(), -1)) == 0x9000);

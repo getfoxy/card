@@ -498,7 +498,7 @@ class ProofStoreTest {
     }
 
     @Test
-    @DisplayName("P1 = 1 is refused as a plain load is, with the same words in the same order: no card record 6A8C, no owner 6A90, no PIN given 6982, a locked card 6986, a piece already on the card 6A94 (spent or not), a full card 6A84, a date with no refund key 6A8E; and nothing is written")
+    @DisplayName("P1 = 1 is refused as a plain load is, with the same words in the same order: no card record 6A8C, no PIN given 6982, a locked card 6986, a piece already on the card 6A94 (spent or not), a full card 6A84, a date with no refund key 6A8E; and nothing is written")
     void theProofFormIsRefusedAsAPlainLoadIs() throws Exception {
         byte[] p = piece(10, 1), proof = dleqProof(1);
         // no card record: a PIN and an owner, and no SET_CARD
@@ -511,16 +511,13 @@ class ProofStoreTest {
         assertEquals(SW_NO_CARD_RECORD, noRecord.loadProof(p, proof).getSW(), "no card record");
         noRecord.assertSameAs(snap, "no card record");
         assertNull(noRecord.store(), "and the refusal reserved nothing");
-        // no owner: a PIN and a record
+        // no owner, a PIN and a record (1.22): the proof form loads as the plain one does, under the PIN, and keeps its proof
         Card noOwner = new Card();
         noOwner.setPin();
         noOwner.pin();
         assertEquals(SW_OK, noOwner.setCard(REFUND));
-        snap = noOwner.snapshot();
-        assertEquals(SW_NO_OWNER, noOwner.loadPlain(p).getSW());
-        assertEquals(SW_NO_OWNER, noOwner.loadProof(p, proof).getSW(), "no owner");
-        noOwner.assertSameAs(snap, "no owner");
-        assertArrayEquals(NONE, noOwner.dleqOf(0));
+        assertArrayEquals(new byte[] { 0, 1 }, noOwner.loadProof(p, proof).getData(), "a card with no owner takes the piece and its proof under the PIN");
+        assertArrayEquals(dleqHeld(proof), noOwner.dleqOf(0));
         // a PIN set and not given, no grant: as a plain load refuses
         Card c = new Card().ready();
         c.power();
@@ -770,7 +767,7 @@ class ProofStoreTest {
             byte[] d = c.info(p1);
             assertEquals(30, d.length, "P1 = " + p1);
             assertEquals(1, d[0]);
-            assertEquals(0x15, d[1], "version 1.21");
+            assertEquals(0x16, d[1], "version 1.22");
             assertEquals((byte) 0xFF, d[6], "capabilities as they were");
             assertEquals(4, d[8], "format 4");
         }
@@ -778,7 +775,7 @@ class ProofStoreTest {
         assertEquals(43, c.info(2).length);
         assertArrayEquals(c.info(1), Arrays.copyOf(c.info(2), 42));
         assertEquals(0, c.info(2)[42], "the tag is on");
-        assertArrayEquals(new byte[] { 0x01, 0x15 }, c.send(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR))).getData(), "SELECT says 1.21");
+        assertArrayEquals(new byte[] { 0x01, 0x16 }, c.send(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR))).getData(), "SELECT says 1.22");
         // with pieces on, the same on a card whose pieces came with proofs and one whose did not
         Card plain = new Card().ready(), proofed = new Card().ready();
         for (int i = 0; i < 4; i++) {
