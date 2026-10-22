@@ -1,1253 +1,1253 @@
-# Foxy card: more than one balance (the keyset table)
+# Foxy card: dollars and sats on one card (the keyset table, software 1.23)
 
-A card that holds dollars and sats at one mint, and money at more than one
-mint, and the one change to the card's software that both need: a table, kept
-on the card, of which mint and which unit each keyset it holds is.
+A card that holds dollars and sats at its one mint, held to one ceiling in
+cents whichever it pays with, and the change to the card's software that this
+needs: a table, kept on the card, of which unit each keyset it holds is, and a
+rate, written by the owner's phone, that turns sats into cents at a payment.
 
-This is a design. Nothing in it is built. It is written against software 1.20
-(`SELECT` answers `01 14`), `FOXY-CARD-SPEC.md`, `FOXY-CARD-DAILY-LIMIT.md`
-(LIMIT below), `spec/APDU.md`, `SECURITY-MODEL.md` and the applet as it is in
-`CashuApplet.java`, and against the phone as it is at Foxy `770db86`
-(`build/wallet/08a-flashcard.js`, `08c-units.js`, `21a-flashcard.js`,
-`build/app/26f-flashcard.js`). The software it describes is 1.23.
+This is the design of software 1.23 (`SELECT` answers `01 17`). Nothing in it is
+built. It is written against software 1.22 (`01 16`) as it is in
+`CashuApplet.java` and as `FOXY-CARD-DAILY-LIMIT.md` (LIMIT below) describes it,
+against `FOXY-CARD-SPEC.md` (SPEC), `spec/APDU.md` and `FOXY-CARD-HARDWARE.md`,
+and against the phone's reading of a card in `build/wallet/08a-flashcard.js`,
+`08c-units.js`, `21a-flashcard.js` and `build/app/26f-flashcard.js`. Where this
+document and LIMIT differ, LIMIT says what 1.22 does and this says what 1.23
+changes. When 1.23 is built, LIMIT section 8, SPEC 5.2 and `spec/APDU.md` take
+the rows of section 8 below.
 
-Its rows were written against 1.21 as the documents then described it. The software it would
-be built on is 1.22 (`FOXY-CARD-DAILY-LIMIT.md` 8.2 to 8.4), which differs from that in what lets
-a piece on:
-every load wants the PIN given in the tap, and neither the owner's grant nor the tap after a
-payment opens one (1.21); a card with no PIN takes nothing (`6A97`); the card's own change goes
-back by `LOAD_CHANGE`, under the key bound at the payment, with no PIN; and a card with a PIN
-and no owner is loaded, set up and numbered under its PIN, keeps its PIN, is rewritten once used
-only after its history is held for, and its history is the PIN's, held for (1.22). The rows
-below that name the owner's grant, the change grant or a card with no PIN as a way to load, or
-say that a card with no owner takes no load (`6A90`), are the design's as written; how the
-table's gate maps onto 1.22's authorities, and the row for a label other than `0, A` on a card
-with no owner, are not settled here.
+Every choice here follows the owner's answers to the ten questions of an earlier
+draft (section 13). The draft held money at up to three mints and gave each unit
+limits of its own; the owner chose one mint and one ceiling, and this document is
+that draft cut down to them.
 
 ## 0. Why
 
-The owner asked two things: can a card hold two balances (dollars and
-bitcoin at a mint like Forge), and what would it take to hold money at more
-than one mint. Both come down to one thing the card does not know today.
+The owner asked for two balances on a card: dollars and bitcoin, at a mint that
+issues both. Today a card knows neither unit apart from the other.
 
-What the card knows now:
+What a card of 1.22 knows:
 
 - **One unit.** The record has a unit byte (offset 1, `SET_CARD`'s first data
-  byte). The card stores it, answers it in `GET_CARD`, and uses it for nothing.
-  The phone sends `00` and reads `00` as sats and anything else as "other",
-  which it refuses (`cardUnusable`: "That card holds something other than
-  sats.").
+  byte), `00` sats or `01` dollars. The card stores it, answers it in
+  `GET_CARD`, and uses it for nothing. The phone reads `00` as sats and `01` as
+  dollars (`cardRecordOf`), and a dollars card has shipped on the cards there are:
+  a card set up in dollars, holding only dollar pieces, its limits in cents.
 - **One mint.** The record holds one address of up to 77 characters (offset 39,
-  length; 40, the text). 77 and not more because `SET_CARD` under the owner's
-  proof has to fit a short APDU: 1 + 72 + 100 + 77 + 3 = 253.
+  length; 40, the text).
 - **A keyset for each piece, which it never reads.** Every slot carries the
-  piece's keyset id, eight raw bytes (slot offset 1). The card hashes it into
-  nothing, compares it with nothing, and takes any keyset at load. Only the
-  change the card makes for itself copies it, from the payment's first piece
-  into the opening (`OPEN_KEYSET`).
+  piece's keyset id, eight raw bytes (slot offset 1). The card compares it with
+  nothing and takes any keyset at load. Only the change the card makes for itself
+  copies it, from the payment's first piece into the opening (`OPEN_KEYSET`).
 - **One sum.** `GET_BALANCE` adds every unspent piece.
-- **One set of limits.** The daily limit, the limit on one payment and the
-  no-PIN allowance are each one number, written as sats, and every payment is
-  charged against them.
+- **Limits with no unit.** The daily limit, the limit on one payment and the
+  no-PIN allowance are each one number, in whatever unit the phone wrote them,
+  and every payment is charged against them as it is. On a sats card they are
+  sats and the phone re-pegs them to the price; on a dollars card they are cents.
 
-And what the phone does today with a keyset it reads off a card: it maps the
-eight bytes to a full id among **every** keyset of its mint (`cardFullId`, by
-`keysetIdsFor`, which does not look at the unit). So a phone of today shown a
-card that held dollar pieces at its own mint would count cents as sats. Nothing
-puts dollar pieces on a card today, so nothing has gone wrong. It is the first
-thing this design has to close (10.2).
+And the phone maps a keyset it reads off a card to a full id among every keyset
+of its mint (`cardFullId`, by `keysetIdsFor`, which does not look at the unit): a
+phone shown a card that held both units would count cents as sats.
 
-So the card can hold money of any keyset already. What it cannot do is say
-which money is which, keep two kinds apart in a payment, or bound each kind by
-a limit in its own unit. Each of those needs the same fact: **for each keyset,
-which mint and which unit.** That fact is the table. Two balances at one mint
-and money at more than one mint both ride on it; nothing else in this design
-is more than what follows from it.
+So a card can hold money of any keyset already. What it cannot do is say which
+piece is which unit, keep the two apart in a payment, or hold a payment of sats
+and a payment of dollars to one ceiling. The first two need one fact, **for each
+keyset, which unit**: that is the table (3). The third needs a price on the card:
+that is the rate (6.2).
 
-A card of 1.20 keeps working. A card with an empty table is a 1.20 card: its
-pieces are of the record's unit at the record's mint.
+A card of one unit (format 4, 4.3) and no ceiling answers as a 1.22 card does,
+to the byte, but for the version.
 
 ## 1. Words
 
 | Word | Means |
 |---|---|
-| **balance** | one mint and one unit: "dollars at Forge", "sats at Minibits". A card holds at most six (three mints, two units) |
 | **unit code** | `00` sats, `01` dollars (cents). The card takes no other. A third unit is a design of its own |
-| **unit A** | the record's unit: what the unit byte at record offset 1 says. Every limit in the record (offsets 2, 189 to 208) is in unit A, as it always was |
-| **unit B** | the other code: `01` on a card whose record says `00`, and `00` on one whose record says `01` |
-| **mint index** | 0, 1 or 2. Mint 0 is the record's mint, as it always was. Mints 1 and 2 are new (section 4) |
-| **the book** | the store this design adds: the table, mints 1 and 2, unit B's limits and a few counts (3.2) |
-| **an entry** | one row of the table: a keyset and its balance |
-| **live** | an entry is live while an unspent slot, or a change opening that is drafted or pending, names its keyset |
+| **the record's unit** | what the unit byte at record offset 1 says. Called **unit A** where a byte has to say it in one bit |
+| **the other unit** | `01` on a card whose record says `00`, and `00` on one whose record says `01`. Called **unit B** in the same places |
+| **the ceiling** | the card's limits, every one of them in cents on a card of 1.23 whatever the record's unit: the daily limit (kept, and not set by Foxy's app: LIMIT 6), the limit on one payment (LIMIT 6a) and the no-PIN allowance (LIMIT 6f). A payment of either unit is held to them |
+| **the rate** | sats per dollar, four bytes, written by the owner's phone with the ceiling. The card turns a payment's sats into cents with it (6.2) |
+| **the book** | the store this design adds: the table and three small things beside it (3.2) |
+| **an entry** | one row of the table: a keyset and its unit |
+| **live** | an entry is live while an unspent slot, or a change opening that is drafted or owed, names its keyset |
+| **the holder's say** | on a card with an owner, the owner's grant (`ALLOW_LOAD`) given in this tap; on a card with no owner, the history held for in this tap (LIMIT 8.4). The same pair 1.22 asks for before `LOAD_CHANGE` takes the mint's answer under another key (LIMIT 8.2) |
+| **the mark** | the bit in an entry that says it was written with the holder's say in the tap (3.1) |
 
 ## 2. Goals
 
-1. A card holds dollars and sats at one mint, and money at up to three mints,
-   and every piece on it is known to be of one balance.
-2. No payment mixes two balances. A payment is charged to the limits of its own
-   unit and nothing else.
-3. The owner sets each unit's limits, in that unit.
-4. A card of 1.20 under a new phone, and a new card under a phone of today, each
-   work as far as they can and refuse plainly past that. A phone of today never
-   reads cents as sats.
-5. A card that holds one balance behaves as a 1.20 card, to the byte, but for
-   the version.
+1. A card holds dollars and sats at its one mint, and every piece on it is known
+   to be of one unit.
+2. No payment mixes two units.
+3. Every payment, in either unit, is held to the same ceiling, in cents, which the
+   owner sets once in dollars.
+4. A card of 1.22 under a new phone, and a card of 1.23 under a phone of today,
+   each work as far as they can and refuse plainly past that. No phone ever reads
+   a dollar piece as sats.
+5. A card that holds one unit and has no ceiling set answers as a 1.22 card, to
+   the byte, but for the version. (With a ceiling set its figures are cents: 6.1.)
 
-Not goals: a third unit; a limit across units in one figure (13, decision 1); a
-swap on the card (the card cannot reach a mint; a swap is the phone's, 9.5); a
-payment that converts on the card.
+Not goals: a third unit; more than one mint (4.4); a swap on the card (the card
+cannot reach a mint; a swap is the phone's, 9.6); a price on the card that
+follows the market by itself (the card has no clock that runs; the rate is the
+owner's phone's, 6.5).
 
 ## 3. The table
 
 ### 3.1 An entry
 
-Ten bytes:
+Nine bytes:
 
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 8 | the keyset id as the card holds it in a piece: the slot's bytes 1 to 8, raw (`spec/APDU.md`: a v1 id's eight bytes; a v2 id's first eight, as `cardShortId` cuts it) |
-| 8 | 1 | the mint byte: `00` is a free entry; otherwise `0x40` with the mint index in bits 0 and 1, and `0x80` added where the entry was written under the owner's grant |
-| 9 | 1 | the unit code: `00` or `01` |
+| 8 | 1 | the state: `00` a free entry. Otherwise bit 6 (`0x40`) set, the entry in use; bit 7 (`0x80`) the mark; bit 0 the unit code. Bits 1 to 5 are zero |
 
-So `40 00` is sats at mint 0 (what every piece of a 1.20 card is), `41 01` is
-dollars at mint 1, and `C0 01` is dollars at mint 0 entered by the owner. A new
-book is zeros, and zeros are free entries, so nothing has to be written to make
-a table empty. The owner's mark (`0x80`) is there for one rule only, the cap on
-entries made by anyone else (3.3).
+So `40` is sats, `41` dollars, `C0` sats entered with the holder's say and `C1`
+dollars entered so. An entry is in use when bit 6 is set and is free otherwise;
+the card writes `00` to free one. A new book is zeros, and zeros are free entries,
+so nothing has to be written to make a table empty.
 
-Where a balance is said in one byte (the last payment's balance, the receipts,
-the answers' "packed" fields), it is `0x80 | B << 6 | index << 4`, where `B` is
-1 for unit B and 0 for unit A: `80` is `0, A`, `C0` is `0, B`, `90` and `D0` are
-mint 1's, `A0` and `E0` mint 2's, and `00` is none. Bits 4 to 6 are the same
-bits, in the same meaning, as a log entry's (6.5), so one reading serves both:
-bits 4 and 5 the mint index, bit 6 unit B. Bit 7 says a balance is there, and
-the log, which has to stay 1.20's on a card of one balance, never sets it. The
-unit is relative to the record's in both, as 1.20's one count has always been:
-the phone resolves A and B to a code with the record's unit byte.
+**Why nine bytes and not the ten of the earlier draft.** The draft's entry had a
+mint byte (`0x40` with the mint index in bits 0 and 1, and the mark) and a unit
+byte. With one mint the index is always 0, so the mint byte would carry only "in
+use" and the mark, six bytes in seven of it dead, and the unit would sit in a byte
+of its own. One state byte holds all three, and is still self-describing: the
+format rule (4.3) reads each entry's unit from bit 0 of the same byte that says
+it is in use, with no other byte to look at. One byte also makes the entry's
+commit one write (3.6). Bits 4 and 5 are left zero where a mint index would go
+(4.4).
 
-The entry's mint byte and the packed balance put the index in different bits:
-the entry `0x40 | index` (bits 0 and 1) with the unit as a code in its own byte,
-the packed `index << 4` with the unit as A or B. One helper turns an entry into
-its packed balance, and one turns a label (index, code) into it. No other code
-shifts the index or compares a code with the record's unit.
+Where a unit is said in one byte outside the table (the last payment's unit, the
+receipts' units, `GET_INFO` byte 50), it is relative to the record's: `80` the
+record's unit, `A0` the other, `00` none. Bit 5 is the same bit, in the same
+meaning, as a log entry's (6.6), so one reading serves both, and bit 7 says a unit
+is there, which the log never sets. Relative, as the log's one count has always
+been: the phone resolves it to a code with the record's unit byte. The table alone
+holds codes, because a keyset's unit is a fact about the mint and not about the
+record.
 
 ### 3.2 How many, and where they live
 
-**Sixteen entries.** A balance needs one entry for the keyset its mint issues
-now, and one more for a keyset the mint has retired while pieces of it are
-still on the card: two. Six balances are twelve. Four more are the room that
-entries made by somebody other than the owner may take (3.3), so that a
-stranger can never fill what the owner needs: sixteen. 160 bytes.
+**Six entries.** A unit needs one entry for the keyset its mint issues now, and
+one more for a keyset the mint has retired while pieces of it are still on the
+card: two. Two units are four. Two more are the room that entries made without
+the holder's say may take (3.3), so that a reader that is not the holder's can
+never fill what the holder needs: six. 54 bytes.
 
-**The book.** One array of 361 bytes:
+**The book.** One array of 75 bytes:
 
 | Offset | Size | Field |
 |---|---|---|
-| 0 | 160 | the table, sixteen entries of ten |
-| 160 | 78 | mint 1: length (1, 0 for none), address (77) |
-| 238 | 78 | mint 2: the same |
-| 316 | 4 | unit B: the daily limit, big-endian; 0 is no limit |
-| 320 | 4 | unit B: the window start |
-| 324 | 4 | unit B: spent today |
-| 328 | 4 | unit B: the limit on one payment |
-| 332 | 4 | unit B: the no-PIN allowance |
-| 336 | 4 | unit B: signed for with no PIN in the window |
-| 340 | 1 | the last payment's balance, packed (7.4) |
-| 341 | 4 | unit B signed for, ever (the log's count of unit A stays where it is: 6.5) |
-| 345 | 16 | the receipts' balances, packed, one beside each of the sixteen receipts (6.5) |
+| 0 | 54 | the table, six entries of nine |
+| 54 | 1 | the last payment's unit, relative (7.4) |
+| 55 | 4 | the other unit signed for, ever (the log's count of the record's unit stays where it is: 6.6) |
+| 59 | 16 | the receipts' units, relative, one beside each of the sixteen receipts (6.6) |
 
-The five fields after unit B's daily limit (320 to 339) are in the order of the
-record's 189 to 208 (window, spent, limit on one payment, allowance, no-PIN
-count), so one base offset serves each unit: field k is at base + 4 × k, base
-189 in the record for unit A and 320 in the book for unit B (6.3).
+The rate is not in the book. It is a limit, written by `SET_LIMIT` with the
+others, and it lives in the record beside them (6.2), where it exists before the
+first `SET_CARD` and on a card refused its book.
 
 **The arithmetic, against what the chip has.** `FOXY-CARD-HARDWARE.md` gives
 three budgets, and the book is held to each:
 
 | Budget | What was measured | The book |
 |---|---|---|
-| storage | a clean card has 164,176 bytes free; 1.7 takes 45,096; 1.20's first `SET_CARD` takes 12,288 more for the mint's proofs, leaving 106,792 | 361 bytes, and a little more of package for the code (about 2.5 KB, 12): about 104,000 stay free. Storage is not what binds |
-| a constructor's allocation | the constructors make 29,806 bytes of arrays; a build that asked for 300 more in the constructor installed, one that asked for 12,288 more did not | 361 is more than any figure measured to install. So the book is **not** made in the constructor. It is made where the store of the mint's proofs is made: by the first `SET_CARD`, once, outside any transaction, guarded (3.6). The constructors stay at 29,806, and the test that pins that figure stays as it is |
-| memory cleared on deselect | 941 bytes installs, 1,030 does not, 942 untried | **nothing new.** The payment's balance is worked out again at `SPEND_ALL_SIGN` from its first place (7.1); the label of a load is read from the APDU buffer; the marks of the reclaim (3.4) are a short local, sixteen bits; the unit's array and offsets are parameters (6.3) |
+| storage | 164,176 bytes free on a clean card; the applet about 45 KB; the first `SET_CARD` 12,288 more for the mint's proofs and 264 for the openings' keys | 75 bytes, and about 2 KB of code (12.1). Not what binds |
+| a constructor's allocation | 300 bytes more than 1.19's 29,806 installed, 12,288 more did not; since 1.21 the constructors make 30,069, 37 under that line | 75 is past the 37, so the book is **not** made in the constructor but by the first `SET_CARD`, once, outside any transaction, guarded, as the mint's proofs' store and the openings' keys are (3.6). The constructors stay at 30,069 |
+| memory cleared on deselect | 941 bytes installs, 1,030 does not, 942 untried | **nothing new**: the payment's unit is looked up again at `SPEND_ALL_SIGN` (7.1), a load's label read from the APDU buffer, the reclaim's marks six bits of a short local (3.4), a payment's cents worked out in `scratch` where `X_HEX` is, unused at `SPEND_ALL_SIGN` (6.4) |
 
-**The install-size window.** Whether the card's applet installs turns on the
-load file's size, by a rule nobody has found (`FOXY-CARD-HARDWARE.md`): 1.20
-installed at 19,634 bytes (178 past a multiple of 256). This design adds code,
-about 575 lines (12), which at the six bytes a line `sizeTheFile` assumes is
-some 2,500 to 3,400 bytes of file: a size between 22,100 and 23,100 bytes,
-where nothing has been tried. `tools/refcheck.py` will say "not tried". The
-build is then moved a line of `sizeTheFile` at a time (six bytes each, up to 43
-lines to cover a window of 256) and tried on a chip with `install-try.sh` until
-one installs, and that size goes into `SIZES`. One sitting at the chip is
-planned for it (12).
+The install-size window is in 12.2.
 
 ### 3.3 When an entry is written
 
 **At `LOAD_PROOF`, and nowhere else**, for a piece whose keyset is in no entry.
 A piece whose keyset is in an entry is checked against it and writes nothing to
-the table.
+the table. `LOAD_CHANGE` writes none: the card's own change is in the keyset of
+its opening, which is the payment's first piece's, whose entry the opening keeps
+live (3.4).
 
-`LOAD_PROOF` gains a labelled form. Why a label at all: a 1.20 phone loads with
-no label and must go on being able to, and a label is the only way the card can
-be told a balance it cannot work out. The card cannot work it out because a
-keyset id says nothing about its mint or its unit until a mint is asked, and a
-card cannot ask a mint.
+`LOAD_PROOF` gains a labelled form. Why a label at all: a phone of today loads
+with no label and must go on being able to, and a label is the only way the card
+can be told a unit it cannot work out. A keyset id says nothing about its unit
+until a mint is asked, and a card cannot ask a mint.
 
 | Form | P1 | P2 | Data | Lengths |
 |---|---|---|---|---|
-| plain, as 1.20 | `00` | `00` | one to three pieces of 81 | 81, 162, 243 |
-| with the mint's proof, as 1.20 | `01` | `00` | one piece and its proof | 177 |
-| **labelled** (1.23) | `00` | `01` | mint index (1), unit (1), then one to three pieces of 81 | 83, 164, 245 |
-| **labelled, with the proof** (1.23) | `01` | `01` | mint index (1), unit (1), then one piece and its proof | 179 |
+| plain, as 1.22 | `00` | `00` | one to three pieces of 81 | 81, 162, 243 |
+| with the mint's proof, as 1.22 | `01` | `00` | one piece and its proof | 177 |
+| **labelled** (1.23) | `00` | `01` | the unit code (1), then one to three pieces of 81 | 82, 163, 244 |
+| **labelled, with the proof** (1.23) | `01` | `01` | the unit code (1), then one piece and its proof | 178 |
 
-With P2 = 1 the label is the first two data bytes, and everything after it is
-read as 1.20 reads its data, two bytes on: piece k at `OFFSET_CDATA + 2 + 81 ×
-k`, the proof at `OFFSET_CDATA + 2 + 81`, and the log's "put on" summed from
-each piece's amount at the same shift (`OFFSET_CDATA + 2 + 81 × k + 8`). The
-answer is as 1.20's: the places, or the place and the proof flag. P2 = 0 is
-unlabelled. Any other P2 is `6B00`, checked with the length, before anything is
-written. The label's checks (1 and 2 below) are made once for the command,
-before its first piece.
+With P2 = 1 the label is the first data byte, and everything after it is read as
+1.22 reads its data, one byte on: piece k at `OFFSET_CDATA + 1 + 81 × k`, the
+proof at `OFFSET_CDATA + 1 + 81`, and the log's "put on" summed from each piece's
+amount at the same shift (`logLoaded`). The answer is as 1.22's. Any P2 other
+than 0 and 1 is `6B00`, before anything is written.
 
-Every piece of a labelled command is of the label's balance. An unlabelled piece
-is labelled `0, A`: sats at mint 0 on a sats card, which is what a 1.20 card
-assumes of every piece. A card of 1.20 does not look at P2, and answers every
-labelled length `6700`: a new phone that sent a label to an old card by mistake
-is refused, and nothing is written (10.1).
+Every piece of a labelled command is of the label's unit. An unlabelled piece is
+of the record's unit, which is what a 1.22 card assumes of every piece. A card of
+1.22 does not look at P2, and answers every labelled length `6700`: a new phone
+that sent a label to an old card by mistake is refused, and nothing is written.
 
-**Who may enter a keyset, and as which balance.** The load itself is let
-through as the applet lets it (as this was written: the PIN verified in this
-tap, the owner's grant, the tap after a payment, or anyone on a card with no PIN;
-as 1.22 is built, `requireLoadAuthority`, the PIN given in this tap and nothing else, and
-`LOAD_CHANGE` for the card's own change).
-Entering a keyset is held tighter, because a wrong entry would put money in the
-wrong balance for as long as a piece of that keyset is on the card:
+**Who may enter a keyset, and as which unit.** Every load is the PIN's, given in
+this tap, as 1.21 made it (`requireLoadAuthority`, LIMIT 3 rule 7): nothing in
+1.23 opens a load to anyone else. Entering a new keyset is held tighter, because
+a wrong entry puts money in the wrong unit for as long as a piece of that keyset
+is on the card:
 
-| In this tap | as `0, A` | as the last payment's balance (7.4) | as any other balance |
+| In this tap | a new keyset as the record's unit | as the last payment's unit (7.4) | as the other unit |
 |---|---|---|---|
-| the owner's grant (`ALLOW_LOAD`) | yes, marked the owner's | yes, marked | yes, marked |
-| the PIN verified | yes | yes | `6A9A` |
-| the tap after a payment (the change grant) | yes | yes | `6A9A` |
-| a card with no PIN, anyone who holds it | yes | yes | `6A9A` |
+| the PIN and the holder's say | yes, marked | yes, marked | yes, marked |
+| the PIN alone | yes | yes | `6A9D` |
 
-Under the owner's grant every entry is marked, a plain load's `0, A` too: it
-enters as `C0 00` on a sats card. Under the PIN, the change grant or no PIN it
-enters as `40 00`.
+Why those two columns are open to a till that holds the PIN. The record's unit is
+what any loader of a 1.22 card does today, so closing it would break every till
+of today. The last payment's unit is where a till's refund to the payer goes: a
+payment the mint refused is paid back in its own unit, and a mint that has moved
+to a new keyset since the card's pieces were made gives the refund in the new
+keyset. The other unit, on a card that has not just paid in it, is the holder's
+to start.
 
-`6A9A` and not `6A91`: the phone reads `6A91` as `not-owner` ("This phone does
-not hold the seed phrase this card was set up with"), and `cardGrant` as "this
-phone is not the owner". Neither is what happened here, which is a load the tap
-may make but a balance it may not start.
+**The mark, and the cap.** An entry written with the holder's say in the tap is
+marked. At most **two** live entries may lack the mark; a third is refused as a
+full table is (`6A9C`). A till with the PIN can load pieces of two keysets of its
+own making and no more, and the four the holder needs stay free.
 
-Why those two columns are open to a till. `0, A` is what any loader of a 1.20
-card does today, so closing it would break every till of today. The last
-payment's balance is where a till's change and refunds go: a payment of dollars
-at mint 1 makes change in dollars at mint 1, and a mint that has moved to a new
-keyset since the card's pieces were made gives that change in the new keyset.
-Anything else is the owner's: a balance the card has not paid from is a balance
-only the owner has any business starting.
+The owner's phone reads its card as owner, which gives the grant in the tap
+(`cardGrant`, from `cardLook` with `mine`), before every ADD FUNDS of a 1.23 card,
+so the owner's entries are marked. On a card with no
+owner a load under the PIN alone enters its keyset unmarked, and the phone holds
+the tap (LIMIT 8.4) only for a new keyset of the other unit, or after a `6A9C`.
 
-**The cap.** At most four live entries may lack the owner's mark. A fifth is
-`6A99`, as a full table is. A stranger with a no-PIN card in hand, or a till
-with the PIN, can load pieces of four keysets of its own making and no more,
-and the twelve the owner needs stay free.
+**What is checked, in order.** The checks of a load are 1.22's in their order
+(`6986` locked; `6A97` no PIN; `6982` the PIN not given; `6A8C` no record; `6A84`
+a full card), then `6B00` for a P2 that is not 0 or 1, then `6700` the length,
+then, for a labelled command, once before its first piece:
 
-**What is checked, in order.** The checks of a load are those of 1.20 in their
-order (`6982` the gate; `6A90` no owner; `6A8C` no record; `6A84` a full card;
-`6700` the length; then for each piece `6A8E` a date with no refund key, `6A80`
-not a piece), and then, new, for each piece before its nonce is looked at:
+1. A unit code over `01`: `6A80`. Then, on a card with no book (3.6), a label
+   of the other unit: `6A9C`.
 
-1. A label whose mint index is over 2 or whose unit is over `01`: `6A80`.
-   Then, on a card with no book, a label other than `0, A`: `6A99`, before
-   check 2. So a card refused its book answers every such load one word.
-2. A label that names mint 1 or 2 with no address on the card: `6A97`.
-3. The piece's keyset in an entry of another balance than the label's (the
-   label of a plain load being `0, A`): `6A97`. Nothing is written.
-4. The keyset in no entry, and the tap may not enter it as this balance (the
-   table above): `6A9A`.
-5. The keyset in no entry, and either no entry is free, or the new entry would
-   lack the owner's mark and four non-free entries already lack it: the reclaim
-   runs (3.4), and the counts are taken again. Still no free entry, or still
-   four unmarked: `6A99`. So the cap counts live entries, and the 128-place
-   pass is paid only where the cheap count says the table may be full, never at
-   a load of a keyset already entered.
+then for each piece 1.22's `6A84` and `6A8E` and `6A80`, and then, new, before
+its nonce is looked at:
 
-and then `6A94` for a nonce already on the card. The reclaim in check 5 writes
+2. The piece's keyset in an entry of the other unit than the label's (the label
+   of a plain load being the record's unit): `6A9B`. Nothing is written.
+3. The keyset in no entry, and the tap may not enter it as this unit (the table
+   above): `6A9D`.
+4. The keyset in no entry, and either no entry is free, or the new entry would
+   lack the mark and two in use already lack it: the reclaim runs (3.4), and the
+   counts are taken again. Still no free entry, or still two unmarked: `6A9C`.
+   So the cap counts live entries, and the pass over the 128 places is paid only
+   where the cheap count says the table may be full, never at a load of a keyset
+   already entered.
+
+and then `6A94` for a nonce already on the card. The reclaim in check 4 writes
 only entries that nothing names. It is not a write of this piece, and `6A94` is
-still the last check before this piece writes anything, as LIMIT section 8 has
-it. Several pieces in one
-command are taken in order, as now: a refusal of the first is the command's
-answer, and a later one ends the command with the places of those before it.
+still the last check before this piece writes anything, as LIMIT 8 has it.
+Several pieces in one command are taken in order, as now: a refusal of the first
+is the command's answer, and a later one ends the command with the places of
+those before it.
 
 ### 3.4 When an entry is let go
 
-- **`RESET_CARD`** zeros the whole book, with the store of the mint's proofs,
-  after the places are freed and outside the transaction (as 1.20 does that
-  store).
-- **`SET_CARD`** zeros the table, mints 1 and 2, the last payment's balance and
-  the receipts' balances with `Util.arrayFillNonAtomic`, after every check has
-  passed and before the record's transaction, not in it. 333 bytes would
-  overrun a commit buffer that holds about a dozen writes
-  (`FOXY-CARD-HARDWARE.md`), and the transaction already logs about 115 (unit
-  1, refund key 33, mint length 1, mint up to 77, design 3, set 1). jCardSim has
-  no such limit, so a build that zeroed the book atomically would pass every
-  test and throw `TransactionException` on the chip. The order is: the sixteen
-  mint bytes first (each entry is then free), then the rest of the table, then
-  each mint's length byte, then its address, then the last balance and the
-  receipts' balances. A tear leaves the old record over a book that is empty or
-  part empty. Nothing unspent and nothing owed names an entry (the two `6A8D`
-  below are checked before it), so nothing is lost, and a part-zeroed entry
-  whose mint byte went first is free. A mint zeroed under an old record is set
-  again by `SET_MINT`.
-- `SET_CARD` is let only on a card with nothing unspent, as it always was. On a
-  1.23 card it also answers `6A8D` while any opening is PENDING (change owed to
-  the card), because `requireNothingUnspent` looks only at the 128 status bytes:
-  after a payment of every piece with the card's own change, the card holds
-  nothing unspent and still waits for a piece whose entry the opening keeps
-  live. A DRAFT opening is let go first (set EMPTY), as `BEGIN` lets it go. So
-  no entry an opening names is ever zeroed. A phone of today already refuses to
-  set up a card that is owed change (`change-owed`), and reads `6A8D` as
-  `in-use` where it does not.
-- Unit B's limits are a limit, and `SET_CARD` never touches a limit: they stay
-  (but see 6.6 for a change of unit).
-- **A reclaim** lets go every entry that is not live. It runs at `CLEAR_SPENT`,
-  after the spent places are freed; at a load of a new keyset where the table
-  may be full or the cap reached (3.3, check 5); and at `SET_MINT`, before its
-  `6A8D` is looked at (4.2). It is one pass over the 128 places (each unspent
-  place marks its entry, its own keyset compared with the one before it first,
-  so that a drawer of one keyset costs one comparison a place) and one over the
-  eight openings that are DRAFT or PENDING, then every entry left unmarked is
-  set free by writing `00` to its mint byte. The marks are sixteen bits in a
-  short local, bit i for entry i: no scratch and no RAM array, so the memory
-  cleared on deselect stays at 941, and nothing in `LOAD_PROOF`'s scratch
-  (`X_HEX`, `X_NUM`, `X_SUM`) is touched between its pieces. A reclaim torn
-  halfway has freed some dead entries and not others, and the next one
-  finishes. A live entry is never freed, because the marks are made from what
-  is on the card at the moment.
+- **A reclaim** lets go every entry that is not live. One pass over the 128
+  places (each unspent place marks its entry, its keyset compared with the one
+  before it first, so that a drawer of one keyset costs one comparison a place)
+  and one over the eight openings that are drafted or owed; then every entry left
+  unmarked is set free by writing `00` to its state byte. The marks are six bits
+  of a short local, bit i for entry i: no scratch and no RAM array, and nothing in
+  `LOAD_PROOF`'s scratch (`X_HEX`, `X_NUM`, `X_SUM`) is touched between its
+  pieces. A reclaim torn halfway has freed some dead entries and not others, and
+  the next one finishes. A live entry is never freed, because the marks are made
+  from what is on the card at that moment. It runs at `CLEAR_SPENT`, after the
+  spent places are freed; at a load of a new keyset where the table may be full or
+  the cap reached (3.3, check 4); and at `SET_CARD`.
+- **`SET_CARD`** is let only on a card with nothing unspent and no change owed
+  (1.21, `requireNothingOwed`). In 1.23 it then lets go any opening drafted for a
+  payment never signed (as `SPEND_ALL_BEGIN` would), runs the reclaim, which with
+  nothing unspent and nothing owed frees every entry, and writes `00` to the last
+  payment's unit: all of it after every check has passed and before the record's
+  transaction, outside it. The receipts' units and the other unit's count stay,
+  with the log and the receipts they describe, which `SET_CARD` does not clear.
+- **`RESET_CARD`** zeros the whole book with `Util.arrayFillNonAtomic`, beside the
+  store of the mint's proofs, outside any transaction, as 1.22 does that store.
 
-An entry is never changed in place. A keyset that is entered stays as that
-balance until it is dead and reclaimed, so no command can move a piece from
-one balance to another.
+An entry is never changed in place. A keyset that is entered stays as that unit
+until it is dead and reclaimed, so no command can move a piece from one unit to
+the other.
 
 ### 3.5 A piece whose keyset is in no entry
 
-There is none. Every load enters the piece's keyset or is refused (3.3), the
-card's own change is written back in the keyset of its opening, whose entry the
-opening keeps live (3.4), and nothing frees an entry a live piece names. A test
-runs a long random history and checks after every step that every unspent
-place's keyset is in an entry of the balance it was loaded as (10.5, J28).
+There is none on a card with a book: every load enters its keyset or is refused
+(3.3), the card's own change is in its opening's keyset, which the opening keeps
+live, and nothing frees an entry a live piece names (U28 checks it after every step
+of a long random history). Should a lookup find no entry all the same (a bug), the
+place is of **no unit** in every command: `SPEND_ALL_BEGIN` refuses it `6A9A` and
+never falls back to the record's unit; `GET_BALANCE` and the phone count it in no
+sum; the reclaim marks nothing for it.
 
-Should a lookup on a card with a book find no entry all the same (a bug), the
-place is of **no balance**, the same answer in every command that asks:
-`SPEND_ALL_BEGIN` and `SPEND_ALL_SIGN` refuse it `6A98` and never fall back to
-`0, A` (a fallback would charge cents to the sats' day, the one thing the
-design exists to stop); `GET_BALANCE` counts it in no sum; the reclaim marks
-nothing for it. The phone counts it nowhere. J28 fails on it, so it never
-ships.
-
-The one card that has no table is a card that was refused the room for the book
-(3.6). It is a 1.20 card in every way: every piece is `0, A`, every load is
-taken as a plain one, a labelled load of any other balance is `6A99` (no room,
-before any other check of the label: 3.3), and every new command answers as a
-1.20 card's would.
+The one card with no table is one refused the room for its book (3.6): a card of
+one unit in every way, every piece the record's unit, every load taken as plain, a
+load labelled the other unit `6A9C`.
 
 ### 3.6 Order of writes, and the book's reservation
 
-`loadOne` writes, for a new keyset, the entry's keyset and unit and then its
-mint byte, last, as one byte: the mint byte is the entry's commit, as the
+`loadOne` writes, for a new keyset, the entry's eight keyset bytes and then its
+state byte, last, as one byte: the state byte is the entry's commit, as the
 status byte is a slot's (D14). This is before the slot's hex text, its proof
-record, its data and its status byte. A card taken away in between holds an
-entry that nothing names, which the next reclaim frees.
+record, its data and its status byte. A card taken away in between holds an entry
+that nothing names, which the next reclaim frees.
 
-The book is reserved by the first `SET_CARD` that goes through, after the store
-of the mint's proofs, the same way: once, outside any transaction, in a
-`try` that leaves it null where the card refuses the room. Every use of the book
-is safe while it is null. A later `SET_CARD` asks again. The tests that pin the
-one allocation of the proofs' store (that it is the only array the install
-leaves out, that it is made in `SET_CARD` and nowhere else) gain the book as the
-second, and nothing beside it.
+The book is reserved by the first `SET_CARD` that goes through, after the store of
+the mint's proofs and the openings' keys, the same way: once, outside any
+transaction, in a `try` that leaves it null where the card refuses the room. Every
+use of the book is safe while it is null. A later `SET_CARD` asks again. The tests
+that pin the once-only allocations (`ONCE_ONLY_ALLOCATIONS` in
+`SchnorrHWMathTest`: that each is in `processSetCard` and nowhere else, and the
+null its catch leaves) gain the book as the third, and nothing beside it.
 
-## 4. The mint list
+## 4. The mint
 
-### 4.1 Three mints, and why three
+### 4.1 One mint
 
-Mint 0 is the record's, at offset 39 and 40, as it is. Mints 1 and 2 are in the
-book, 78 bytes each. Three, because:
+What stays, all of it 1.22's:
 
-- the table holds two keysets for each of six balances, and a fourth mint would
-  be eight balances and sixteen entries with no room for the cap (3.3);
-- `GET_CARD` with P1 = 1 says the list in one answer: 1 + 2 × 79 = 159 bytes for
-  two mints past mint 0, and three would be 238, which fits, and four would be
-  317, which does not;
-- the screens show one mint at a time and list the others (9.4); three is a
-  list a person reads at a glance.
+- The mint is the record's, at offsets 39 (length) and 40 (up to 77 characters).
+  Every piece on the card is at that mint. An entry carries no mint.
+- The mint is changed only by `SET_CARD`, with nothing unspent and no change owed,
+  by the owner's proof on a card with an owner, and under the PIN (and a held tap,
+  once used) on a card with none (SPEC 5.2, LIMIT 8.4). `cardRepointFor` in the
+  phone does it for an empty card, as now.
+- The phone keeps a piece only where the record's mint lists its keyset **in the
+  unit the table names** (`keysetUnit` of `08c-units.js`), and checks its DLEQ
+  with that mint's keys of that unit (9.1).
 
-Each address is up to 77 characters, as mint 0's, and for the same reason (the
-command that writes it carries the owner's proof: 4.2).
+No `SET_MINT`: instruction `46` stays unused. No mint list in the book. No mint
+form of `GET_CARD`.
 
-### 4.2 SET_MINT (`46`)
-
-Why a command of its own: a mint's address is the owner's to give, as the
-record is, and it has to be given before the first piece of that mint goes on.
-Putting it in the load would make every load carry 78 bytes and an owner's
-proof.
-
-| Field | Value |
-|---|---|
-| CLA, INS | `B0 46` |
-| P1, P2 | `00 00` (anything else `6B00`, before anything else) |
-| Data | proof length (1), the owner's proof (DER), then the value: the mint index (1, `01` or `02`), the address's length (1, 0 to 77), the address |
-| Proof | ECDSA (P-256, SHA-256, DER) by the owner's key over `FoxyCard/set-mint` (17 bytes, `46 6F 78 79 43 61 72 64 2F 73 65 74 2D 6D 69 6E 74`), the 16-byte nonce the card gave, and the value as sent |
-
-No name in the owner's list is the start of another (`set-mint` beside
-`set-limit`, `set-card`, `set-owner`), so a proof for one is none for another.
-
-Refused in this order: `6B00` P1 or P2; `6986` a locked card; `6A90` no owner;
-`6A91` the proof (no nonce in this tap, or not the owner's for this label,
-nonce and value; no PIN try is spent); `6700` a value of fewer than two bytes,
-or whose length byte is over 77 or is not what follows; `6A8C` a card with no
-record or no book; `6A80` an index that is not 1 or 2, an address with a byte
-outside `20` to `7E`, or an address the same, byte for byte, as another mint's
-on the card (one mint under two indexes would split one mint's money into two
-balances, and a keyset can be in only one); `6A8D` an entry of that index that
-is live (money of that mint, or change owed to it, is on the card).
-
-Before `6A8D` is looked at, `SET_MINT` runs the reclaim (3.4). An entry of that
-index still there after it is live, and is `6A8D`. Otherwise no entry of that
-index is left, dead or alive. Why: a dead entry of the old mint's keyset K,
-not yet reclaimed, still says mint 1. Were it kept, a later load of K labelled
-`1, unit` would pass check 3 with no new entry and go in as the new mint's
-money, misfiled by the card. Then, in one transaction, the address and its
-length; a length of 0 lets the index go.
-
-No PIN is asked, and none is spent. Any funds are allowed, at other mints:
-money at mint 1 is untouched by mint 2's address, and the address of a mint the
-card holds money at cannot be changed or taken away while it does.
-
-### 4.3 How a mint is added
-
-With its first keyset, in the owner's ADD FUNDS tap, no PIN:
-
-1. `GET_NONCE`, the phone signs `set-mint` over `01 ‖ length ‖ address`,
-   `SET_MINT`.
-2. `GET_NONCE`, the phone signs `load`, `ALLOW_LOAD`.
-3. `CLEAR_SPENT`, then `LOAD_PROOF` labelled `01, unit`: the first piece enters
-   the mint's keyset, marked the owner's, and the rest go in after it.
-
-Two owner's proofs, each 41 ms of the chip's verifier (`FOXY-CARD-HARDWARE.md`),
-and a command each. A tap cut short after step 1 leaves an address with no
-money, which is harmless and which the next ADD FUNDS finds there. Mint 0 is
-changed as now, by `SET_CARD`, only with nothing unspent anywhere on the card.
-
-### 4.4 GET_CARD (`16`)
-
-Why three forms: a phone of today reads the answer to P1 = 0 by its exact
-length (`cardRecordOf` refuses any length but `106 + mint` or `109 + mint`), so
-anything added to that answer would make it refuse every new card. The list and
-the table are asked for by forms of their own, as `GET_INFO` P1 = 1 and P1 = 2
-were added beside P1 = 0.
+### 4.2 GET_CARD (`16`)
 
 | P1 | Answer |
 |---|---|
-| `00`, and any but `01` and `02` | 1.20's, to the byte: the card's format (1; 4 or 5: 4.5), record set (1), unit (1), limit (4), refund key (33), the clock's 65 bytes, mint 0's length (1) and address, design (3). At most 186 bytes |
-| `01` (1.23) | the mints past mint 0: a count (1), then for each index that has an address, the index (1), the length (1), the address. At most 159 bytes. `00` alone on a card with no book |
-| `02` (1.23) | the table: a count (1), then each entry that is not free, its ten bytes as kept (3.1), in the table's order. At most 161 bytes. `00` alone on a card with no book |
+| `00`, and any but `02` | 1.22's, to the byte but for byte 0, the card's format (4 or 5: 4.3): record set (1), unit (1), daily limit (4, cents on 1.23), refund key (33), the clock's 65 bytes, mint length (1) and address, design (3). The 29 bytes after the newest header's hash stay zeros in the answer, though the rate is kept in the first four of them (6.2): the answer masks it. At most 186 bytes |
+| `02` (1.23) | the table: a count (1), then each entry in use, its nine bytes as kept (3.1), in the table's order. At most 55 bytes. `00` alone on a card with no book |
 
-No PIN, any state, as P1 = 0. A card of 1.20 does not look at P1 and answers
-every form with the record; a phone asks P1 = 1 and 2 only of a card that says
-1.23 (10.1).
+No PIN, any state: a till needs the table to sort the pieces into units before it
+picks. A form of its own, because a phone of today reads P1 = 0's answer by its
+exact length (`cardRecordOf`), and would refuse a longer one. P1 = 1 is left as
+P1 = 0, the place a mint list would take (4.4). A card of 1.22 does not look at P1;
+a phone asks P1 = 2 only of a card that says `01 17`.
 
-### 4.5 GET_INFO (`01`), and the card's format
+### 4.3 GET_INFO (`01`), and the card's format
 
-`GET_INFO` with P1 = 0, 1 and 2 answers the 30, 42 and 43 bytes it does, to the
-byte but for the version and byte 8. With **P1 = 3** (1.23) it answers 73:
+`GET_INFO` with P1 = 0, 1 and 2 answers the 30, 42 and 43 bytes it does, laid out
+to the byte as 1.22's but for the version and byte 8; every figure in them is
+cents (the daily limit at 12, spent today at 25, the limit on one payment at 30,
+the allowance and its count at 34 and 38). With **P1 = 3** (1.23) it answers 51:
 
 | Bytes | Field |
 |---|---|
 | 0 to 42 | the 43 bytes of P1 = 2 |
 | 43 | the book's format: `01`; `00` on a card that was refused the room for it |
-| 44 | unit B's code |
-| 45 to 48 | unit B's daily limit |
-| 49 to 52 | unit B's window start |
-| 53 to 56 | unit B's spent today |
-| 57 to 60 | unit B's limit on one payment: with the owner's grant in this tap (on a card with no owner, to the PIN given in a held tap, 1.22), and zeros to anyone else, as bytes 30 to 33 are for unit A (LIMIT 6a) |
-| 61 to 64 | unit B's no-PIN allowance, to anyone |
-| 65 to 68 | unit B's signed with no PIN in its window, to anyone |
-| 69 | entries in use |
-| 70 | of them, entries without the owner's mark |
-| 71 | mints with an address, mint 0 counted |
-| 72 | the last payment's balance, packed |
+| 44 to 47 | the rate (6.2): with the owner's grant in this tap, or on a card with no owner to the PIN in a held tap (1.22, LIMIT 8.4); zeros to anyone else, as bytes 30 to 33 are |
+| 48 | entries in use |
+| 49 | of them, entries without the mark |
+| 50 | the last payment's unit, relative (`80`, `A0` or `00`) |
 
-Bytes 45 to 68 are the book's 316 to 339 in one copy, then 57 to 60 zeroed
-without the grant: the book keeps unit B's fields in this order for that reason
-(3.2).
+Any other P1 is answered with the thirty bytes, as now. A card of 1.22 answers
+P1 = 3 with the thirty.
 
-Any other P1 is answered with the thirty bytes, as it is now. A card of 1.20
-answers P1 = 3 with the thirty.
-
-**Byte 8, the card's format.** It was 4 for every card since 1.4, and it says
-how a piece's secret is made (`SIG_ALL`). It still means that, and gains one
-value:
+**Byte 8, the card's format.** It has been 4 since 1.4, and it says how a piece's
+secret is made (`SIG_ALL`). It still means that, and gains one value:
 
 | Byte 8 | Means | A phone of today |
 |---|---|---|
-| `04` | every entry in the table is `0, A`, or there is no table: **a card of one balance**. Every piece is of the record's unit at the record's mint, and the secret is format 4's | reads it, pays with it and loads it as a 1.20 card (or, for a record in dollars, refuses it: "That card holds something other than sats.") |
-| `05` | some entry is of another balance. The secret is format 4's, and the table has to be read before a piece can be counted | refuses it before anything else is read: "That card is a kind this Foxy does not know." (`cardLook`, which takes 3 and 4 and nothing else) |
+| `04` | every entry in use is of the record's unit, or there is no table: **a card of one unit**. The secret is format 4's | reads it, pays with it and loads it as a 1.22 card of that unit (a dollars card as the dollars card that has shipped) |
+| `05` | some entry in use is of the other unit. The secret is format 4's, and the table has to be read before a piece can be counted | refuses it before anything else is read: "That card is a kind this Foxy does not know." (`cardLook`, which takes 3 and 4 and nothing else) |
 
-`GET_CARD`'s byte 0 says the same. The card works it out at each asking, from
-the sixteen mint and unit bytes: 5 if any entry has a mint byte other than `00`
-and either its index (mint byte `& 0x03`) is not 0 or its unit byte is not the
-record's; else 4. The owner's bit (`0x80`) is not looked at, so `C0 00` is
-`0, A`; a free entry (`00`) is skipped; a card with no book is 4. So a card goes
-to 5 at its first entry of any balance other than `0, A`, a card that holds
-only `0, B` among them (one balance, but not the record's, so a phone of today
-would read it in the record's unit), and back to 4 when the last such entry is
-reclaimed: an owner who takes the dollars off a card and taps CLEAR has a card a
-phone of today can use again. Why a format, and not only a version: a phone of today checks the
-format and not the version before it reads a piece as sats, and it is the one
-switch that stops it reading cents as sats (10.2). New phones take 4 and 5 as
-the same secret (`cardSecret`, `cardIsAll` compare with `>= 4`).
+`GET_CARD`'s byte 0 says the same. The card works it out at each asking from the
+six state bytes: 5 if an entry in use has a bit 0 that is not the record's unit
+byte, else 4 (the mark is not looked at; no book is 4). So a card goes to 5 at its
+first entry of the other unit, and back to 4 when the last is reclaimed. Why a
+format and not only a version: a phone of today checks the format, not the version,
+before it reads a piece in the record's unit, and it is the one switch that stops
+it reading cents as sats (10.2). New phones take 4 and 5 as the same secret (9.1).
+
+### 4.4 What three mints would have added (history)
+
+The earlier draft held money at up to three mints. It would have added: two more
+addresses in the book (78 bytes each); `SET_MINT` (`46`), under the owner's proof
+over `FoxyCard/set-mint`, refused while money of that mint was on the card; a mint
+index in every entry and sixteen entries in place of six (two for each of six
+balances, and four for the cap); a reclaim at `SET_MINT` so that a dead entry of
+an old mint could not misfile a new mint's money; the mint's bits in the log and
+the receipts; `GET_CARD` P1 = 1 for the list; and a till that could be paid at any
+of the three. The door is marked: instruction `46` and `GET_CARD` P1 = 1 are left
+unused, an entry's state byte keeps bits 4 and 5 zero where an index would go, and
+a log entry's flags keep bits 6 and 7 free (bit 4 is 1.22's let-go and bit 5 is
+the unit, 6.6). A mint index would need two bits there, and the book would grow by
+the addresses; nothing else in 1.23 would have to move.
 
 ## 5. Sums
 
 The card's pieces are listed by `GET_PIECES` as they are, each with its keyset.
-A phone reads the table once (`GET_CARD` P1 = 2) and sorts the pieces into
-balances itself; that is how a phone reads one balance per unit per mint, and it
-needs no sum from the card. The card's sums are for a reader that does not list
-pieces (an upstream terminal, a quick look):
+A phone reads the table once (`GET_CARD` P1 = 2) and sorts the pieces into units
+itself; it needs no sum from the card. The card's sums are for a reader that does
+not list pieces (an upstream terminal, a quick look):
 
 | Command | Answers |
 |---|---|
-| `GET_BALANCE` (`11`), P1 = `00` | the sum of the unspent pieces of **the record's balance** (`0, A`), 4 bytes. On a card of one balance that is every unspent piece, so the answer is 1.20's. On a card of format 5 it is never a sum across units: a reader that knows only this command sees the money it would understand, and no cents added to sats |
-| `GET_BALANCE`, P1 = `01` (1.23) | a count n (1), then for each balance that holds a piece, in the order mint 0 sats, mint 0 dollars, mint 1 sats, and so on: mint index (1), unit code (1), pieces (1), sum (4); then a count u (1; 1 or 2, 0 on a card with nothing unspent), then for each unit held: unit code (1), its sum over every mint (4). At most 1 + 6 × 7 + 1 + 2 × 5 = 54 bytes |
+| `GET_BALANCE` (`11`), P1 = `00` | the sum of the unspent pieces of **the record's unit**, 4 bytes. On a card of one unit that is every unspent piece, so the answer is 1.22's. On a card of format 5 it is never a sum across units: a reader that knows only this command sees the money it would understand, and no cents added to sats |
+| `GET_BALANCE`, P1 = `01` (1.23) | a count u (1; 0, 1 or 2), then for each unit held, sats first: unit code (1), pieces (1), sum (4). At most 13 bytes |
 
-A sum that passes four bytes wraps, as P1 = 0's always has (`testGetBalanceWrapsPast2Pow32`). Sats are added to sats and cents to cents,
-across mints, because a sat at Forge and a sat at Minibits are the same sat to
-the holder; they are never added to each other. The card does not know a price
-and never says a total in one unit.
+A sum that passes four bytes wraps, as P1 = 0's always has
+(`testGetBalanceWrapsPast2Pow32`). A card of 1.22 does not look at P1 and answers
+the one sum. The card never says a total in one unit across both: the rate is for
+holding a payment to the ceiling, not for counting money.
 
-## 6. Limits
+## 6. The ceiling
 
-### 6.1 One set for each unit
+### 6.1 One ceiling, in cents, across units
 
-Why: a daily limit of 20,000 counted against cents is a limit of $200, and
-against sats about $20. A number with no unit is no limit. So each unit has its
-own: the daily limit, the limit on one payment and the no-PIN allowance, each
-with what has been counted against it and a window of its own.
+The owner's answer to the first question: one ceiling across units. On a card of
+1.23 **every limit in the record is in cents**, whatever the record's unit: the
+daily limit (offset 2), what it counts (window 189, spent today 193), the limit on
+one payment (197), the no-PIN allowance (201) and what it counts (205). A dollar
+payment is compared as it is. A sats payment is turned into cents with the rate
+at `SPEND_ALL_SIGN`, and then held to the same figures by the same code.
 
-Unit A's are the record's fields, where they are (limit at 2, window 189, spent
-193, limit on one payment 197, allowance 201, its count 205). Unit B's are in
-the book (316 to 339), in the same meanings. A window of its own for each unit,
-and not one shared, because setting a limit begins its window: a shared window
-would let the owner's withdrawal of dollars, which lifts and puts back the
-dollar limit, also give the sats their whole day back.
+Foxy's app sets no daily limit at launch (LIMIT 6), and does not on 1.23 either.
+The field stays, and the card keeps it as 1.22 does: a later app may set it, in
+cents, and it is then charged with the same converted figure. So the ceiling that
+works at launch is two numbers: **the limit on one payment** (a larger payment
+waits, LIMIT 6a) and **the no-PIN allowance** (LIMIT 6f). Each bounds payments of
+either unit, and each is counted across both: an allowance of $2.00 is $2.00 of
+sats and dollars together, not $2.00 of each.
 
-### 6.2 SET_LIMIT gains a unit
+Why not a set of limits for each unit, as the earlier draft had it: a terminal
+with the PIN would take the two together, and a thief two allowances where the
+owner set one.
 
-The owner's form (`34`) takes the value it takes now, or the same with the unit
-in front:
+### 6.2 The rate
 
-| Value | Sets |
-|---|---|
-| 4, 8 or 12 bytes | unit A's, exactly as now |
-| **5, 9 or 13 bytes** (1.23) | unit code (1), then 4, 8 or 12 bytes as above, for that unit: unit A's when the code is the record's, unit B's when it is the other. Any other code is `6A80` |
+**What it is.** Sats per dollar, four bytes, big-endian, the price the owner's
+phone shows turned round and rounded **down**: `R = floor(100,000,000 / P)`, with
+`P` that phone's price in dollars a bitcoin. At $100,000 a bitcoin R is 1,000. 0
+is no rate.
 
-The proof is over the value as sent, unit byte and all, under the label it has
-(`FoxyCard/set-limit`), so a proof for the sats' limit is none for the dollars'.
-A card of 1.20 answers the new lengths `6700`, so a figure in cents can never be
-taken by an old card as sats (10.1). Every rule of the twelve-byte form holds
-for each unit (LIMIT 6f): a figure that does not change keeps its window and its
-count; a new daily limit begins that unit's window at `now` and takes that
-unit's two counts to 0; an allowance on a card with no PIN is `6985`. The PIN
-form (`33`, a card with no owner) is unit A's only.
+**Where it is kept.** In the record at offset 156, the first four of the 29 bytes
+after the newest header's hash, zeros since 1.15 (they were the end of a time key
+up to 1.14). `SET_CARD` does not write those bytes and so leaves the rate as it
+is, as it leaves every limit; `RESET_CARD` zeros them with the rest of the record
+but the clock. `SET_LIMIT` writes it, in the transaction that writes the limits
+(6.3). `GET_CARD` answers those bytes as zeros (4.2); `GET_INFO` P1 = 3 says the
+rate to the holder (4.3). Why the record and not the book: it is a limit, written
+with the limits; it is there before the first `SET_CARD` and on a card refused its
+book; and it costs no new storage.
 
-Unit B on a card with no book, including a card before its first `SET_CARD`
-(whose book is not made yet), is `6A8C`, after the proof and the length and
-before anything is written. Before the first `SET_CARD` the record's unit byte
-is `00`, so unit A is sats there, and a five-byte value with code `00` sets
-unit A's as the four-byte one does.
+**How a payment is turned into cents.** Java Card makes `int` optional and this
+applet uses none (`toDecimal`, `SchnorrHW`), so the arithmetic is by hand on
+bytes, in `scratch`:
 
-`writeLimit`'s transaction writes the same number of fields for unit B as for
-unit A, into the book in place of the record: nothing more is logged.
+    cents(S) = ceil(S × 100 / R)       S the payment's sats, four bytes; R the rate, R ≥ 1
 
-### 6.3 A payment is charged to its own unit, and only to it
+    1. A = S × 100, in five bytes: from the low byte up, v = A[i] × 100 + carry, A[i] = v & 0xFF,
+       carry = v >> 8. v is at most 255 × 100 + 99 = 25,599, inside a short.
+    2. Q = A ÷ R and M = A mod R, by forty steps of shift and subtract on five-byte numbers.
+    3. Q = Q + 1 where M is not 0.
+    4. Q past four bytes (its top byte not 0): Q = FF FF FF FF, over every ceiling.
 
-The payment's unit is its balance's (7.1). Each reader of a limit takes three
-parameters: the unit's array (`cardRecord` or the book), the offset of its daily
-limit (2 or 316) and the base of its other five (189 or 320), worked out once
-at the top of the command from the payment's balance. Field k is at base + 4 ×
-k (3.2). No instance field holds them: a field is persistent memory, and would
-be written at every payment. Java has no pair return, and small methods that
-answer an array and an offset would be two calls a field, each a place the
-chip relocates at install, of which it takes only so many (`waitsFor`'s
-comment). `requireUnderLimits`, `waitsFor`, `requireAllowanceOrPin`, `dayIsOver` (as
-`windowIsOver` on the unit's window) and the `SIGN` commit read their fields
-this way, so the code that counts is the code of 1.20 with three parameters in
-it:
+**The bound.** Every amount the card is asked about is four bytes: a piece, a
+payment's sum (a sum that wraps is refused at `SPEND_ALL_BEGIN`, as now) and every
+count. So S < 2^32 (42.9 bitcoin) and A = S × 100 < 2^39, which five bytes hold:
+nothing overflows, for any S the card can hold and any R. Q fits four bytes
+whenever R ≥ 100 (a price of up to a million dollars a bitcoin), since Q ≤ S then;
+under that, a Q past four bytes is taken as over every ceiling. The whole supply,
+21 million bitcoin, is 2.1 × 10^15 sats, 51 bits: past any figure a card holds, so
+the card is never asked to convert it. R stays at least 1 for prices up to $100
+million a bitcoin; past that a sat is worth more than a dollar and the rate would
+need a scale, which is a later version's question.
 
-- **The day** (`requireUnderLimits`): spent today in the payment's unit, plus
-  what leaves the card, over that unit's daily limit: `6A8F`, written in the log
-  and refused, as now. A day is over when `now` is a day past **that unit's**
-  window start. At `SPEND_ALL_BEGIN` a sum that wraps is refused here too, as
-  now (the carry path), against the payment's unit: the unit is the first
-  place's, and the one-balance check (`6A98`, 7.1), made in the loop over the
-  places, comes before the wrapped-sum refusal, so a wrap never meets a place
-  of another balance. The refusal is logged with the payment's balance (6.5),
-  and the other unit's counts are untouched.
-- **The wait** (`waitsFor`): with `L` that unit's limit on one payment and `S`
-  what leaves the card (the pieces less the card's own change, both in the
-  payment's unit), the formula of LIMIT 6a, unchanged:
+**The rounding never under-counts.** R is rounded down, so each sat is counted as
+at least its worth in cents at the phone's price, and Q is rounded up, so a part
+of a cent counts as a cent. Both err toward the stricter: a payment in sats is
+charged a little more than its worth, never less. The error from R's rounding is
+under 1/R: 0.1% at $100,000 a bitcoin, 1% at a million.
 
-      S ≤ L + L/32         waits = 0
-      otherwise            waits = 10 + 4 × (ceil(S / L) − 2), at most 255 limits' worth,
-                           less two for every three change outputs, never below 0
+### 6.3 SET_LIMIT, both forms
 
-  "One payment a tap at full speed" stays one rule for the card and not one a
-  unit: a second payment in the same time in the field is slowed whichever
-  balance it is of, because what it guards is a terminal taking a payment a
-  second, and two units do not make that slower.
-- **The no-PIN allowance** (`requireAllowanceOrPin`): what has been signed with
-  no PIN in that unit's window, plus what leaves the card, over that unit's
-  allowance: `6A94`, the PIN for the whole payment, nothing in the log. A card
-  with a PIN and no allowance in one unit asks for the PIN for every payment in
-  that unit.
-- **The commit**: in `SPEND_ALL_SIGN`'s one transaction, the payment's unit's
-  window start (on a new day), spent today and no-PIN count: the same number of
-  writes as now, in another place.
-- **`SET_HEADER`**: the first header after a limit set while `now` was 0 anchors
-  the window of each unit that has one: one `arrayCopy` of 4 more in its
-  transaction, for unit B's window.
+The owner's form (`34`): proof length (1), the proof (DER) over
+`FoxyCard/set-limit`, the nonce the card gave and the value as sent, then the
+value:
 
-### 6.4 A card with one unit
+| Value | Sets | On 1.23 |
+|---|---|---|
+| 4 bytes: daily limit | as 1.22 | taken where the record's unit is dollars (the figures are cents already); `6700` where it is sats |
+| 8 bytes: daily limit, limit on one payment | as 1.22 | the same |
+| 12 bytes: those, then the allowance | as 1.22 | the same |
+| **16 bytes** (1.23): daily limit (4), limit on one payment (4), allowance (4), rate (4) | every figure in cents, and the rate in sats per dollar (0 none) | taken |
 
-A card whose book holds no entry of unit B has unit B's limits and counts at 0,
-which is no limit, and never reads them: no payment is of unit B. It is the 1.20
-card. A card whose record is in dollars and that holds only dollars is the same,
-in cents: its limits in the record are cents, and every rule above reads them
-as they are (9.7).
+The PIN form (`33`, a card with no owner, under the PIN given in this tap, with
+nothing unspent and no change owed, and once used in a held tap: LIMIT 8.4):
 
-### 6.5 The log and the receipts say the balance
+| Value | Sets | On 1.23 |
+|---|---|---|
+| 4 bytes: limit on one payment | as 1.22 | taken where the record's unit is dollars; `6700` where it is sats |
+| 8 bytes: that, then the allowance | as 1.22 | the same |
+| **12 bytes** (1.23): limit on one payment (4), allowance (4), rate (4) | in cents, and the rate | taken |
+
+**Why the old lengths only on a dollars record.** They carry no rate, and are
+figures in the record's unit, as they always were. On a dollars record that is
+cents: they are taken, the rate left as it is, and the dollars card that has
+shipped works on a 1.23 card with no change to its phone. On a sats record they
+would be sats where the card keeps cents, ten times too loose or more, so they are
+refused before anything is written (before the first `SET_CARD` too, whose unit
+byte is `00`). One comparison of the unit byte, with the length.
+
+**The version gate, both ways.** A card of 1.22 answers the sixteen-byte owner's
+form and the twelve-byte PIN form `6700`, so a figure in cents is never taken by a
+card that does not know it is cents. A new phone sends the new forms only to a
+card that says `01 17`, and the old ones, in the old way, to a card before it
+(10.3).
+
+**What each form does, beyond 1.22.** The rules of LIMIT 6f hold for every
+figure: a figure that does not change keeps its window and its count; a new daily
+limit begins its window at `now` with nothing spent; a new allowance counts from
+nothing; the PIN form's allowance count goes to 0 whether or not its number
+changed. A new rate changes no count and begins no window: the counts are cents
+already. The proof is over the value as sent, rate and all, so a proof for one
+rate is none for another, and none for a shorter value.
+
+`writeLimit` writes the rate, where it changed, in the transaction that writes the
+limits: one `arrayCopy` of four more (7.4).
+
+### 6.4 A payment held to the ceiling
+
+The payment's unit is its first place's entry's (7.1). At the first
+`SPEND_ALL_SIGN`, after 1.22's `6A97` and `6985`:
+
+1. **Its cents.** A dollar payment's figures are its own. A sats payment's two
+   figures are turned into cents (6.2): **the whole of its pieces** (`allSum`),
+   which the allowance counts (LIMIT 6f), and **what leaves the card** (`allNet`,
+   the pieces less the card's own change), which the day and the wait count (LIMIT
+   6, 6a). Each is converted and rounded up by itself, so neither under-counts.
+   They go in `scratch` at offsets 0 and 4, the division's room at 8 to 17, all
+   inside `X_HEX`, unused at `SPEND_ALL_SIGN`, and are worked out again at the last
+   `SPEND_ALL_SIGN`, where the checks are asked again: nothing is kept in RAM
+   between the two, and the rate cannot change between them (any other command
+   gives the payment up).
+2. **No rate.** A sats payment, no rate (R = 0), and any of the three limits set:
+   **`6A99`**, the payment given up, nothing signed, burned, counted or logged.
+   Before the PIN gate, so a reader with no PIN writes nothing. With no limit set
+   none is asked, and a dollar payment never asks. The card refuses rather than
+   taking a sats payment as unbounded or as zero cents, which would leave a ceiling
+   the owner set with none for sats. Foxy's phone writes the rate with every
+   ceiling (9.1), so `6A99` is met only by a card set by something else.
+3. **The allowance** (`requireAllowanceOrPin`), held to the whole in cents, as 1.22
+   holds it to the whole in its unit: `6A94` over it, the PIN for the whole payment.
+4. **The day** (`requireUnderLimits`), held to what leaves the card in cents, where
+   a daily limit is set: `6A8F`, written in the log, as now.
+5. **The wait** (`waitsFor`), with L the limit on one payment and S what leaves the
+   card, both in cents, the formula of LIMIT 6a unchanged:
+
+        S ≤ L + L/32         waits = 0
+        otherwise            waits = 10 + 4 × (units − 2), units = ceil(S / L), at most 255,
+                             less two for every three change outputs, never below 0
+
+   S is rounded up (6.2) and `units` counts a part of a limit as a whole, as the
+   code always has, so the wait never under-counts: about seven seconds over the
+   limit and three more a further limit's worth, at least what the payment's true
+   worth in cents would ask. A second payment in a time in the field is slowed as
+   now, whichever unit.
+
+`requireUnderLimits` and `waitsFor` already take the sum they are held to, and
+`requireAllowanceOrPin` is given its figure the same way, so the code that counts
+is 1.22's, handed cents. The commit is 1.22's, in cents. `SET_HEADER` is untouched:
+one window, as there was.
+
+### 6.5 How stale a rate may be
+
+The card has no clock that runs, and it does not judge its rate: the rate is the
+owner's phone's word, as the ceiling is. What keeps it near the market is the
+phone's rule, which exists today for the figures themselves: at each read of the
+card as its owner (`cardLook` with `mine`), where the price the phone shows has
+moved more than `CARD_PACE_DRIFT` (2%) from what the card holds, the phone writes
+it again with its proof, in the tap. On a sats card of 1.22 it re-pegs the
+figures (`cardPaceSats`, `cardPaceNoPinSats`); on a card of 1.23 the figures are
+cents and never move, and it re-pegs the rate: the sixteen-byte form with the
+three figures as the card has them (so no window or count begins again) and the
+new R. The phone compares its own R with the one the card says (`GET_INFO` P1 = 3,
+bytes 44 to 47, which the owner's grant opens), not with a note of its own, so it
+sees the rate it last wrote, and a write that was lost is written again at the
+next read.
+
+A card with no owner has no owner's read. Its rate, like its limits, is set under
+the PIN only while it is empty (`33`, LIMIT 8.4), and drifts with the price while
+it holds money. A 1.22 card with no owner drifts the same: its sats limits are
+fixed and their dollar worth moves. A sats payment is held to the same number of
+sats either way.
+
+A till is told nothing new. It is not told the rate (4.3) and does not need it: it
+reads the allowance in cents, guesses with its own price, and the card's answer
+(`6A94`, the wait) is the truth, as it is today (`cardNeedsPin`).
+
+### 6.6 The log and the receipts say the unit
 
 Why: the log is the one account of a card's use that needs nobody's honesty, and
-a line that says "1,000 signed for" without its unit says nothing.
+"1,000 signed for" without its unit says nothing. Its amounts stay in each
+payment's own unit; the cents a payment was weighed at are the ceiling's business.
 
-- **A log entry is of one balance.** Its flags byte gains bits 4 and 5 (the mint
-  index) and bit 6 (`1` unit B, `0` unit A), the same bits as the packed
-  balance's (3.1) with its bit 7 left off. A tap whose payment or load is of
-  another balance than the entry it has begins a new entry: the count of taps
-  then counts entries, which a phone that remembers the counts it saw reads the
-  same. Bit 2 stays unused. An entry of a 1.20 card, and of a 1.23 card that
-  holds only `0, A` (in sats or in dollars), has the three bits at 0, so its log
-  is 1.20's to the byte (goal 5).
-- **How `logEntry` knows.** It takes the packed balance. Where the tap has an
-  entry (`tapOpen[0]`), it reads that entry's bits 4 to 6. If they differ, it
-  begins a new entry as at a tap's start, and the new entry's bits are written
-  when it is begun, in the transaction that begins it (`LOAD_PROOF`'s log,
-  `SIGN`'s, `refuseOverLimit`'s). Nothing new in RAM: the entry's own flags
-  byte is what is compared.
-- **Units are the record's.** Bit 6 and the head's count are relative to the
-  record's unit at the moment of reading, as 1.20's one count has always been.
-  A change of the record's unit (6.6) changes what old entries mean, as it
-  does on 1.20; it is the owner's, on an empty card.
-- **The counts.** The head's "sats, ever" (offset 4) counts unit A. Unit B's is
-  in the book (341). `GET_LOG` with **P1 = 2** (1.23) answers 20 bytes of counts
-  (taps, unit A ever, refused, runs, unit B ever) and the eight entries: 180
-  bytes. P1 = 0 is the 176 bytes it is.
-- **The receipts.** Each receipt's balance is kept beside it in the book (345,
-  one byte for each of the sixteen), written in the receipt's own transaction.
-  `GET_LOG` with **P1 = 3** (1.23) answers as P1 = 1 does with each receipt one
-  byte longer, its 77 and its balance packed: 4 + 3 × 78 = 238 bytes. Same gate
-  as P1 = 1 (the owner's grant; on a card with no owner, the PIN in a held tap, 1.22; with no PIN, anyone). P1 = 1 is the 77-byte form
-  it is. A receipt from before the book has `00` there.
+- **A log entry is of one unit.** Its flags byte gains bit 5 (`0x20`): set, the
+  other unit; clear, the record's. Bits 0 to 4 are 1.22's (bit 4 the let-go, 1.22).
+  A tap whose payment or load is of another unit than the entry it has begins a
+  new entry: the count of taps then counts entries, which a phone that remembers
+  the counts it saw reads the same. An entry of a card that holds one unit has bit
+  5 at 0, so its log is 1.22's to the byte (goal 5).
+- **How `logEntry` knows.** It takes the unit, and where the tap has an entry
+  (`tapOpen[0]`) whose bit 5 differs, begins a new one, its bit written in the
+  transaction that begins it (`logLoaded`'s, `SIGN`'s, `refuseOverLimit`'s,
+  `LOAD_CHANGE`'s, whose unit is its opening's keyset's). Nothing new in RAM.
+- **Relative to the record.** Bit 5 and the head's count are relative to the
+  record's unit when read, as 1.22's one count always was; a change of the record's
+  unit (6.7), the owner's on an empty card, changes what old entries mean.
+- **The counts.** The head's count at offset 4 counts the record's unit. The other
+  unit's is in the book (55). `GET_LOG` with **P1 = 2** (1.23) answers 20 bytes of
+  counts (taps, the record's unit ever, refused, runs, the other unit ever) and the
+  eight entries: up to 180 bytes. P1 = 0 is the up to 176 it is.
+- **The receipts.** Each receipt's amount is in its payment's unit, and the unit
+  is kept beside it in the book (59, one byte for each of the sixteen), written in
+  the receipt's own transaction. `GET_LOG` with **P1 = 3** (1.23) answers as P1 = 1
+  does with each receipt one byte longer, its 77 and its unit: 4 + 3 × 78 = 238
+  bytes. P1 = 1 is the 77-byte form it is. A receipt from before the book has `00`.
+- **Who reads them.** P1 = 2 is P1 = 0's (the PIN or the grant with an owner; the
+  PIN in a held tap with none) and P1 = 3 is P1 = 1's (the grant with an owner; the
+  PIN in a held tap with none), and on a card with no owner each is counted toward
+  the held tap as the form it extends is. Any P1 past 3 is `6A86`, which neither
+  counts nor ends the held count. A card of 1.22 answers P1 = 2 and 3 with `6A86`.
 
-A card of 1.20 answers `GET_LOG` P1 = 2 and 3 with `6A86`.
+### 6.7 A change of the record's unit
 
-### 6.6 A change of the record's unit
-
-`SET_CARD` may change the unit byte only on a card with nothing unspent, as
-now. But its limits stay, and a daily limit of 2,000 set in sats would read, in
-a record now in dollars, as $20.00. So a 1.23 card refuses a `SET_CARD` that
-changes the unit (`6985`) while any limit of either unit is set. The owner's
-phone, in the one tap that turns a card from sats to dollars, takes the limits
-to 0 with its proof, writes the record, and sets them again in the unit they
-belong to. On a 1.20 card, which does not refuse, the phone does the same in the
-same order (9.7).
+Moot. The earlier draft kept each unit's limits in that unit, so a record turned
+from sats to dollars would have read a daily limit of 2,000 sats as $20.00, and it
+refused the change while a limit was set. On 1.23 every limit is in cents whatever
+the record's unit, so `SET_CARD` may change the unit byte (on an empty card owed
+nothing, as always) and every limit means what it meant. Nothing is refused for
+it. What the unit byte still decides is which unit is the record's: the format
+(4.3), `GET_BALANCE` P1 = 0, the log's bit and its head count, and whether the old
+lengths of `SET_LIMIT` are taken (6.3). New in 1.23, `SET_CARD` takes only `00`
+and `01` there (`6A80` for any other, with the design's check).
 
 ## 7. Payments
 
-### 7.1 One balance a payment
+### 7.1 One unit a payment, and who chooses it
 
-`SPEND_ALL_BEGIN` (`22`) refuses places of more than one balance: **`6A98`**,
-nothing hashed, the payment not begun. It is checked with the date, after the
-places are found unspent and named once: the first place's keyset is compared
-with each place's own (one native comparison a place), and only a place of
-another keyset is looked up in the table, its balance compared with the first
-place's. Two keysets of one balance (a mint's old keyset and its new) are one
-balance, and a mint takes them in one swap. The first place is looked up too:
-a place of no entry (3.5) is `6A98`, never `0, A`. This check is in the loop
-over the places, so it comes before the refusal of a sum that wraps, which is
-then charged to the payment's unit (6.3).
+`SPEND_ALL_BEGIN` (`22`) refuses places of both units: **`6A9A`**, nothing hashed,
+the payment not begun. It is checked in the loop over the places, after a place is
+found unspent and named once and with the date: the first place's keyset is
+compared with each place's own (one native comparison a place), and only a place
+of another keyset is looked up in the table, its unit compared with the first
+place's. Two keysets of one unit (a mint's old keyset and its new) are one unit,
+and a mint takes them in one swap. The first place is looked up too: a place of no
+entry (3.5) is `6A9A`, never the record's unit. Being in the loop, it comes before
+the refusal of a sum that wraps.
 
-Why the card refuses and does not leave it to the mint: a mint refuses a swap
-whose inputs are of two units, so no money would move. But the card charges the
-day before the mint is asked, and a payment of sats and cents together has no
-unit to charge. And two mints in one payment is a swap no mint can make.
+Why the card refuses and does not leave it to the mint: a mint refuses a swap whose
+inputs are of two units, so no money would move. But the card charges its counts
+before the mint is asked, and a payment of sats and cents together has no one
+figure to charge.
 
-At `SPEND_ALL_SIGN`, the payment's balance is the first place's entry, looked up
-once. Nothing new is kept in RAM between the two commands.
+**The card never chooses a unit.** The payment's unit is the unit of the pieces the
+phone names. The phone chooses them after asking the holder: where a card holds
+both units and either could pay, the phone asks every time, on the app's own
+currency question (SELECT CURRENCY), the two with their balances, and a unit that
+cannot cover the price shown as short and not offered (the owner's answer to the
+fifth question: always ask). Where only one unit can pay, the phone pays from it
+and asks nothing. The unit is named to the card by the pieces and by nothing else:
+`SPEND_ALL_BEGIN` gains no byte, so a 1.22 phone's payment is unchanged, and a
+phone that named the wrong pieces would be refused (`6A9A`) before a mixed payment
+could be signed.
 
-### 7.2 SIG_ALL stays per mint and per date
+At `SPEND_ALL_SIGN`, the payment's unit is the first place's entry, looked up once
+at each `SIGN` that needs it. Nothing new is kept in RAM between the commands.
+
+### 7.2 SIG_ALL stays per unit and per date
 
 One signature is over every piece and every output of one swap at one mint, and
 the pieces' secrets have to agree in everything but the nonce (LIMIT 6c). Both
-rules stand: one balance a payment (so one mint and one unit), one date a
-payment. A card of two balances pays a dollar price from its dollars and a sats
-price from its sats; never both at once.
+rules stand: one unit a payment, one date a payment.
 
 ### 7.3 The card's own change
 
-`SPEND_ALL_CHANGE` copies the payment's first keyset into the opening, as it
-does now. So the change is in the payment's balance by construction, and what
-leaves the card (the pieces less that change) is in the payment's unit. The
-opening carries its mint and unit through its keyset, whose entry it keeps live
-until the piece is back (3.4). `GET_CHANGE` answers the openings as it does,
-80 bytes each; a phone finds an opening's balance in the table it has read. No
-form of `GET_CHANGE` changes. The eight openings are shared by every balance.
+`SPEND_ALL_CHANGE` copies the payment's first keyset into the opening, as it does
+now. So the change is in the payment's unit by construction, and what leaves the
+card (the pieces less that change) is in the payment's unit before it is turned
+into cents. The opening carries its unit through its keyset, whose entry it keeps
+live until the piece is back by `LOAD_CHANGE` (3.4). `GET_CHANGE` answers the
+openings as it does; a phone finds an opening's unit in the table it has read. The
+eight openings are shared by both units.
 
-### 7.4 The last payment's balance
+### 7.4 The last payment's unit, and every transaction that changes
 
-Kept in the book (340), packed, written in `SPEND_ALL_SIGN`'s transaction (one
-byte more in a transaction that is the same size for every payment; the test
-that counts its writes is moved by one, and the chip's commit buffer is
-measured again with it, 12). It is the balance a till may enter a new keyset as
-without the owner (3.3), and `GET_INFO` P1 = 3 says it (byte 72). It stays until
-the next payment, and is let go by `SET_CARD` and `RESET_CARD`.
+Kept in the book (54), relative, written in `SPEND_ALL_SIGN`'s transaction: the
+unit a till with the PIN may enter a new keyset as (3.3), said in `GET_INFO` P1 = 3
+byte 50, let go by `SET_CARD` and `RESET_CARD`.
 
-**Every transaction this design touches, and what it gains.** The chip's
-commit buffer holds about a dozen writes and jCardSim has no limit, so each is
-listed and each is measured at the chip in the one sitting of 12:
+The chip's commit buffer holds about a dozen writes and jCardSim's has no limit,
+so each transaction this design touches is listed, and measured at the chip (10.7):
 
 | Transaction | Gains |
 |---|---|
-| `SPEND_ALL_SIGN` | one byte (the last balance); at a tap's first entry of a balance, the new entry's flags byte (6.5). The unit's counts replace unit A's, they do not add to them |
-| `LOAD_PROOF`'s log | the flags byte, at a new entry |
-| `refuseOverLimit` | the flags byte, at a new entry |
-| `SET_HEADER` | one `arrayCopy` of 4 (unit B's window) |
-| `writeLimit` | none: unit B's writes replace unit A's |
-| `SET_MINT` | the address and its length: two writes, nothing else in it |
-| `SET_CARD` | none: the book's zeroing is outside it (3.4) |
-| the entry at a load | none: its bytes are written before the slot's, outside any transaction, its mint byte last (3.6) |
+| `SPEND_ALL_SIGN` | one byte (the last unit); at a tap's first entry of a unit, the new entry's flags byte (6.6). The other unit's count, where the payment is of it, replaces the head's, and does not add to it. Spent today and the no-PIN count are the same writes, in cents |
+| the receipt's | one byte (the receipt's unit) |
+| `logLoaded`, `LOAD_CHANGE`'s log, `refuseOverLimit` | the flags byte, at a new entry |
+| `writeLimit` | one `arrayCopy` of four (the rate), where it changed: at most seven writes in all |
+| `SET_CARD` | none: the reclaim and the last unit's byte are outside it, before it (3.4) |
+| the entry at a load | none: its bytes are written before the slot's, outside any transaction, its state byte last (3.6) |
 
 ## 8. Commands and words, all together
 
-New or changed in 1.23. `SELECT` answers `01 17`. No capability bit changes;
-all eight were taken by 1.9, and the version says it.
+New or changed in 1.23. `SELECT` answers `01 17`. No capability bit changes (all
+eight were taken by 1.9), and no instruction is new: the version says what a card
+knows.
 
 | INS | Command | Needs | Data sent | Answers |
 |---|---|---|---|---|
-| `01` | GET_INFO | | P1 = 3 | 73 bytes (4.5). Byte 8 is 4 or 5 in every form |
-| `11` | GET_BALANCE | | P1 = 0 or 1 | P1 = 0: the record's balance; P1 = 1: each balance and each unit's total (5) |
-| `16` | GET_CARD | | P1 = 0, 1 or 2 | the record as 1.20's; the mints; the table (4.4) |
-| `18` | GET_LOG | as P1 = 0 and 1 | P1 = 2 or 3 | the counts with unit B's; the receipts with their balances (6.5) |
-| `22` | SPEND_ALL_BEGIN | | | `6A98` for places of two balances (7.1) |
-| `24` | SPEND_ALL_SIGN | | | charged to the payment's unit only; the last payment's balance written (6.3, 7.4) |
-| `30` | LOAD_PROOF | as 1.20 for the load; the table's gate for a new keyset (3.3) | P2 = 1: mint index (1), unit (1), then the pieces; any other P2 but 0 is `6B00` | `6A97`, `6A9A`, `6A99` as 3.3; a new keyset entered |
-| `31` | CLEAR_SPENT | as 1.20 | | and a reclaim of the table (3.4) |
-| `32` | SET_CARD | as 1.20 | as 1.20 | `6A8D` also while change is owed (an opening PENDING; a DRAFT let go first); the table, mints 1 and 2, the last balance and the receipts' balances zeroed outside its transaction, before it (3.4); `6985` for a change of unit while a limit is set (6.6); the book reserved the first time (3.6) |
-| `34` | SET_LIMIT, owner's | as 1.20 | 5, 9 or 13 bytes: the unit, then the limits | that unit's limits (6.2) |
-| `46` | **SET_MINT** | the owner's proof, no PIN, any funds but not at that mint | proof length, proof, index, length, address | the address of mint 1 or 2 set, replaced or let go (4.2) |
-| `51` | RESET_CARD | as 1.20 | | and the book zeroed |
+| `01` | GET_INFO | as 1.22 | P1 = 3 | 51 bytes (4.3). Byte 8 is 4 or 5 in every form; every figure is cents |
+| `11` | GET_BALANCE | | P1 = 0 or 1 | P1 = 0: the record's unit's sum; P1 = 1: each unit's (5) |
+| `16` | GET_CARD | | P1 = 0 or 2 | the record as 1.22's, byte 0 the format, the rate masked; the table (4.2) |
+| `18` | GET_LOG | as P1 = 0 and 1 | P1 = 2 or 3 | the counts with the other unit's; the receipts with their units (6.6) |
+| `22` | SPEND_ALL_BEGIN | as 1.22 | | `6A9A` for places of both units, or of no entry (7.1) |
+| `24` | SPEND_ALL_SIGN | as 1.22 | | a sats payment in cents at the rate; `6A99` with a limit and no rate; the last unit written (6.4, 7.4) |
+| `30` | LOAD_PROOF | as 1.22 for the load (the PIN given in this tap); the holder's say for a new keyset of the other unit (3.3) | P2 = 1: the unit code (1), then the pieces; any P2 but 0 and 1 is `6B00` | `6A9B`, `6A9C`, `6A9D` as 3.3; a new keyset entered |
+| `31` | CLEAR_SPENT | as 1.22 | | and a reclaim of the table (3.4) |
+| `32` | SET_CARD | as 1.22 | as 1.22 | `6A80` for a unit over `01`; drafted openings let go and the table reclaimed before its transaction; the book reserved the first time (3.4, 3.6) |
+| `33` | SET_LIMIT, PIN form | as 1.22 | 12 bytes: limit on one payment, allowance, rate | the 4 and 8 bytes of 1.22 only on a dollars record, `6700` on a sats one (6.3) |
+| `34` | SET_LIMIT, owner's | as 1.22 | 16 bytes: daily limit, limit on one payment, allowance, rate | the 4, 8 and 12 bytes of 1.22 only on a dollars record, `6700` on a sats one (6.3) |
+| `51` | RESET_CARD | as 1.22 | | and the book zeroed; the rate zeroed with the record |
 
 Every command in every state, the rows that change:
 
 | Command | Card with no owner | Card with an owner |
 |---|---|---|
-| `GET_INFO` P1 = 3, `GET_CARD` P1 = 1 and 2, `GET_BALANCE` P1 = 1 | open | open |
-| `SET_MINT` (`46`) | `6A90` | the owner's proof, any funds, none of them at that mint (`6A8D`, after a reclaim); `6986` locked |
-| `SET_CARD` (`32`) | as 1.20 | as 1.20, and `6A8D` while change is owed |
-| `LOAD_PROOF` with a label other than `0, A` and the last payment's balance | `6A90` (no load at all) | the owner's grant in this tap (`6A9A` otherwise) |
+| `GET_INFO` P1 = 3, `GET_CARD` P1 = 2, `GET_BALANCE` P1 = 1 | open; the rate in P1 = 3 to the PIN in a held tap | open; the rate in P1 = 3 to the owner's grant |
+| `LOAD_PROOF` of a new keyset of the other unit, not the last payment's | the PIN in a held tap (`6A9D` with the PIN alone) | the PIN and the owner's grant in this tap (`6A9D` with the PIN alone) |
+| `SET_LIMIT` with a rate | `33`, 12 bytes, as 1.22's `33` | `34`, 16 bytes, as 1.22's `34` |
 
-Status words, in the part of `6Axx` that ISO 7816-4 leaves unassigned (`6A92`
-and `6A95` stay unused, as LIMIT section 8 says):
+**Status words.** 1.23 adds five, in the part of `6Axx` that ISO 7816-4 leaves
+unassigned. Against LIMIT 8's table, none collides: 1.22 answers `6A8C` (no record),
+`6A8D` (in use, or change owed), `6A8E` (a dated piece, no refund key), `6A8F` (over
+the day), `6A90` (no owner), `6A91` (the owner's proof), `6A93` (little work), `6A94`
+(a piece on the card already; the PIN needed), `6A96` (too many), `6A97` (no PIN,
+1.21) and `6A98` (keep holding, 1.21), and keeps `6A92` and `6A95` unused, as it
+says; 1.23 keeps every one of those meanings, the figures behind `6A8F` and `6A94`
+now in cents. The earlier draft's `6A97` ("another balance") and `6A98` ("two
+balances") collide with 1.21's words and are not used for them:
 
-| SW | Means |
+| SW | Means (1.23) |
 |---|---|
-| `6A97` | another balance: a load whose piece's keyset is in the table as another balance than the load names, or whose label names a mint the card has no address for. Nothing is written |
-| `6A98` | two balances in one payment: `SPEND_ALL_BEGIN` was given places of more than one mint or unit. Nothing is hashed, counted or written, and no payment is begun |
-| `6A99` | no room in the table: a load of a new keyset with no free entry after a reclaim, or a fifth live entry without the owner's mark; also every labelled load of another balance than `0, A` on a card refused the room for its book, before the label's mint is looked at. Nothing of the piece is written |
-| `6A9A` | not this tap's to start: a load of a new keyset as a balance other than `0, A` and the last payment's, without the owner's grant (3.3). Kept apart from `6A91`, which a phone reads as "not the owner". Nothing is written |
+| `6A99` | **no rate**: `SPEND_ALL_SIGN` of a sats payment on a card with a limit set and no rate. The payment given up; nothing signed, burned, counted or written in the log (6.4) |
+| `6A9A` | **two units in one payment**: `SPEND_ALL_BEGIN` given places of both units, or a place of no entry. Nothing hashed, counted or written; no payment begun (7.1) |
+| `6A9B` | **the other unit**: a load whose piece's keyset is in the table as the other unit than the load names. Nothing written (3.3) |
+| `6A9C` | **no room in the table**: a new keyset with no free entry after a reclaim, or a third live entry without the mark; and every load labelled the other unit on a card refused its book. Nothing of the piece written (3.3) |
+| `6A9D` | **not this tap's to start**: a new keyset as the other unit, not the last payment's, without the holder's say. Kept apart from `6A91`, which a phone reads as "not the owner", and `6982`, "the PIN". Nothing written (3.3) |
 
-`CardGate.swift` carries `46` beside the rest.
+`CardGate.swift` gains nothing: no instruction is new.
 
 ## 9. The phone
 
-Each file, and what it gains. Nothing here is built.
+Each file, and what it gains. Nothing here is built. The dollars card on 1.20 and
+1.22 (a record of `01`, dollar pieces, limits in cents typed in dollars and never
+re-pegged, the till's dollar payments, the rows with `unit: 'usd'`) has shipped,
+and is not on this list. Everything below asks a card for nothing new unless it
+says `01 17`.
 
 ### 9.1 `build/wallet/08a-flashcard.js`
 
-- **Reading.** `cardInfoOf`: `balancesKnown` for 1.23 and on (the version, as
-  for `proofs`); the 73-byte answer to P1 = 3 read into `info.b` (unit B's
-  limits and counts) and `info.book` (format, entries, mints, last balance);
-  format 5 taken as 4 for the secret. `cardRecordOf`: unit `00` is `'sat'` and
-  `01` is `'usd'`, anything else `'other'`. A new `cardBookOf` reads `GET_CARD`
-  P1 = 1 and 2 into `card.mints` (index to address) and `card.table` (short
-  keyset to balance). `cardLook` asks P1 = 3 in place of P1 = 1 and the two
-  `GET_CARD` forms of a 1.23 card (two commands, about 0.06 s), and skips the
-  two where byte 8 is 4 and one mint is named.
-- **Sorting the pieces.** Each piece's balance is the table's, and then it has
-  to agree with the mint: the keyset has to be one that mint lists **in that
-  unit** (`keysetUnit` of `08c-units.js`, against the mint the table names).
-  `cardFullId` takes a unit and maps only among that unit's keysets. A piece
-  whose keyset the mint does not list in that unit is foreign, counted nowhere
-  and never paid with. `card.balances` is the pieces by balance, with each one's
-  sum; `card.pieces` stays the whole list for what reads every piece (the mint's
-  state check, the proofs' check).
-- **Usable.** `cardUnusable` stops refusing a record in dollars, and stops
-  refusing a card at another mint outright: it asks whether the card holds the
-  balance asked for (this phone's mint and the unit of the request), and says
-  so in plain words when not (9.6). `cardUsable(card, w, own, balance)` gives the
-  pieces of one balance only.
-- **Limits.** `cardDayOf`, `cardTapOf` and `cardNoPinOf` take a unit and read A's
-  or B's. `cardLimitTo` sends the five-, nine- or thirteen-byte value to a card
-  of 1.23, and the old lengths for unit A on a card before it. `cardLiftNote`
-  (the limit written down before the owner's withdrawal lifts it) keys by card
-  and unit. `cardPaceNote` (a limit kept in dollars and re-pegged to sats as the
-  price moves) applies to sats only; a dollar limit is cents and is never
-  re-pegged.
-- **Choosing pieces.** `cardPick`, `cardPickAll`, `cardExactPick` and the rest
-  are handed one balance's pieces and nothing else, and the cap of that
-  balance's unit. Unchanged inside.
-- **Signing.** `cardSign` and `cardSignGroup` begin with one balance's places.
-  `6A98` read as "the card was asked to pay from two balances at once", which a
-  phone that picked from one balance never sees.
-- **Loading.** `cardPrepare`, `cardLoadCut` and `cardChangeCut` make pieces in
-  the unit's wallet (`walletIn(unit)`), on that unit's active keyset
-  (`unitKeysetId`), cut in that unit; `cardMintMisfit` asks of that keyset. The
-  128 places are the card's, not a balance's: two balances that each want a
-  deep drawer (eight of every size from 1 to 1,024, 88 pieces) would want 176. A
-  card of two balances is cut four deep in each (44 and 44), with the rest of
-  the room for larger pieces and change (13, decision 7). `cardWriteOwed` sends
-  every piece labelled with its balance on a card of 1.23, and plain on one
-  before it (which holds only `0, A`). `6A97`, `6A9A` and `6A99` are read as
-  words (9.6).
-- **Records.** Every row this file keeps for a card gains the balance it is of:
-  `CARD_OWED` (pieces owed to a card: it has `mint` and gains `unit`),
-  `CARD_SWAPS` (a payment's swap), the pieces a phone files to take a lost card
-  back (`cardRemember`), the receipts (`CARD_RECEIPTS`, from `GET_LOG` P1 = 3).
-  A row with no unit is sats at the card's mint, as every row written before is.
-- **Its mint.** `cardRepointFor` (a card moved to another mint, empty) is
-  mint 0's, and does what it does. A new `cardMintAdd` puts `SET_MINT` before
-  the first load of a mint the card does not name (4.3).
-- **The secret, and every other comparison of the format with 4.** Each
-  becomes `>= 4` (with `<= 5`, so a format 6 is still refused): `cardSecret`
-  (`Number(format) === CARD_FORMAT_ALL`), `cardIsAll` (`card.info.format ===
-  CARD_FORMAT_ALL`), every capability `cardInfoOf` works out as `b(8) ===
-  CARD_FORMAT_ALL && version` (`ownChange`, `shaped`, `costed`, `headers`,
-  `noPinKnown`, `resetKnown`, `moreKnown`, `proofsKnown`: left as they are, a
-  card of format 5 would read as knowing none of them), `cardLook`'s refusal
-  (`format !== CARD_FORMAT && format !== CARD_FORMAT_ALL`, which takes 5 on a
-  new phone), `21a-flashcard.js`'s take-back (`Number(row.format) ===
-  CARD_FORMAT_ALL`), and `26f-flashcard.js`'s `fcShaped` (`c.info.format ===
-  4`). A row's format
-  (`row.format`, filed where the pieces are filed for take-back) is filed as 4
-  for a card of 4 or 5, since it says how the secret is made and not the
-  balances. A test greps both files for `=== CARD_FORMAT_ALL`, `=== 4` and
-  `== 4` beside `format` and finds none left.
+- **The format, everywhere it is compared with 4**, becomes `>= CARD_FORMAT_ALL
+  && <= 5` (a format 6 still refused): `cardSecret`, `cardIsAll`, every capability
+  `cardInfoOf` works out as `b(8) === CARD_FORMAT_ALL && version` (`headers`,
+  `noPinKnown`, `resetKnown`, `moreKnown`, `proofsKnown`, `ownChange`, `shaped`,
+  `costed`: left alone, a card of format 5 would read as knowing none of them), and
+  `cardLook`'s refusal. A row's `format`, filed for take-back, is filed as 4 for 4
+  or 5. A test greps the three files for `=== CARD_FORMAT_ALL`, `=== 4` and `== 4`
+  beside `format` and finds none left. These go in first, with the reading of 5.
+- **Reading.** `cardIs123` beside `cardIs121`. `cardInfoOf` reads the 51 bytes of
+  P1 = 3 into `info.book` (format, entries, unmarked, last unit) and `info.rate`,
+  and marks every figure of a 1.23 card as cents (`info.cents`). A new
+  `cardTableOf` reads `GET_CARD` P1 = 2 into `card.table` (short keyset to unit
+  code). `cardLook` asks `GET_INFO` P1 = 3 in place of P1 = 1 on a 1.23 card (the
+  owner's second asking after the grant too), and `GET_CARD` P1 = 2 where byte 8 is
+  5; on format 4 every piece is the record's unit and the table is not asked.
+  `cardRecordOf` is unchanged: the rate is masked in its answer.
+- **Sorting the pieces.** On format 5 each piece's unit is the table's, and the
+  mint must list its keyset in that unit (`keysetUnit`); `cardFullId` takes a unit
+  and maps only among its keysets. A piece that fails is foreign, counted nowhere
+  and never paid with. `card.units` is the pieces by unit with their sums;
+  `card.pieces` stays the whole list (the mint's state check, `cardRealCheck`).
+- **Usable.** `cardUnusable` takes the unit asked for and says whether the card
+  holds it, in the words it has (`cardWrongUnit`); on a card of both units neither
+  is wrong, and the page asks (9.5).
+- **The ceiling.** On a 1.23 card `cardDayOf`, `cardTapOf` and `cardNoPinOf` read
+  cents; `cardNeedsPin` turns a sats `net` into cents before it compares, with the
+  card's rate where this phone is the owner and its own price where not, rounded as
+  the card rounds (6.2); `cardWaitSigns` is handed the cents of what leaves the card.
+- **Writing it.** `cardLimitTo` sends the sixteen-byte form (the figures in cents
+  and R) to a card that says `01 17`, the old forms, as now, to one before it; the
+  PIN form sends twelve bytes on 1.23. `R = floor(100,000,000 / P)`, `P` the price
+  SET AMOUNT uses; with no price, no write. The phone asks the owner before writing
+  a rate more than twice, or under half, the card's (11, row 26).
+- **The re-peg.** On a 1.23 card `cardLook` (`mine`) re-pegs the rate, not the
+  figures (6.5): its R against `info.rate`, by `CARD_PACE_DRIFT`, the figures sent
+  as the card has them. No `cardPaceNote` or `cardPaceNoPinNote` is written for a
+  1.23 card: its figures are on the card, in cents.
+- **A limit lifted for a withdrawal** (`cardUnderPin`, `cardLiftNote`): the lift and
+  the putting back are the sixteen-byte form on 1.23, the rate as the card has it.
+- **Choosing pieces.** `cardPick`, `cardPickAll` and `cardExactPick` are handed
+  one unit's pieces. Unchanged inside.
+- **Signing.** `cardSignAll` and `cardSignGroup` begin with one unit's places.
+  `6A9A` is read as "the card was asked to pay from both currencies at once";
+  `6A99` as "this card cannot pay in bitcoin until its owner's phone sets it again".
+- **Loading.** `cardPrepare`, `cardLoadCut` and `cardChangeCut` make pieces in the
+  unit's wallet (`walletIn`), on its active keyset (`unitKeysetId`), cut in it (9.2);
+  `cardMintMisfit` asks of that keyset. `cardWriteOwed` labels every piece on a 1.23
+  card, the record's unit too (so the card checks it), and sends plain to one before
+  it; on a card with no owner a new keyset of the other unit goes in a held tap.
+  Words: `6A9B` "That money is the other currency on this card. Nothing was put on
+  it."; `6A9C` "This card has no room for another kind of money until its owner's
+  phone clears it."; `6A9D` "Only the card's owner can add a new currency to it."
+- **Records.** `CARD_OWED`, `CARD_SWAPS`, `cardRemember`'s rows and the receipts
+  (from `GET_LOG` P1 = 3) carry each unit, as the dollars card's rows already do.
 
-### 9.2 `build/wallet/08c-units.js`
+### 9.2 The 128 places between two units
 
-Little. `unitCode` and `unitOfCode` map `'sat'` and `'usd'` to `00` and `01`.
-The card's code uses `keysetsOf`, `keysetUnit`, `unitKeysetId` and `walletIn`
-as they are, and every write into a pile still passes `unitGuard`, so a dollar
-piece taken off a card can only land in the dollar pile.
+The owner's answer to the seventh question: what this design recommends. A card of
+128 places is cut deep today, eight of every size from 1 to 1,024 (`CARD_DEEP`,
+`CARD_DEEP_TOP`, `cardDeepLadder`): 88 pieces, and eight prices in a row paid
+exactly. Two units each eight deep would want 176. So:
 
-### 9.3 `build/wallet/21a-flashcard.js`
+| Card | Unit | Sizes | Of each | Pieces | Worth |
+|---|---|---|---|---|---|
+| one unit | sats | 1, 2, 4 … 1,024 sats | 8 | 88 | 16,376 sats |
+| one unit | dollars | 1, 2, 4 … 1,024 cents ($0.01 to $10.24) | 8 | 88 | $163.76 |
+| both units | sats | 1, 2, 4 … 1,024 sats | 4 | 44 | 8,188 sats |
+| both units | dollars | 1, 2, 4 … 1,024 cents | 4 | 44 | $81.88 |
 
-The page's calls gain a balance: `cardPrepare(card, amount, { unit, mint })`,
-`cardAdd`, `cardWithdraw(link, { unit, mint, amount })`, `cardSetLimit(link, {
-unit, ... })`, `cardPay(link, { unit })` (the till's), and `cardBalances(card)`
-for the screen. A new `cardSwap` runs the two taps of 9.5.
+Both units deep are 88 of the 128, the same as one unit today, and leave 40 for
+the rest of each amount in powers of two and for the card's own change (at most
+`CARD_WIDE_CHANGE`, 32, a payment). Four of each pays four prices in a row exactly
+in each unit, up to 2,047 of that unit each.
 
-### 9.4 `build/app/26f-flashcard.js`, the Flashcard screen
+What the refill does per unit: `cardDeepLadder` gains the depth (8 for a card that
+holds one unit, 4 for one that holds both or is about to) and is handed only that
+unit's pieces as `have`, so a top-up of dollars fills the dollar rungs and never
+counts or cuts a sats piece, and the reverse. The sizes are the unit's keyset's
+(`unitKeysetId`): a dollar keyset that does not list a size is cut without it. When
+the second unit first goes on, the first unit's eight-deep drawer is not cut down;
+it drains to four as it is paid from, and its refills go to four. Where the places
+do not allow four, it is three of each, down to none, as `cardDeepLadder` already
+steps down within `CARD_WIDE_LOAD`.
 
-- **The pills.** The home's two pills, as the two-balances home has them: the
-  dollar pill in frost blue with its worth in sats under it, the bitcoin pill in
-  fox fur with its worth in dollars under it, at the market price. A card that
-  holds one balance shows one pill, as now. A card at a mint of one unit never
-  shows the dollar pill.
-- **Mints.** The mint on show is named over its pills, as the home names its
-  mint (`FORGE ›`). The card's other mints are rows under the pills, each with
-  its balances; a tap on one puts it on show. The daily limit, what is left of
-  it today and when the day turns are said under each pill, for its unit.
-- **ADD FUNDS and WITHDRAW** ask which balance first where there are two, on the
-  app's own currency question (`What do you want to add?`, the two cards with
-  their balances), and then the SET AMOUNT screen in that unit. A mint the card
-  does not name is added from ADD FUNDS (`ADD ANOTHER MINT`, the app's mint
-  list), at the cost of nothing but the load.
-- **SWAP** on the card's row, on a card that holds a balance at a mint of two
-  units (9.5).
-- **CHANGE LIMIT** on a card of two units sets both from one dollar figure
-  (13, decision 1): dollars to cents exactly, sats at the price and re-pegged.
-  The confirmation says both: `YOU ARE APPLYING A DAILY LIMIT OF: $20.00` and,
-  under it, `on its dollars, and on its bitcoin at today's price`.
-- **Words** for the refusals of 9.6.
+### 9.3 `build/wallet/08c-units.js`
 
-### 9.5 SWAP, a phone's swap with a tap at each end
+Nothing new. The card's code uses `keysetsOf`, `keysetUnit`, `unitKeysetId`,
+`walletIn` and `cardUnitByte` (in `08a`) as they are, and every write into a pile
+still passes `unitGuard`, so a dollar piece taken off a card can only land in the
+dollar pile.
 
-The card cannot reach a mint, and a swap between dollars and sats is the mint's
-(a quote paid by a melt), which takes from a few seconds to a minute: longer
-than a card is held. So a swap is the phone's, with the card at each end:
+### 9.4 `build/wallet/21a-flashcard.js`
 
-1. **SWAP**, the amount on SET AMOUNT in the unit that leaves, the app's own
-   swap confirmation (YOU ARE GETTING, YOU ARE SPENDING, FEE, the mint's rate).
-2. **Tap 1, the PIN.** A withdrawal of that amount from that balance, as
-   WITHDRAW is: the unit's limits lifted with the owner's proof, the pieces
-   signed under the PIN, the limits put back. The money is in this phone.
+The page's calls gain a unit where a card holds both: `cardPrepare(card, amount, {
+unit })`, `cardWithdraw(link, { unit, amount })`, `cardPay` (the till's) with the
+unit the holder chose, and `cardUnits(card)` for the screen. `cardSetLimit` takes
+dollars and, on a 1.23 card, writes cents and the rate; on a card before it, what
+it writes today. A new `cardSwap` runs the two taps of 9.6. The take-back
+(`cardTakeBack`, `Number(row.format) === CARD_FORMAT_ALL`) takes the row's format as
+9.1 says, and swaps each piece into the pile of its own unit.
+
+### 9.5 `build/app/26f-flashcard.js`, the Flashcard screen
+
+- **The pills.** A card that holds both units shows two, as the two-balances home
+  has them: the dollar pill with its worth in sats under it, the bitcoin pill with
+  its worth in dollars under it, at the market price. A card of one unit shows one,
+  as now. One mint, named over the pills as now; no rows of other mints.
+- **The ceiling.** Said once, under the pills, in dollars: the limit on one payment
+  and the no-PIN allowance, each for both units together. No daily limit is shown
+  where none is set.
+- **CHANGE LIMIT** takes one figure for both units, and the rate is written with it.
+  The owner's rule for the unit it is typed in: a card that holds dollars only takes
+  the figure in dollars; a card that holds bitcoin, alone or with dollars, offers
+  dollars or sats (the SET AMOUNT screen's swap). A figure typed in sats is turned
+  into cents by the phone at the rate it writes in that same tap, so the card still
+  holds cents. The figure is never re-pegged; the rate is, without a word (6.5).
+  The same rule holds for the set-up screens' wheels (the no-PIN amount and the
+  limit on one payment).
+- **ADD FUNDS and WITHDRAW** ask which currency first where both are possible, on
+  the app's own currency question with the two balances, then SET AMOUNT in that
+  unit.
+- **Paying from the card** (SEND, and the till's sheet when this phone is the
+  holder's): SELECT CURRENCY every time both units could pay (7.1).
+- **SWAP** on a card that holds both (9.6).
+- `fcShaped` (`c.info.format === 4`) becomes `>= 4`, as 9.1.
+- **Words** for `6A99` to `6A9D`, as 9.1.
+
+### 9.6 SWAP, a phone's swap with a tap at each end
+
+The card cannot reach a mint, and a swap between dollars and sats is the mint's (a
+quote paid by a melt), which takes from a few seconds to a minute: longer than a
+card is held. So a swap is the phone's, with the card at each end:
+
+1. **SWAP**, the amount on SET AMOUNT in the unit that leaves, the app's own swap
+   confirmation (YOU ARE GETTING, YOU ARE SPENDING, FEE, the mint's rate).
+2. **Tap 1, the PIN.** A withdrawal of that amount from that unit, as WITHDRAW is:
+   the ceiling lifted with the owner's proof, the pieces signed under the PIN, the
+   ceiling put back. The money is in this phone.
 3. **No card.** The phone swaps at the mint, as its own SWAP does.
-4. **Tap 2, no PIN.** ADD FUNDS of what arrived, into the other balance, under
-   the owner's grant.
+4. **Tap 2, the PIN and the grant.** ADD FUNDS of what arrived, into the other
+   unit, labelled, the keyset entered with the mark where it is new.
 
-Two taps and one PIN. Cut short anywhere, the money is in the phone, in
-whichever unit it was at that moment, and the screen offers to put it on the
-card or leave it. Only the owner's phone swaps (step 4 is a load under the
-grant, and step 2 lifts the limit).
+Cut short anywhere, the money is in the phone, in whichever unit it was then, and
+the screen offers to put it on the card or leave it. Only the owner's phone swaps.
 
-### 9.6 The till
+### 9.7 The till
 
 A till asks to be paid in its request's unit at its own mint. It reads the card
-(`GET_INFO` P1 = 3, the table and the mints on a 1.23 card) and finds the
-balance at its mint in that unit. Then everything is as now, on that balance's
-pieces and that unit's limits: the pieces it picks, the PIN or the allowance,
-OVER THE CARD'S DAILY LIMIT in that unit, the change, the second tap. A card
-with balances at several mints pays any till at any of them, which is the one
-thing two mints on a card buy at a counter.
+(`GET_INFO` P1 = 3 and, on format 5, the table) and finds the pieces at its mint in
+the unit the holder chose. Then everything is as now, on that unit's pieces: the
+pieces it picks, the PIN or the allowance (in cents: 6.5), the wait, the change, the
+second tap.
 
-| What the card holds | The till says |
+| What the card holds | The till |
 |---|---|
-| no balance at this phone's mint | `This card's money is at Minibits and Forge. This phone is at <mint>.` |
-| sats here, and a dollar request | as now (`770db86`): the card pays the dollar invoice from its sats |
-| dollars here, and a dollar request | paid from the dollars. A card that holds both pays a dollar request from its dollars first, and from its sats only where its dollars are short (13, decision 5) |
-| dollars here, and a sats request | `This card holds dollars here, not bitcoin.` (a dollar payment of a sats invoice is a melt, and is left for later) |
+| no money at this phone's mint | as now: "This card's money is at <its mint>. This phone is at <this mint>." |
+| one unit, the request's | paid from it, as now |
+| one unit, not the request's | as now (`cardWrongUnit`: a dollars card asked for sats is offered a figure in dollars for the holder to agree to; a bitcoin card asked for dollars is refused in words) |
+| both units | SELECT CURRENCY, every time both could pay, the holder answering at the till as they give the PIN; one alone where only one can |
 
-Offline, a till takes only an exact set of one balance in its request's unit,
-as now in sats, and the DLEQ of each piece is checked against the mint's keys of
-that unit.
+Offline, a till takes only an exact set of one unit in its request's unit, as now,
+and the DLEQ of each piece is checked against the mint's keys of that unit
+(`unitKeysOffline` for dollars).
 
-**Change and refunds** go back in the balance they came from: written labelled
-under the change grant, which the card lets in as the last payment's balance
-(3.3). A refund to the payer of a payment the mint refused is the same.
-
-**Take-back of a lost card** (`cardTakeBack`): the pieces this phone filed when
-it loaded them, each with its balance, swapped with the refund key at its own
-mint, each into the pile of its own unit.
-
-### 9.7 What a dollars card needs
-
-A card whose record says dollars and that holds only dollars at mint 0 is a
-card of one balance (format 4), in cents. Its limits are the record's, in cents,
-typed in dollars and never re-pegged. It needs nothing of 1.23: see 12.2.
+**Change** comes back by `LOAD_CHANGE` in the payment's keyset, with no label
+(7.3). **A refund to the payer** of a payment the mint refused is a labelled load in
+the payment's unit, under the PIN, which the card lets in as the last payment's unit
+(3.3).
 
 ### 9.8 Native
 
-- `Foxy/Flashcard/CardGate.swift`: instruction `46`.
-- `Foxy/Keychain/NUT13.swift`, `CardOwner.Label`: `setMint = "set-mint"`,
-  whose value is an index of `01` or `02`, a length of 0 to 77 and that many
-  bytes of `20` to `7E`; and `setLimit` accepting 5, 9 and 13 bytes whose first
-  is `00` or `01`, beside 4, 8 and 12. Native refuses every other label and
-  shape before it reads the seed, as now. Its tests gain both.
+- `Foxy/Flashcard/CardGate.swift`: nothing. No instruction is new, and the gate
+  checks the class and the instruction only.
+- `Foxy/Keychain/NUT13.swift`, `CardOwner.Label.setLimit`: `accepts` takes 16 bytes
+  beside 4, 8 and 12. The PIN form carries no owner's proof and never reaches it.
+  Native refuses every other label and shape before it reads the seed, as now. Its
+  tests gain the sixteen-byte value.
 
 ## 10. Migration and compatibility
 
-### 10.1 A card of 1.20 under a new phone
+### 10.1 The cards in hand are installed again as 1.23
 
-It stays a card of one balance for good. A Java Card applet is not upgraded in
-place: a new version is a new install, which makes a new key and takes the
-money with the old one, so a card in hand becomes a 1.23 card only by being
-emptied, deleted and installed again (`HARDWARE_DEPLOYMENT.md`), after which
-the phone sets it up as a new card.
+The owner's answer to the ninth question: installing again is fine. There is no
+migration on the card. A Java Card applet is not upgraded in place: a new version is
+a new install, which makes a new key, and pieces locked to the old key cannot be
+moved to the new one by the card. So, for each card in hand:
 
-The new phone knows it by its version (`01 14`), and sends it nothing new:
+1. The owner's phone takes every piece off (`cardWithdraw` of everything, as RESET
+   does in the app), and the change owed is written back or given up first, as
+   RESET already asks (`6A8D`).
+2. The card is deleted and installed again with the 1.23 load file, in the order of
+   `HARDWARE_DEPLOYMENT.md` (the tag, the card's applet, the opener, then the
+   package; installed opener first), at a size known to install (12.2).
+3. The phone sets it up as a new card: PIN, record, the owner's claim, then the
+   ceiling with the rate (the sixteen-byte form).
+4. ADD FUNDS puts the money back, labelled, in whichever units the owner chooses.
 
-| New command or form | What a 1.20 card does | Why it is safe |
-|---|---|---|
-| `GET_INFO` P1 = 3 | the thirty bytes | the phone checks the version, and the length (73) |
-| `GET_CARD` P1 = 1, 2 | the record | the phone asks only a 1.23 card |
-| `GET_BALANCE` P1 = 1 | the one sum | the same |
-| `GET_LOG` P1 = 2, 3 | `6A86` | the same |
-| `LOAD_PROOF` labelled | `6700` (83, 164, 245, 179 are not its lengths) | a label sent by mistake writes nothing |
-| `SET_LIMIT` of 5, 9, 13 bytes | `6700` | a figure in cents can never be taken as sats |
-| `SET_MINT` (`46`) | `6D00` | |
-
-A 1.20 card can be a dollars card (12.2), with a record in dollars and pieces
-in dollars, and nothing else.
+The old log and receipts go with the old install; the phone keeps its own rows of
+the card. A card not installed again stays a 1.22 card, and a new phone keeps
+working with it as now (10.3).
 
 ### 10.2 A card of 1.23 under a phone of today
 
 | The card | What the phone of today does |
 |---|---|
-| one balance, sats at mint 0 (format 4) | everything, as with a 1.20 card. It loads plain pieces, which go in as `0, A`. It sets limits of 4, 8 and 12 bytes, which are unit A's. Its `SET_CARD` on an empty card clears the table, which is empty of money |
-| one balance, dollars (format 4, record unit `01`) | refuses it at the read: "That card holds something other than sats." Refuses to load it (`cardPrepare` calls `cardUnusable`) |
-| more than one balance (format 5) | refuses it before it reads a piece: "That card is a kind this Foxy does not know." |
+| one unit, sats, no limit set (format 4) | everything, as with a 1.22 card. Its plain loads go in as the record's unit |
+| one unit, sats, a limit set (format 4) | reads it, pays from it, is paid by it, loads it. It reads the cents as sats: its screen misstates them, and its guess at the PIN errs toward asking (under a million dollars a bitcoin); the card decides, as always. It cannot change them: its old `SET_LIMIT` lengths are `6700` on a sats record, so its set-up stops at the allowance, CHANGE LIMIT is refused, its re-peg is let go, and its withdrawal stops at the lift, before anything is signed |
+| one unit, dollars (format 4) | everything, as the dollars card that has shipped: its figures are cents, as it writes them, and its old forms are taken |
+| both units (format 5) | refuses it before it reads a piece: "That card is a kind this Foxy does not know." |
 
-So no phone ever reads a dollar piece as sats. That needs the format byte: a
-phone of today maps a keyset to any keyset of its mint whatever its unit
-(`cardFullId`), and the version alone does not stop it, since it takes any
-version past 1.20 as having what 1.20 has.
+So no phone ever reads a dollar piece as sats. That needs the format byte: a phone
+of today maps a keyset to any keyset of its mint whatever its unit (`cardFullId`),
+and the version alone does not stop it, since it takes any version past 1.22 as
+having what 1.22 has.
 
-### 10.3 Version and formats
+### 10.3 A card of 1.22 under a new phone
 
-| | 1.20 | 1.23 |
+The new phone knows it by its version (`01 16`) and sends it nothing new: it reads
+it, sets its limits in its unit and re-pegs a sats card's figures, as today.
+
+| New form | What a 1.22 card does | Why it is safe |
 |---|---|---|
-| `SELECT` | `01 14` | `01 17` |
-| the card's format, `GET_INFO` byte 8 and `GET_CARD` byte 0 | 4 | 4 for a card of one balance, 5 for one of more |
+| `GET_INFO` P1 = 3 | the thirty bytes | the phone checks the version, and the length (51) |
+| `GET_CARD` P1 = 2 | the record | the phone asks only a 1.23 card |
+| `GET_BALANCE` P1 = 1 | the one sum | the same |
+| `GET_LOG` P1 = 2, 3 | `6A86` | the same |
+| `LOAD_PROOF` labelled | `6700` (82, 163, 244 and 178 are not its lengths) | a label sent by mistake writes nothing |
+| `SET_LIMIT` of 16 bytes (`34`), of 12 (`33`) | `6700` | a figure in cents is never taken as sats |
+
+### 10.4 Version and formats
+
+| | 1.22 | 1.23 |
+|---|---|---|
+| `SELECT` | `01 16` | `01 17` |
+| the card's format, `GET_INFO` byte 8 and `GET_CARD` byte 0 | 4 | 4 for a card of one unit, 5 for one of both |
 | the piece's format (the secret) | 4 (`SIG_ALL`) | 4, whatever byte 8 says |
 | the book's format, `GET_INFO` P1 = 3 byte 43 | none | `01`, or `00` for a card refused the room |
-| `FORMAT` in the applet | 4 | 4, and a constant `FORMAT_BALANCES` = 5 |
+| the limits | in whatever unit the phone wrote | cents |
+| `FORMAT` in the applet | 4 | 4, and a constant `FORMAT_UNITS` = 5 |
 
-### 10.4 The model of the card (the card with no card)
+### 10.5 The model of the card (the card with no card)
 
-`tests/flashcard-card.js` in Foxy answers as the applet does, and is held to it
-by `tests/flashcard-model.js` replaying a recording of the applet.
+`tests/flashcard-card.js` in Foxy answers as the applet does, and is held to it by
+`tests/flashcard-model.js` replaying a recording of the applet.
 
-- `makeCard({ software: 21 })` the card of this design; `software: 20` and
-  before are the cards before it, as now; `makeCard({ book: false })` a 1.23
-  card refused the room for its book, as `proofRoom: false` is for the proofs.
-- The book, the table's gate (3.3), the reclaim, `SET_MINT`, the labelled load,
-  unit B's limits in the day, the wait and the allowance, `6A97`, `6A98`,
-  `6A99`, the format byte at each asking, `GET_INFO` P1 = 3, `GET_CARD` P1 = 1
-  and 2, `GET_BALANCE` P1 = 1, `GET_LOG` P1 = 2 and 3, and the log's bits.
-  `MINT_MAX` (80 in the model) comes down to 77 to match the applet, which it
-  should already.
-- `tests/flashcard-model.js` replays a 1.23 recording and keeps every recording
-  it has, the 1.20 one as `-120`.
-- New suites: `tests/flashcard-balances.js` (dollars and sats at one mint: load,
-  read, pay a dollar till and a sats till, change, withdraw, swap, limits in each
-  unit, a till of today refused cleanly), `tests/flashcard-mints.js` (two mints:
-  add a mint, pay a till at each, a mint's address under money refused, a mint
-  let go), and the money suites run over a two-unit stand-in mint, as the
-  two-balances work runs. A live suite against a two-unit Nutshell (the one
-  `tools/live/two-balances.js` uses) with the applet under jCardSim as the card.
+- `makeCard({ software: 23 })` is this design's card, `software: 22` and before the
+  cards before it, and `makeCard({ book: false })` a 1.23 card refused its book, as
+  `proofRoom: false` is for the proofs. It has every rule of sections 3 to 8.
+- `tests/flashcard-model.js` replays a 1.23 recording and keeps every recording it
+  has, the 1.22 one as `-122`.
+- A new suite, `tests/flashcard-units.js`: dollars and sats on one card at one mint
+  (load both, read, pay a dollar till and a sats till, SELECT CURRENCY, change in
+  each unit, withdraw, swap, one ceiling across both with the rate re-pegged as the
+  price moves, a phone of today refused cleanly on format 5, a refund in a new keyset
+  of the last payment's unit). The money suites run over a two-unit stand-in mint, as
+  the dollars card's do (`flashcard-usd.js`). A live suite at a local mint of two
+  units with the applet under jCardSim as the card.
 
-### 10.5 The JUnit tests to add
+### 10.6 The JUnit tests to add
 
-A new class, `BalancesTest`, beside `ProofStoreTest`, with the applet under
-jCardSim. Each test, and what it pins:
+A new class, `UnitsTest`, beside `ProofStoreTest`, with the applet under jCardSim.
+Thirty-four tests, each and what it pins:
 
 | # | Test | Pins |
 |---|---|---|
-| J1 | `theBookIsNotMadeAtInstallAndIsMadeByTheFirstSetCard` | null after install, after a PIN and after a refused `SET_CARD`; 361 zero bytes after the first that goes through; the same array after every later one |
-| J2 | `aCardRefusedTheBookIsATwentyCard` | with the allocation made to fail: plain loads go on as `0, A`, a labelled load of another balance is `6A99`, every new form answers as 3.5 says, byte 8 is 4 |
-| J3 | `aPlainLoadEntersANewKeysetAsTheRecordsBalance` | under the PIN or the change grant: one entry `40 00` after a plain load on a sats card, `40 01` on a dollars card; under the owner's grant, `C0 00` and `C0 01`; a second piece of the keyset writes no entry |
-| J4 | `aLabelledLoadUnderTheOwnersGrantEntersItsBalanceMarked` | `C1 01` (dollars at mint 1, the owner's), `C2 00` (sats at mint 2, the owner's), `C0 01` (dollars at mint 0, the owner's); the mint byte's owner bit; the packed balance of each by the one helper (`D0`, `A0`, `C0` on a sats card) |
-| J5 | `withoutTheOwnerOnlyTheRecordsBalanceAndTheLastPaymentsMayBeEntered` | under the PIN, the change grant and on a card with no PIN: `0, A` yes, the last payment's balance yes, any other `6A9A`, nothing written |
-| J6 | `aKeysetIsNeverEnteredTwice` | a piece of an entered keyset labelled another balance is `6A97`, plain or labelled, with the proof or without; nothing written, the count the same |
-| J7 | `aLabelNamingAMintWithNoAddressIs6A97AndABadLabelIs6A80` | index 1 with no address; index 3; unit `02`; P2 = 2 is `6B00`, nothing written |
-| J7b | `aLabelledLoadKeepsItsOwnProofAndCountsItsAmount` | P1 = 1, P2 = 1: the proof read back by `GET_DLEQ` is the one sent after the label, byte for byte; three labelled pieces: each slot holds its own 81 bytes; the log's "put on" is the pieces' sum, not a sum read two bytes off |
-| J8 | `theTableHoldsSixteenAndReclaimsTheDeadFirst` | a seventeenth keyset with every entry live is `6A99`; with one dead it goes in, in the dead one's place |
-| J9 | `noMoreThanFourLiveEntriesWithoutTheOwner` | the fifth `6A99` under the PIN; the owner's still go in; four unmarked entries, two of them dead and not yet reclaimed: a fifth unmarked keyset goes in after the reclaim, and the count after is three; a load of a keyset already entered runs no reclaim (the pass is counted) |
-| J10 | `clearSpentFreesWhatNoPieceAndNoOpeningNames` | after a payment of every piece of a keyset and `CLEAR_SPENT`, its entry is free; an entry named by a pending opening is not |
-| J11 | `aTornEntryIsFreedAndNeverServes` | the entry's mint byte last; torn states set by hand: an entry with no piece, a piece whose status byte is not written |
-| J12 | `setMintUnderTheOwnersProof` | set, replace, let go; every refusal of 4.2 in its order; the label, the nonce and the value each bound; no PIN try spent |
-| J13 | `setMintRefusesAMintThatHoldsMoney` | `6A8D` with a live entry of that index, money at mint 0 and mint 2 no bar; a dead entry of index 1 (all its pieces spent, no `CLEAR_SPENT`), then `SET_MINT` index 1 to a new address: the entry is free after it, and a load of the old keyset labelled `1, unit` enters a new entry and does not reuse it |
-| J14 | `setMintRefusesAMintTwice` | the same address at index 1 and 2: `6A80` |
-| J15 | `setCardZerosTheTableAndTheMintsOnlyWhenEmpty` | `6A8D` with anything unspent anywhere; after it the table, mints 1 and 2, the last balance and the receipts' balances are zeros, unit B's limits are not |
-| J15b | `setCardRefusesWhileChangeIsOwed` | a payment of every piece with the card's own change, then `SET_CARD` under the owner's proof is `6A8D` and the book is untouched; after the change is written back and `CLEAR_SPENT`, it goes through; a DRAFT opening left by a payment never signed is let go and does not bar it |
-| J16 | `setCardRefusesAChangeOfUnitWhileALimitIsSet` | `6985` while any of the six is set; goes through when all are 0 |
-| J17 | `resetCardZerosTheBook` | the book zeros, the same array, not made twice |
-| J18 | `aPaymentOfTwoBalancesIs6A98` | two units at one mint; two mints in one unit; two keysets of one balance go through and sign once; a place whose entry is zeroed by hand (3.5) is `6A98`, first or not, and is not charged to unit A |
-| J19 | `aPaymentIsChargedToItsOwnUnitsDayAndNoOther` | the day to the sat and to the cent; the other unit's count untouched; `6A8F` in each; each unit's window turning by itself |
-| J20 | `theWaitIsWorkedOutFromItsOwnUnitsLimitOnOnePayment` | the 6a formula in each unit; a second payment in a tap slowed across units |
-| J21 | `theNoPinAllowanceIsPerUnit` | to the unit, `6A94` past it, a unit with none asks the PIN, nothing in the log |
-| J22 | `setLimitWithAUnitSetsThatUnitOnly` | 5, 9 and 13 bytes; a proof for one unit is none for the other; 4, 8 and 12 are unit A's; `6A80` for code `02`; every other length `6700` |
-| J23 | `theFirstHeaderAnchorsEachUnitsWindow` | a limit in each unit set before any header; the first header anchors both |
-| J24 | `getInfoIsTwentyByteForByteAndThreeSaysUnitB` | P1 = 0, 1, 2 as 1.20 but the version and byte 8; P1 = 3 every byte; unit B's limit on one payment zeros without the grant |
-| J25 | `theFormatIsFourForOneBalanceAndFiveForMore` | 4 on a new card and after loads of `0, A`; an entry `C0 00` (`0, A`, the owner's) leaves it at 4; 5 at the first other entry; 5 on a card that holds `0, B` only; 4 again after the reclaim; `GET_CARD` byte 0 the same |
-| J26 | `getBalanceZeroIsTheRecordsBalanceAndOneIsEachBalance` | on one balance P1 = 0 is 1.20's; on two, the record's only; P1 = 1's layout and totals; the wrap |
-| J27 | `getCardZeroIsAsItWasAndOneAndTwoAreTheMintsAndTheTable` | byte for byte; 159 and 161 at the most |
-| J28 | `aLongHistoryKeepsEveryPieceInItsBalance` | random labelled and plain loads under every authority, payments, change, clears, `SET_MINT`, power-ups: after every step every unspent place's keyset is in an entry of the balance it was loaded as, and each unit's counts add up to what was signed |
-| J29 | `theLogSaysEachEntrysBalance` | the flags' bits, the same as the packed balance's bits 4 to 6; a tap of two balances makes two entries; a dollars card holding only `0, A` has bit 6 at 0; `GET_LOG` P1 = 2's counts; P1 = 3's receipts and their balances |
-| J30 | `onlyTheseMethodsNameTheBook` | a source scan, as the proofs' store has: `processSetCard` (the reservation and the zeroing), `processResetCard`, `loadOne`, `processClearSpent` and the reclaim, `processSetMint` (and its reclaim), `processSpendAllSign`'s transaction and its receipt, `processSetLimitOwner`, `processSetHeader`, the readers (`GET_INFO`, `GET_CARD`, `GET_BALANCE`, `GET_LOG`, `SPEND_ALL_BEGIN`); no other |
-| J31 | `theSignTransactionIsOneByteLonger` | the source reading that counts what the transaction writes, moved by the last balance's byte and no more |
-| J32 | `aOneBalanceCardAnswersTheTwentyTranscript` | `spec/vectors/transcript.json`'s 1.20 commands replayed on a 1.23 card set up in sats, loaded plain and under the grant: every answer and status word equal, but `SELECT`'s second byte and `GET_INFO` byte 1 (the version). Then the same on a card set up in dollars. Goal 5, pinned whole |
-| J33 | `setCardZerosTheBookOutsideItsTransaction` | a source scan: in `processSetCard` the book is named only before `beginTransaction`, and only by `arrayFillNonAtomic`; the mint bytes zeroed first |
-| J34 | `aWrappedSumIsRefusedAgainstItsOwnUnit` | a payment of dollar places whose sum wraps is `6A8F` against unit B, written in the log with unit B's bits; unit A's counts are untouched; with places of two balances and a wrapping sum, the answer is `6A98` |
-| J35 | `theCapHoldsOnACardWithNoPin` | anyone who holds a card with no PIN: `0, A` and the last payment's balance go in, any other `6A9A`, the fifth unmarked `6A99` |
-| J36 | `aRefusalIsLoggedAsItsBalance` | `6A8F` in each unit: the refusal is counted in an entry with that balance's bits, and a refusal in one balance after a payment in the other begins a new entry |
-| J37 | `setLimitOfUnitBWithNoBookIs6A8C` | 5, 9 and 13 bytes with unit B's code before the first `SET_CARD` and on a card refused its book: `6A8C`, nothing written; with unit A's code, as the 4, 8 and 12 |
+| U1 | `theBookIsNotMadeAtInstallAndIsMadeByTheFirstSetCard` | null after install, after a PIN and after a refused `SET_CARD`; 75 zero bytes after the first that goes through; the same array after every later one |
+| U2 | `aCardRefusedItsBookIsAOneUnitCard` | the allocation made to fail: plain loads as the record's unit; a load labelled the other unit `6A9C`; byte 8 is 4; P1 = 3 byte 43 and `GET_CARD` P1 = 2 are `00`; a rate is still taken and read back |
+| U3 | `aPlainLoadEntersItsKeysetAsTheRecordsUnit` | under the PIN alone, `40` on a sats card and `41` on a dollars card; with the grant too, `C0` and `C1`; a second piece of the keyset writes no entry |
+| U4 | `theOtherUnitNeedsTheHoldersSay` | a new keyset labelled the other unit: `6A9D` under the PIN alone, nothing written; entered marked under the PIN and the grant; on a card with no owner, `6A9D` under the PIN alone and entered marked in a held tap |
+| U5 | `aTillMayEnterANewKeysetOfTheLastPaymentsUnit` | after a dollar payment on a sats card, the PIN alone enters a new dollar keyset, unmarked; after a sats payment it is `6A9D`; after `SET_CARD` the last unit is gone |
+| U6 | `aKeysetIsNeverEnteredAsBothUnits` | a piece of an entered keyset labelled the other unit is `6A9B`, plain or labelled, with the proof or without; nothing written, the count the same |
+| U7 | `aBadLabelIsRefusedBeforeAnythingIsWritten` | unit `02` is `6A80`; P2 = 2 is `6B00`; 82, 163, 244 and (P1 = 1) 178 taken, every other labelled length `6700` |
+| U8 | `aLabelledLoadReadsItsPiecesOneByteOn` | P1 = 1, P2 = 1: the proof read back by `GET_DLEQ` is the one sent after the label, byte for byte; three labelled pieces: each slot holds its own 81 bytes; the log's "put on" is the pieces' sum, not a sum read a byte off |
+| U9 | `theTableHoldsSixAndReclaimsTheDeadFirst` | a seventh keyset with every entry live is `6A9C`; with one dead it goes in, in the dead one's place |
+| U10 | `noMoreThanTwoLiveEntriesWithoutTheMark` | a third unmarked `6A9C`; marked ones still go in; two unmarked entries, one dead and not yet reclaimed: a new unmarked keyset goes in after the reclaim; a load of a keyset already entered runs no reclaim (the pass is counted) |
+| U11 | `clearSpentFreesWhatNoPieceAndNoOpeningNames` | after a payment of every piece of a keyset and `CLEAR_SPENT` its entry is free; one named by an owed opening is not; a drafted opening keeps it until the next `BEGIN` |
+| U12 | `aTornEntryIsFreedAndNeverServes` | the state byte last; torn states set by hand: an entry with no piece, a piece whose status byte is not written; the format reads 4 again after the reclaim |
+| U13 | `setCardLetsTheTableGoAndTakesOnlyUnitsItKnows` | after it every entry is free and the last unit `00`; a drafted opening let go first; the receipts' units and the other unit's count stay; unit `02` is `6A80`, nothing written; the rate and every limit stay |
+| U14 | `resetCardZerosTheBookAndTheRate` | the book zeros, the same array, not made twice; the rate zeros with the record, the clock kept |
+| U15 | `aPaymentOfBothUnitsIs6A9A` | both units in one `BEGIN`; two keysets of one unit go through and sign once; a place whose entry is zeroed by hand is `6A9A`, first or not, and is never charged as the record's unit |
+| U16 | `theCentsOfASatsPaymentAreRoundedUp` | `cents` of 1 sat at R = 1,000 is 1; of 1,000 is 100; of 1,001 is 101; at R = 1 and at R = 2^32 − 1; of 2^32 − 1 sats at R = 100 is 2^32 − 1; at R = 99 it is past four bytes and taken as `FF FF FF FF` |
+| U17 | `theConversionAgreesWithBigIntegerEverywhere` | thousands of random S and R, and every edge, against `ceil(S × 100 / R)` worked in `BigInteger`, saturated at four bytes: never one cent under |
+| U18 | `aSatsPaymentWithALimitAndNoRateIs6A99` | at the first `SIGN`, before the PIN gate; nothing signed, burned, counted or logged; the payment given up (`6985` after); with no limit set it signs; a dollar payment never asks for a rate |
+| U19 | `theWaitIsWorkedOutInCents` | LIMIT 6a's formula with S and L in cents: a sats payment worth the limit waits nothing, one worth a cent over the tolerance waits ten, each further limit's worth four; the L/32 tolerance in cents; a second payment in a tap slowed across units |
+| U20 | `theAllowanceCountsBothUnitsInCents` | a sats payment and a dollar payment with no PIN add up in cents, as the whole of their pieces; `6A94` past it; `VERIFY_PIN` renews it |
+| U21 | `theDayCountsBothUnitsInCents` | a daily limit set: sats and dollar payments counted in one spent-today, `6A8F` over it, written in the log with the payment's unit; the window as 1.22's |
+| U22 | `setLimitTakesTheRateWithTheFigures` | sixteen bytes (`34`) and twelve (`33`); the proof binds the rate (a proof for one rate is none for another, and none for twelve bytes); a rate alone changed begins no window and keeps every count; seven writes at most |
+| U23 | `theOldLengthsAreTakenOnlyOnADollarsRecord` | 4, 8 and 12 bytes (`34`), 4 and 8 (`33`): taken on a dollars record as 1.22 takes them, the rate untouched; `6700` on a sats record and before the first `SET_CARD`, nothing written; every other length `6700` |
+| U24 | `theRateIsTheHoldersToRead` | `GET_INFO` P1 = 3 bytes 44 to 47 with the grant, and on a card with no owner to the PIN in a held tap; zeros otherwise; `GET_CARD` P1 = 0's 29 bytes stay zeros with a rate set |
+| U25 | `getInfoThreeSaysTheBook` | every byte of the 51; P1 = 0, 1 and 2 as 1.22 but the version and byte 8 |
+| U26 | `theFormatIsFourForOneUnitAndFiveForBoth` | 4 on a new card and after loads of the record's unit, marked or not; 5 at the first entry of the other unit; 5 on a dollars card that holds sats; 4 again after the reclaim; `GET_CARD` byte 0 the same |
+| U27 | `getBalanceZeroIsTheRecordsUnitAndOneIsEachUnit` | on one unit P1 = 0 is 1.22's; on both, the record's only; P1 = 1's layout; the wrap; a place of no entry in no sum |
+| U28 | `aLongHistoryKeepsEveryPieceInItsUnit` | random loads under every authority, payments in both units with change, refunds, clears, `SET_CARD`, new rates, power-ups: after every step every unspent place's keyset is in an entry of its unit, and the counts add up, in cents and in each unit |
+| U29 | `theLogSaysEachEntrysUnit` | bit 5; a tap of both units makes two entries; a card of one unit has bit 5 at 0; P1 = 2's counts; P1 = 3's receipts and units; a refusal in an entry of its unit; with no owner, P1 = 2 and 3 counted toward the held tap as 0 and 1, and `6A86` for P1 = 4 counting nothing |
+| U30 | `getCardTwoIsTheTable` | the count and every entry in use, in order; 55 bytes at the most; P1 = 1 answers as P1 = 0 |
+| U31 | `onlyTheseMethodsNameTheBook` | a source scan, as the proofs' store has: `processSetCard`, `processResetCard`, `processLoadProof`, `loadOne`, `processLoadChange`, the reclaim, `processSpendAllBegin`, `processSpendAllSign`, and the readers of `GET_INFO`, `GET_CARD`, `GET_BALANCE` and `GET_LOG`; no other |
+| U32 | `theTransactionsGrowByWhatTheDesignSays` | the source readings that count what each transaction writes: `SIGN`'s and the receipt's one byte more, `writeLimit`'s one copy more, nothing in `SET_CARD`'s |
+| U33 | `aOneUnitCardAnswersTheTwentyTwoTranscript` | `spec/vectors/transcript.json`'s 1.22 commands replayed on a 1.23 card in sats: every answer equal but the version, and the old-length `SET_LIMIT`s, `6700` (U23); on a card in dollars, those too. Goal 5, pinned whole |
+| U34 | `theCentsAreWorkedInScratchAndAskNoRam` | a source scan: the conversion names `scratch` at offsets inside `X_HEX` only, and nothing else is written there between the conversion and its use; the RAM budget test stays at 941 and 7 |
 
-Changed: the test that walks every command through every state gains `46` and
-the labelled load; `theConstructorsAskForNoMorePersistentMemory` stays at
-29,806, and the once-only allocations it lists gain the book; the RAM budget
-test stays at 941.
+Changed, keeping what each pins:
 
-Changed too: the source scans in `CashuAppletTest` that name the limit fields or
-slice the source by method order. Each is rewritten to the per-unit form,
-keeping what it pins:
+- `SchnorrHWMathTest`: the constructors stay at 30,069; `ONCE_ONLY_ALLOCATIONS`
+  gains the book, and `theOnceOnlyAllocationIsNarrow` finds three; RAM stays at 941.
+- `CashuAppletTest`'s helpers (`setLimitCommand`, `setLimitsCommand`,
+  `setLimitByPinCommand`, `setLimit`, `setLimits`) send the new forms with a rate
+  of **100** sats per dollar. At R = 100, `ceil(S × 100 / 100) = S`: every figure a
+  1.22 test wrote in sats is the same number of cents, and every limit test keeps its
+  figures and its assertions. The tests that pin the old lengths themselves
+  (`testSetLimitTakesTheAllowance` and its like) are rewritten to U23's rule.
+- The source scans that slice by method (`testSpendIsOneTransaction`, from
+  `requireUnderLimits(` to `waitsFor(`; the `waitsFor` and `GET_INFO` scans; from
+  `processSetCard(` to `processSetLimit(`; from `processSetLimitOwner(` to
+  `writeLimit(`): new methods go after `dayIsOver`, or the slices are anchored on the
+  next method by name, each keeping what it pins.
+- The test that walks every command through every state gains the labelled load and
+  the new `SET_LIMIT` lengths.
 
-- `testSpendIsOneTransaction` (about line 7767): the day's window, the spent
-  count and the no-PIN count are written in the one transaction, now through
-  the unit's array and base; the receipt's transaction counts nothing.
-- the `waitsFor` scan (about 7863): it reads the unit's limit on one payment
-  and no window, no clock and no spent count.
-- the `GET_INFO` scan (about 7906): the limit on one payment copied once for
-  each unit, each under `loadGrant`.
-- the `SET_HEADER` scan (about 5632): each unit's window anchored after the
-  clock.
-- the `SET_CARD` scan (about 7960): still no clock, window or spent count in
-  it, now with the book's zeroing before its transaction (J33).
-- every `body(code, a, b)` whose end marker moves, the slice from
-  `processGetReceipts(` to `dayIsOver(` (about 7911) among them. New methods go
-  after `dayIsOver`, or the slices are re-anchored on the next method by name.
+### 10.7 At the chip
 
-### 10.6 The transcript vectors
+One sitting, with `tools/chip`. `ProofStoreCheck` gains the book (made by the first
+`SET_CARD`, P1 = 3 byte 43 `01`; zeros after `RESET_CARD`). `ChangeCheck` gains a run
+of 1.23, blank card to blank card as now, with a keyset id made up for each unit as it
+makes up its mint's key:
+
+1. `SELECT` answers `01 17`; `GET_INFO` P1 = 3 is 51 bytes, format 4.
+2. `SET_PIN`, `VERIFY_PIN`, `SET_CARD` in sats, the owner's claim; `SET_LIMIT` (`34`)
+   of sixteen bytes, a limit on one payment of 100 cents, an allowance of 200, R =
+   1,000; P1 = 3 with the grant reads the rate back; `GET_CARD` answers it as zeros.
+3. A new tap, the PIN: a plain load of sats (`40`); a load labelled dollars, `6A9D`;
+   with the grant as well, taken (`C1`); format 5; `GET_CARD` P1 = 2 lists both.
+4. A payment of a sats piece and a dollar piece together: `6A9A`.
+5. A new tap, no PIN: a sats payment of pieces of 2,000 sats with change, 200 cents,
+   the whole allowance, signed; a second of 10 sats in a new tap: `6A94`. Timed: the first and
+   the last `SIGN`, against 1.22's, for the conversion's cost.
+6. A sats payment of 1,500 sats under the PIN: 150 cents, a limit and a half, ten
+   waits counted to the asking.
+7. A dollar payment with change: the change by `LOAD_CHANGE`; the entry stays live
+   while the opening is owed.
+8. `SET_LIMIT` with R = 0, a sats payment: `6A99`; a dollar payment signs.
+9. The dollars paid off, `CLEAR_SPENT`: the reclaim frees the dollar entry, format 4.
+10. `SET_CARD` again on the empty card; `RESET_CARD`; blank.
+
+Each transaction of 7.4's table is measured in it, with the reclaim's time over a
+full card and `GET_BALANCE` P1 = 1's; and the install-size work of 12.2.
+
+### 10.8 The transcript vectors
 
 `spec/vectors/transcript.json` gains, as commands and answers: `SELECT` `01 17`;
-`GET_INFO` P1 = 3 on a new card and on a card of two balances; `GET_CARD` P1 =
-1 and 2; a plain load and a labelled one; a labelled load refused `6A9A`,
-`6A97` and `6A99`; `SET_MINT` set and refused `6A8D`; `SPEND_ALL_BEGIN` refused
-`6A98`; a payment in dollars, with the day's count read after it in P1 = 3;
-`SET_LIMIT` with a unit; `GET_BALANCE` P1 = 1; `GET_LOG` P1 = 2 and 3;
-`SET_CARD` refused `6A8D` while change is owed; a labelled load with P2 = 2
-refused `6B00`. `spec/vectors/owner.json` gains a proof over `set-mint` and one
-over a thirteen-byte `set-limit`.
+`GET_INFO` P1 = 3 on a new card, on a card of both units, without and with the grant;
+`GET_CARD` P1 = 0 with a rate set, and P1 = 2; a plain load and a labelled one; a
+labelled load refused `6A9B`, `6A9C` and `6A9D`, and one with P2 = 2 refused `6B00`;
+`SPEND_ALL_BEGIN` refused `6A9A`; a sats payment held to a ceiling in cents, with the
+counts read after it in P1 = 3; `SPEND_ALL_SIGN` refused `6A99`; `SET_LIMIT` of
+sixteen bytes (`34`) and of twelve (`33`), and the owner's old twelve on a sats
+record refused `6700`;
+`GET_BALANCE` P1 = 1; `GET_LOG` P1 = 2 and 3. `spec/vectors/owner.json` gains a proof
+over a sixteen-byte `set-limit`.
 
-### 10.7 Order of the work
+### 10.9 Order of the work
 
-1. **Applet 1.23 and `BalancesTest`**, the transcript and the vectors, with the
-   install-size sitting at the chip (3.2) and the transactions of 7.4 measured
-   in it. A 1.23 card in a phone of today is safe from the first build: format
-   4 is used as 1.20, format 5 is refused (10.2).
-2. **The model of the card** (10.4), from a 1.23 recording. It cannot come
-   first: `tests/flashcard-model.js` holds it to a recording of the applet.
-3. **The phone** (9.1 to 9.8). It asks a card for nothing new unless the card
-   says `01 17`, so it can ship before any 1.23 card exists. The format
-   comparisons of 9.1 go in first, in the same change as the reading of format
-   5, or a new phone would treat a 1.23 card of two balances as knowing nothing.
-4. **The dollars card on 1.20** (12.2) is phone only and can go before step 1.
+1. **Applet 1.23 and `UnitsTest`**, the transcript and the vectors, with the sitting
+   at the chip (10.7, 12.2). A 1.23 card under a phone of today is safe from the first
+   build: format 4 is used as 1.22, format 5 is refused, and a sats ceiling cannot be
+   written in sats (10.2).
+2. **The model of the card** (10.5), from a 1.23 recording. It cannot come first:
+   `tests/flashcard-model.js` holds it to a recording of the applet.
+3. **The phone** (9.1 to 9.8). It asks a card for nothing new unless the card says
+   `01 17`, so it can ship before any 1.23 card exists. The format comparisons of 9.1
+   go in first, in the same change as the reading of format 5.
+4. **The cards in hand** installed again (10.1), once the phone that knows 1.23 is
+   the owner's.
 
 ## 11. Threats
 
-What the table and the second unit change in `SECURITY-MODEL.md` and LIMIT 13,
-each with the rule that closes it. Numbered to follow the threat table's 16.
+What the table, the second unit and the rate change in `SECURITY-MODEL.md` and
+LIMIT 13. Numbered to follow the threat table's 16.
 
 | # | Threat | Closed by |
 |---|---|---|
-| 17 | **A dollar limit walked round with sats.** The owner sets $20 a day on the dollars; the card's sats have no limit; a terminal that has the PIN takes the sats | Each unit has its own limits, and nothing is bound that the owner has not set (LIMIT 13). The card cannot hold one ceiling across units without a price. So the phone never sets one unit's limit alone on a card of two: CHANGE LIMIT sets both from one dollar figure (9.4). The worst a terminal takes in a day is then the two limits together, which the screen says. Open: 13, decision 1 |
-| 18 | **A payment charged to the wrong unit**, by mixing pieces or by a piece put in the wrong balance | `SPEND_ALL_BEGIN` refuses two balances (`6A98`). A keyset is in one entry and is never moved (3.4). A terminal can put a piece of its own in a wrong balance (its own money, which the mint refuses there), and never a piece of the holder's |
-| 19 | **A mint index swapped**: mint 1's address pointed at another mint, so a phone takes the card's pieces to the wrong mint, or a keyset entered under the wrong mint | `SET_MINT` is the owner's alone and is refused while any money or change of that mint is on the card (`6A8D`). Mint 0 changes only with nothing unspent. An entry is never changed. The phone keeps a piece only where the mint the table names lists its keyset in that unit, and checks its DLEQ with that mint's keys (9.1) |
-| 20 | **A keyset entered by a stranger** on a card with no PIN (anyone may load it), or by a till that has the PIN | A stranger enters only the record's balance or the last payment's (3.3), at most four entries live at once. What it can do is load pieces of its own, as LIMIT 13 already says: a nuisance, and a keyset it squats on answers the owner's later load `6A97` until those pieces are gone. The owner's phone frees it as WITHDRAW does: that unit's limits lifted with the owner's proof, a payment of nothing but those places under the PIN (the mint refuses it, and the card has burned them; a squatter's junk piece can carry any amount, which is why the limits are lifted first), the limits put back, then `CLEAR_SPENT`, and the entry is free. One PIN and two owner's proofs, not free. Open: 13, decision 3 |
-| 21 | **Two units under one SIG_ALL** | `6A98` before anything is hashed. The card's own change is made in the payment's keyset, so it is the payment's balance |
-| 22 | **A phone of today reading cents as sats** | the card's format is 5 for a card of more than one balance, and a phone of today refuses it at the read. A card in dollars alone it refuses by its unit byte (10.2) |
-| 23 | **A figure in cents taken as sats by a card that does not know units** | the new forms of `SET_LIMIT` and `LOAD_PROOF` are lengths a card of 1.20 refuses (`6700`) |
-| 24 | **A reader that adds a card's balance**, an upstream terminal | `GET_BALANCE` P1 = 0 is the record's balance alone; no command of the card adds two units |
+| 17 | **A ceiling walked round with the other unit.** The owner sets $20 on one payment; a terminal that has the PIN takes the sats | One ceiling, in cents, for both units (6.1): a sats payment is weighed in cents at the rate before it is held to it. The worst a terminal takes is what one ceiling allows, whichever unit it takes, and a thief with the card has one allowance, not one a unit |
+| 18 | **A payment charged as the wrong unit**, by mixing pieces or by a piece put in the wrong unit | `SPEND_ALL_BEGIN` refuses both units (`6A9A`). A keyset is in one entry and is never moved (3.4). A terminal can label a piece of its own wrongly (its own money, which the mint refuses there, and which the phone counts nowhere), and never a piece of the holder's |
+| 19 | **A piece taken to the wrong mint** | One mint, the record's, changed only on an empty card owed nothing (4.1). The phone keeps a piece only where that mint lists its keyset in the unit the table names, and checks its DLEQ with that mint's keys of that unit |
+| 20 | **A keyset entered by a reader that is not the holder's**: a till that has the PIN (nobody loads a card with no PIN, since 1.21) | It enters only the record's unit or the last payment's (3.3), at most two entries live at once. It can load pieces of its own, as LIMIT 13 says: a nuisance, and a keyset it squats on answers the owner's later load `6A9B` until they are gone. The owner's phone frees it as WITHDRAW does: the ceiling lifted with the owner's proof (a squatter's piece can say any amount), a payment of those places under the PIN (the mint refuses it; the card burns them), the ceiling put back, `CLEAR_SPENT`. It cannot start the other unit on a card that has not just paid in it, so it cannot turn a card of one unit to format 5 |
+| 21 | **Two units under one SIG_ALL** | `6A9A` before anything is hashed. The card's own change is made in the payment's keyset, so it is the payment's unit |
+| 22 | **A phone of today reading cents as sats** | in a piece: the format is 5 for a card of both units, and a phone of today refuses it at the read (10.2). In a figure: on a sats card of 1.23 it reads the ceiling's cents as sats on its screen and in its guess at the PIN, which the card overrules; it cannot write a figure in sats there (`6700`) |
+| 23 | **A figure in cents taken as sats by a card that does not know units** | the sixteen- and twelve-byte `SET_LIMIT` and the labelled `LOAD_PROOF` are lengths a card of 1.22 refuses (`6700`) |
+| 24 | **A reader that adds a card's balance**, an upstream terminal | `GET_BALANCE` P1 = 0 is the record's unit alone; no command of the card adds two units |
+| 25 | **A stale rate.** The price moves after the owner's phone wrote R, and a sats payment is weighed at the old price | The owner's phone re-pegs R at every read as owner where its price has moved more than 2% (6.5). Between reads, the ceiling for sats moves with the price as a 1.22 sats limit's worth in dollars always has. A card with no owner keeps its rate while it holds money, as it keeps its limits; it holds a sats payment to the same number of sats a 1.22 card with no owner would. A card with a ceiling and no rate fails closed: `6A99` for every sats payment, never a payment unbounded |
+| 26 | **A wrong rate written by the owner's own phone**: a bad price, or a bug | It costs only sats payments, and in proportion: a rate ten times too many sats per dollar weighs a sats payment at a tenth of its worth, so the limit on one payment and the allowance let ten times their figure of sats go before the next correct re-peg; dollar payments are untouched. A rate ten times too few is ten times stricter: sats payments wait or ask the PIN, and nothing is lost. The phone writes R only from the price SET AMOUNT uses, rounds it toward the stricter, and asks the owner before writing a rate more than twice or less than half the one on the card (9.1). The card cannot judge a price, and does not try |
+| 27 | **A rate written by a till** | It cannot: the rate is written only with the owner's proof (`34`), or, on a card with no owner, under the PIN while the card is empty and owed nothing and, once used, in a held tap (`33`, LIMIT 8.4). A till with the PIN cannot change the rate of a card that holds money, as it cannot change its limits |
+| 28 | **The conversion's arithmetic** | Five bytes for every product a four-byte amount can make, rounding up, and a quotient past four bytes taken as over every ceiling (6.2). U16 and U17 pin it against `BigInteger` |
 
-What it does not change: the card checks no piece and knows no price; a
-terminal that has the PIN takes up to each unit's limits in a day; the receiver
-always asks the mint. And one thing it costs: a card of two balances is two
-limits' worth to a thief in a day, where a card of one is one (17).
+What it does not change: the card checks no piece and knows no market; a terminal
+that has the PIN takes up to the ceiling; the receiver always asks the mint.
 
-**A mismatch between the documents and the applet, found writing this** (history:
-settled by 1.21). `FOXY-CARD-SPEC.md` 5.3 rule 5 and LIMIT 6f said a card with no
-PIN is loaded only by the owner's grant or in the tap after a payment; the applet
-of 1.20 (`requireLoadAuthority` returned at once on a card with no PIN), the
-`LOAD_PROOF` rows of SPEC 5.2 and LIMIT 8, and `ProofStoreTest` said anyone who
-holds it. Since 1.21 nobody loads a card with no PIN (`6A97`), and the documents
-and the applet agree. Threat 20 is smaller for it (13, decision 3).
+## 12. Size, and what shipped first
 
-## 12. Size, and what can ship first
+### 12.1 The applet
 
-### 12.1 The whole
+| Area | Lines of applet code |
+|---|---|
+| the book: constants, the reservation, `SET_CARD`'s reclaim and unit check, `RESET_CARD`'s zeroing | 30 |
+| the table: lookup, the labelled load (the label, and the one-byte shift in `loadOne` and `logLoaded`), the gate, the cap, the order of writes | 90 |
+| the reclaim, at `CLEAR_SPENT`, at a full table or the cap, and at `SET_CARD` | 35 |
+| `SPEND_ALL_BEGIN`'s one unit; `SIGN`'s unit and the last unit | 25 |
+| the ceiling: the conversion, `6A99`, the cents handed to the allowance, the day and the wait | 55 |
+| `SET_LIMIT`: the sixteen- and twelve-byte forms, the old lengths' rule, the rate in `writeLimit` | 25 |
+| `GET_INFO` P1 = 3, the format byte, `GET_CARD` P1 = 2 and the rate masked, `GET_BALANCE` P1 = 1, `GET_LOG` P1 = 2 and 3 | 80 |
+| the log's bit, the other unit's count, the receipts' units | 30 |
+| **in all** | **about 370**, and as many lines of comment in this file's way |
 
-| Area | Lines of applet code | |
-|---|---|---|
-| the book: constants, the reservation, `SET_CARD` (the zeroing outside its transaction, change owed) and `RESET_CARD` | 55 | |
-| the table: lookup, the labelled load, the gate, the cap, the order of writes | 130 | |
-| the reclaim at `CLEAR_SPENT`, at a full table or the cap, and at `SET_MINT` | 40 | |
-| `SET_MINT` | 55 | |
-| `SPEND_ALL_BEGIN`'s one balance, `SIGN`'s unit and last balance | 35 | |
-| limits per unit: the array and the two offsets as parameters, `requireUnderLimits`, `waitsFor`, `requireAllowanceOrPin`, `writeLimit`, `SET_LIMIT`'s unit, `SET_HEADER` | 110 | |
-| `GET_INFO` P1 = 3, the format byte, `GET_CARD` P1 = 1 and 2, `GET_BALANCE` P1 = 1, `GET_LOG` P1 = 2 and 3 | 115 | |
-| the log's bits and the receipts' balances | 35 | |
-| **in all** | **about 575**, and about as many lines of comment in this file's way | about 2.5 to 3.4 KB of load file |
+At the 4.3 to 5.9 bytes of load file a line of code that the earlier draft's estimate
+came to, that is about 1,600 to 2,200 bytes: a load file of about 23,400 to 24,100
+bytes.
+
+### 12.2 The install-size window
+
+Whether the card's applet installs turns on the load file's size, by a rule nobody
+has found (`FOXY-CARD-HARDWARE.md`). The record so far: 1.19 installed at 19,269
+bytes (69 past a multiple of 256), 1.20 at 19,634 (178 past), 1.21 at 21,109 (117
+past); **1.22 was refused at 21,740 bytes (236 past) and installed at 21,830 (70
+past)**, with fifteen lines of `sizeTheFile` and nothing else changed. No size past
+21,830 has been tried, so `tools/refcheck.py` will say "not tried" of 1.23's.
+
+The work: build, read the size, and try it on the chip with
+`~/.foxycard/install-try.sh`. Where it fails, move the build a line of `sizeTheFile`
+at a time (six bytes a line; up to 43 lines cover a window of 256; lines may be taken
+away as well as added) and try again until one installs. Every answer, the failures
+too, goes into `SIZES` in `tools/refcheck.py`, and `sizeTheFile`'s comment says which
+size failed and which installed, as 1.22's does. 1.23 ships at a size that installed.
+The sitting is planned for it, with the measures of 10.7.
+
+### 12.3 Days
 
 | Work | Days |
 |---|---|
-| applet | 4 |
-| JUnit (J1 to J37 with J7b and J15b, about 3,300 lines), the source scans rewritten (10.5), the transcript and the vectors | 3.5 |
-| at the chip: the install-size window (3.2), every transaction of 7.4's table, the reclaim's and `BEGIN`'s times with a table, `GET_BALANCE` P1 = 0 on a card of format 5 and P1 = 1 (each looks up 128 places in the table), `SET_CARD`'s zeroing of 333 bytes outside its transaction, `ProofStoreCheck`'s like for the book | 1 to 2 |
+| applet | 3 |
+| JUnit (U1 to U34, about 2,600 lines), the helpers and source scans rewritten (10.6), the transcript and the vectors | 3 |
+| at the chip: the install-size window, 10.7's run and measures, `ProofStoreCheck`'s book | 1 to 2 |
 | the model of the card and its replay | 1 |
-| the phone's wallet (`08a`, `21a`, `08c`, native): about 900 lines | 4 |
-| the screens (`26f`): pills, mints, SWAP, the limit for two units, the words: about 600 lines, and their snapshots | 3 |
-| the phone's suites, and a live one at a two-unit mint with the applet as the card | 2 |
-| **in all** | **18.5 to 19.5 working days**, about four weeks of the way this project is worked now |
+| the phone's wallet (`08a`, `21a`, native): about 700 lines | 3 |
+| the screens (`26f`): two pills, SELECT CURRENCY, SWAP, the ceiling for both, the words: about 400 lines, and their snapshots | 2 |
+| the phone's suites, and the live one at a two-unit mint with the applet as the card | 2 |
+| **in all** | **15 to 16 working days**, about three weeks |
 
-### 12.2 What can ship first: a dollars card, on the cards there are
+### 12.4 What shipped first
 
-**A card of one balance in dollars needs no new card software.** A 1.20 card
-already keeps a unit byte it never reads, takes pieces of any keyset, counts
-what leaves it and waits by its own work in whatever unit its numbers are, and
-its limits are numbers with no unit. Set up with a record that says `01`, loaded
-with Forge's dollar pieces, and given limits in cents, it is a dollars card. The
-two 1.20 cards in hand can be dollars cards the day the phone is.
+The dollars card on the cards there are (a record of `01`, dollar pieces at the mint,
+limits in cents typed in dollars and never re-pegged, paid by a dollar till) needed no
+new card software, and has shipped in the phone. It is a card of one unit, format 4,
+and a 1.23 card set up in dollars is the same card to that phone (10.2). 1.23 is next.
 
-What that cut is, exactly, all of it in the phone:
+## 13. Decided
 
-1. `cardRecordOf`: `01` is `'usd'`. `cardUnusable`: a dollars card at this mint
-   pays a dollar request; a sats request is refused in words (9.6).
-2. Set-up and an empty card's record: `DOLLARS` or `BITCOIN` at a mint of two
-   units (the app's own currency question), written as the unit byte;
-   from bitcoin to dollars, the limits taken off and put back in cents in the
-   same tap (6.6).
-3. ADD FUNDS from the dollar pile: pieces on the dollar keyset, cut in cents.
-   WITHDRAW into the dollar pile, through `unitGuard`.
-4. The limits in cents, typed in dollars, never re-pegged.
-5. The till: a dollar request paid from a dollars card, its change and refunds
-   in dollars; the rule of `211ed9e` that refuses a held card payment in a unit
-   that is not sats lifted for a dollars card. Offline: an exact set in cents.
-6. The screen: one frost-blue pill with its worth in sats, amounts in dollars.
-7. The rows (`CARD_OWED`, `CARD_SWAPS`, take-back) with `unit: 'usd'`.
-8. Suites: the model card set up in dollars; the money suites at a two-unit
-   stand-in mint; the live two-unit Nutshell with the applet as the card.
+The owner's answers to the ten questions of the earlier draft, in the owner's words,
+and what each meant for this design:
 
-Why it is smaller: no applet, no chip, no install-size window, no new command,
-no table, no new card to buy or install; and nothing on the card can mix two
-units, because one card holds one. Why it is safe with the phones there are: a
-phone of today refuses a card whose unit is not sats, to read it and to load it
-(10.2). What it does not give: dollars and sats on one card, and more than one
-mint. Those are 1.23.
+1. **One ceiling or two.** "ok on limit across units". One ceiling, in cents, for
+   both units, with a rate the owner's phone writes and the card converting sats at
+   each payment (6).
+2. **Three mints and sixteen entries.** "yes both units at one mint, card supports
+   one mint for now". One mint, the record's; no mint list, no `SET_MINT`; six
+   entries; the three mints kept as history with the door marked (4).
+3. **Who loads a card with no PIN.** "confirmed". Nobody, since 1.21 (`6A97`); every
+   load is the PIN's, and a new keyset of the other unit wants the holder's say as
+   well (3.3).
+4. **The format byte by what the card holds.** "A sounds fine". 4 for a card of one
+   unit, 5 for one of both, worked out at each asking, so a phone of today keeps
+   using a card of one unit (4.3).
+5. **A dollar request from a card of both.** "always ask". The card never chooses;
+   the phone asks the holder every time both units could pay (7.1, 9.7).
+6. **A change of the record's unit.** "got answer?". Moot once the first was
+   decided: every limit is in cents whatever the record's unit, so a change of unit
+   changes no limit's meaning, and nothing is refused for it (6.7).
+7. **The 128 places between two units.** "what you recommend". Four of every size,
+   1 to 1,024, in each unit on a card of both; eight on a card of one (9.2).
+8. **The screen of a card at several mints.** "yes both units at one mint, card
+   supports one mint for now". One mint on the screen, named over its pills, and no
+   rows of other mints (9.5).
+9. **The cards in hand.** "reintall to 1.23 is fine". Each is emptied by the phone,
+   installed again as 1.23 with a new key, set up and loaded; no migration on the
+   card (10.1).
+10. **What ships first.** "ok cool". The dollars card on 1.20 has shipped in the
+    phone; 1.23 is next (12.4).
 
-About 4 to 5 days, phone only.
-
-## 13. For the owner to decide
-
-1. **One ceiling or two.** Each unit has its own limits (designed), and the
-   phone sets both from one dollar figure, so a thief's day is the two limits
-   together. The other way is one ceiling in dollars on the card, with a rate the
-   owner's phone writes with the limit and the card converting sats to cents at
-   each payment: about 80 lines more in bytecode, a rate that goes stale as the
-   re-pegged limit does, and one more number a terminal is not told. Recommended:
-   two.
-2. **Three mints and sixteen entries**, four of them open to entries made without
-   the owner (3.2, 3.3). Fewer mints is fewer entries and a smaller book; more
-   than four mints does not fit one answer.
-3. **Who loads a card with no PIN.** Settled by 1.21 (history): nobody (`6A97`),
-   and the documents and the applet agree. Up to 1.20 the applet let anyone who
-   held it, and the SPEC said only the owner's grant or the tap after a payment
-   (11).
-4. **The format byte, 4 or 5 by what the card holds** (designed), so a phone of
-   today keeps using a 1.23 card of one balance. The other way is 5 on every
-   1.23 card: simpler, and every phone of today refuses every new card.
-5. **A dollar request from a card of both**: from the dollars first, and from
-   the sats (by the `770db86` route) only where the dollars are short
-   (designed). Or always ask.
-6. **A change of the record's unit** refused while a limit is set, the phone
-   taking them off and putting them back in one tap (designed), or the card
-   swapping the two units' limits itself.
-7. **The 128 places between two balances**: four of every size in each
-   (designed), or as the owner uses them (the phone could cut deep in the unit
-   paid with most).
-8. **The screen of a card at several mints**: one mint on show with its pills
-   and the others as rows (designed), or every balance in one list.
-9. **The cards in hand**: stay 1.20 (sats, or dollars with 12.2), or be emptied
-   and installed again as 1.23 cards with new keys.
-10. **What ships first**: the dollars card on 1.20 (12.2), then 1.23.
+**Still open.** Nothing the owner has to answer before 1.23 is built. Two things are
+the chip's to answer, in the one sitting: the size at which 1.23 installs (12.2), and
+the time the conversion adds to a sats payment's first and last `SIGN` (10.7, step 5).
