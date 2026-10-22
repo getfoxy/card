@@ -19,7 +19,7 @@ its PIN ([GET_LOG](#get_log-0x18--software-122-on-a-card-with-no-owner)).
 ---
 
 
-> **1.22:** the rules in FOXY-CARD-DAILY-LIMIT.md, section "1.22 in one place", win over anything below that still says a card with no owner takes no load, that the receipts are the owner's grant's alone, that a card with no owner holds nothing, or that SET_PIN, SET_CARD or the PIN form of SET_LIMIT is open to any reader on an empty card with no owner.
+> **1.22:** the rules in FOXY-CARD-DAILY-LIMIT.md, section "1.22 in one place", win over anything below that still says a card with no owner takes no load, that the receipts are the owner's grant's alone, that a card with no owner holds nothing, or that SET_PIN, SET_CARD or the PIN form of SET_LIMIT is open to any reader on an empty card with no owner. Rule 12 there (no change owed can strand the card) is in [LOAD_CHANGE](#load_change-0x53--software-121) and [RESET_CARD](#reset_card-0x51--software-117) below.
 
 > **1.21:** the rules in FOXY-CARD-DAILY-LIMIT.md, section "1.21 in one place", win over anything below that still describes the tap after a payment as a grant, a claim answered `00 01`, loads under the owner's grant, or a no-PIN allowance renewed by the day.
 
@@ -450,23 +450,26 @@ One opening of the card's own change (`SPEND_ALL_CHANGE`) made into the piece it
 | Le | 01 |
 | Response | 1-byte slot index the piece went into |
 
-**Who may:** the PIN given in this tap, or the owner's grant (`ALLOW_LOAD`), or this tap being the one after the payment that made the opening, once for that opening (`docs/FOXY-CARD-DAILY-LIMIT.md` 8.2).
+**Who may:** any reader, with no PIN, in any tap, on a locked card as well (1.21: `docs/FOXY-CARD-DAILY-LIMIT.md`, "1.21 in one place", rule 3), under the key `K` the opening was bound to at `SPEND_ALL_CHANGE` (GET_CHANGE gives it) and no other.
+
+**Another key (1.22).** A `K` other than the bound one is taken only when the PIN has been given in this tap, no payment has been signed in this time in the field, and the holder's own say is in the tap: on a card with an owner the owner's grant (`ALLOW_LOAD`), on one with no owner the history held for (`GET_LOG`'s hold). The PIN alone is not enough, because a till has it, and with it alone could bind an earlier payment's opening to a key of its own and be paid in the same tap; a held tap pays nothing for the rest of that time in the field. The proof is then checked under the `K` given, as it is under the bound one. This is how the holder's phone mends an opening a till bound to a key that is not the mint's: it asks the mint for its answer to the opening's `B_` (NUT-09 restore) and brings it under the mint's real key. Without the PIN, another key is `6A80`, as in 1.21; with it, in a tap that paid, `6985`; with no grant or hold, `6982`. A reader that has the PIN and the hold (no owner), or the owner's phone, and names a key of its own, with a proof that holds for it, has a piece written that the mint will not take: the holder's own change (`docs/FOXY-CARD-DAILY-LIMIT.md`, "1.22 in one place", rule 12).
 
 **Errors** (in the order they are checked):
 
 | SW | Meaning |
 |----|---------|
-| 6986 | Card locked (`LOCK_CARD`) |
 | 6A97 | The card has no PIN |
 | 6A83 | P1 is past the last opening (7) |
-| 6982 | Neither the PIN, nor the owner's grant, nor the grant of the tap after the payment for this opening |
 | 6A88 | The opening is not waiting for its piece |
 | 6A94 | The opening's piece is on the card already; the opening is let go |
 | 6A84 | No empty slot |
 | 6700 | Any length but 194 |
-| 6A80 | A point that is not on the curve or not in the `04` form, or a proof that does not hold |
+| 6A80 | A `K` whose first byte is not `04`, or a `K` other than the one the opening was bound to (its x, or its y's parity) with the PIN not given in this tap |
+| 6985 | 1.22: a `K` other than the bound one, with the PIN, in a time in the field in which a payment was signed |
+| 6982 | 1.22: a `K` other than the bound one, with the PIN, and no owner's grant in this tap (a card with an owner) or no history held for in it (a card with none) |
+| 6A80 | A point that is not on the curve, or a proof that does not hold under the `K` given |
 
-The card cannot tell that `K` is the mint's key: a key made up with a proof that holds for it is taken, and the piece is one the mint will not take (`docs/FOXY-CARD-SPEC.md` 5.10).
+The card cannot tell that `K` is the mint's key. It takes the key bound at the payment from anyone, and another key only under the PIN and the owner's grant or the held tap; whatever the key, the piece written is a signature under it, and a piece under a key that is not the mint's is one the mint will not take (`docs/FOXY-CARD-SPEC.md` 5.10). An opening nothing can load is given up by `RESET_CARD`'s let-go form (below).
 
 ---
 
@@ -619,12 +622,39 @@ Returns the card to what it was out of its packet, so that another person can se
 
 | SW | Meaning |
 |----|---------|
-| 6B00 | P1 is not 00 or P2 is not AD |
+| 6B00 | P1 is not 00 (or 01, the let-go form, 1.22) or P2 is not AD |
 | 6A90 | The card has no owner |
 | 6A91 | No nonce was asked for in this tap, or the proof is not the owner's |
 | 6700 | Bytes after the proof |
 | 6982 | The card is locked and the PIN has not been verified in this tap |
 | 6A8D | Anything unspent is on the card |
+
+**The let-go form (1.22).** P1 = `01`, P2 = the number of one opening of change (0 to 7, as `GET_CHANGE` gives it). That opening is let go with its piece never loaded, and nothing else is reset. It is for an opening nothing can load: one a till bound to a key that is not the mint's whose real answer the holder cannot bring (`LOAD_CHANGE` under the PIN and the owner's grant, or the held tap, mends one that can), or change the till never took to the mint. The card cannot tell such an opening from one whose piece is still to come: giving it up is the owner's choice, and the money of that opening is gone. Then nothing owed stops a reset, a new record, a new PIN or the PIN form of the limit (`6A8D`).
+
+| Field | Value |
+|-------|-------|
+| P1 | 01 |
+| P2 | The opening's number (0 to 7) |
+| Data, a card with an owner | proof length (1), the owner's proof (ECDSA over `FoxyCard/reset`, the nonce just given, and the number), then the number (1) |
+| Data, a card with no owner | the number (1), under the PIN given in this tap and the history held for in it (`GET_LOG`), as the rewrites of a used card want them |
+
+The tap is written in the card's log: its entry, with bit 4 of its flags (`docs/FOXY-CARD-SPEC.md` 5.2; the entry and its size are as before). Answers `9000` and nothing.
+
+**Errors of the let-go form** (in the order they are checked):
+
+| SW | Meaning |
+|----|---------|
+| 6A83 | P2 is past the last opening (7), before the owner, the proof or the PIN is looked at |
+| 6A91 | With an owner: no nonce was asked for in this tap, or the proof is not the owner's for this label, nonce and number |
+| 6982 | With an owner: the card is locked and the PIN has not been verified in this tap |
+| 6A97 | With no owner: the card has no PIN |
+| 6982 | With no owner: the PIN not given in this tap |
+| 6985 | With no owner: a payment was signed in this time in the field |
+| 6982 | With no owner: the history not held for in this tap |
+| 6700 | Anything but the number after the proof (with an owner), or but the number (with none) |
+| 6B00 | The number in the data is not P2 |
+| 6A88 | The opening is not waiting for its piece |
+| 6A94 | The opening's piece is on the card already: it is let go, and nothing is written in the log |
 
 From 1.20 it also fills the store of the mint's proofs with zeros, after the places are freed and outside the transaction. A blocked PIN is no bar on a card that is not locked. The wipe is one transaction of five bytes (the lock, the PIN state, the change note, the owner and the NFC tag's switch), after the keys are drawn; see `docs/FOXY-CARD-SPEC.md` 5.6a. It puts the NFC tag back on.
 

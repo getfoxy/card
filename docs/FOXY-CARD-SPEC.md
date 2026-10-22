@@ -320,7 +320,7 @@ has most of them as commands and answers):
 | `15` | AUTH | | 16 random bytes | 16 of the card's own and a signature |
 | `16` | GET_CARD | | | format, record set, unit, limit (4), refund key (33), then 65 bytes at offset 40: the hardest header's `bits` (4), the newest header's hash (32) and 29 zeros (a time key up to software 1.14), mint length, mint |
 | `17` | GET_PIECES | | P1 = the first slot to report | one page: the first slot the page does not cover (1), then for each slot in the range that is not empty a tag (1) and, for an unspent slot, its 81 bytes (FOXY-CARD-DAILY-LIMIT.md 8.1). `6A83` for a P1 of 64 or more |
-| `18` | GET_LOG | with an owner: the PIN verified in this tap, or the owner's grant; with P1 = 1 (receipts) the owner's grant only. With no owner (software 1.22): the PIN given in this tap for both, `6985` in a tap that paid, and held for: `6A98` with no data to the first nine askings in a row, the tenth answers; open for the rest of the time in the field once answered, and no payment in it (`6985`). No PIN set: open (it is empty) | with P1 = 1, P2: how many receipts back from the newest to begin | the card's own account of its taps (`FOXY-CARD-DAILY-LIMIT.md` 6b): 16 bytes of counts, then up to eight taps of 20 bytes (16 before software 1.15), newest first: the clock (4), sats signed for (4), pieces signed (1), refused (1), flags (1), pieces put on (1), sats put on (4), the time the terminal told (4). With P1 = 1: the count of payments (4), then up to three receipts of 77 bytes (73 before 1.15), newest first: the clock (4), the time the terminal told (4), the sats (4), SHA-256 of the message signed (32), the first output's blinded message (33). `6982` to anyone else |
+| `18` | GET_LOG | with an owner: the PIN verified in this tap, or the owner's grant; with P1 = 1 (receipts) the owner's grant only. With no owner (software 1.22): the PIN given in this tap for both, `6985` in a tap that paid, and held for: `6A98` with no data to the first nine askings in a row, the tenth answers; open for the rest of the time in the field once answered, and no payment in it (`6985`). No PIN set: open (it is empty) | with P1 = 1, P2: how many receipts back from the newest to begin | the card's own account of its taps (`FOXY-CARD-DAILY-LIMIT.md` 6b): 16 bytes of counts, then up to eight taps of 20 bytes (16 before software 1.15), newest first: the clock (4), sats signed for (4), pieces signed (1), refused (1), flags (1; bit 4, software 1.22: an opening of change given up), pieces put on (1), sats put on (4), the time the terminal told (4). With P1 = 1: the count of payments (4), then up to three receipts of 77 bytes (73 before 1.15), newest first: the clock (4), the time the terminal told (4), the sats (4), SHA-256 of the message signed (32), the first output's blinded message (33). `6982` to anyone else |
 | `20` | ~~SPEND_PROOF~~ | | | gone with format 4: `6D00`. Up to format 3 it signed for one slot, over that piece's secret alone |
 | `22` `23` `24` | SPEND_ALL_BEGIN, SPEND_ALL_OUTPUTS, SPEND_ALL_SIGN | a PIN set (`6A97` with none, software 1.21, as for `25` and `26`; `6985` for all five in a tap that claimed an owner, 5.10); `24`: the PIN, or the no-PIN allowance (5.7a); `22` and `23` ask nothing more | the places of a payment; then the swap's outputs, 37 bytes each; then nothing | **one** 64-byte signature over every piece and every output (NUT-11 `SIG_ALL`), with every place burned in the same transaction. The limits are held to what leaves the card: the pieces less the card's own change (`26`), worked out at the first SIGN, where the day refuses (`6A8F`) and the wait begins (00 01, "not yet"). Not opened by `ALLOW_LOAD` (FOXY-CARD-DAILY-LIMIT.md 6c) |
 | `26` | SPEND_ALL_CHANGE | as `22`; a payment begun, its outputs (`23`) all given | the amount (4) | one change output the card makes for itself (software 1.12): a fresh nonce, the secret in the card's own form (its key, the payment's date and refund key, `SIG_ALL`), hashed to the curve as NUT-00 says and blinded with a fresh factor; hashed into the message as an output, after the terminal's; the opening (amount, keyset, date, nonce, blinding factor and, from 1.21, the blinded message) is kept until the piece is written back. Answers the blinded message, 33 bytes. At most 8 openings on a card. `6985` with no payment begun; `6A80` for nothing, or more change than the pieces come to; `6A84` with no opening free; the terminal's outputs after it are `6985`, and the payment is given up |
@@ -341,10 +341,10 @@ has most of them as commands and answers):
 | `43` | SET_OWNER | no owner (a claim, software 1.21): a PIN set (`6A97`) and given in this tap (`6982`), no payment signed in this time in the field (`6985`), nothing unspent, the same key ten times in a row. Owner: the owner's proof, nothing unspent | 65 bytes, the owner's public key, uncompressed; with an owner, proof length (1) and the proof first | the claim: `00 01` ("not yet") to the first nine askings, a signature's work each, and the owner set at the tenth, answering nothing; another key or another command between begins the count again (5.10). With an owner: replaced at once. `6A8D` if anything is unspent; `6A91` with an owner and no good proof; `6A80` for a key not beginning `04`; `6700` other length; `6986` locked |
 | `44` | GET_NONCE | a card with an owner. No PIN | | 16 bytes, or `6A90` |
 | `45` | ALLOW_LOAD | the owner's proof, over `FoxyCard/load` and no value | proof length (1), proof | for the rest of this tap: `LOAD_PROOF`, `LOAD_CHANGE` and `CLEAR_SPENT` need no verified PIN. `6A90`, `6A91`; `6986` locked |
-| `51` | RESET_CARD (software 1.17) | the owner's proof; on a locked card the PIN as well; nothing unspent | P1 = `00`, P2 = `AD`; proof length (1), proof (over `FoxyCard/reset` and no value), nothing after it | nothing. `6B00` for a P1 or P2 not those, before anything else; `6A90` with no owner; `6A91` with no good proof; `6700` for bytes after the proof; `6982` on a locked card whose PIN has not been given in this tap; `6A8D` with anything unspent. A blocked PIN is no bar |
+| `51` | RESET_CARD (software 1.17) | the owner's proof; on a locked card the PIN as well; nothing unspent | P1 = `00`, P2 = `AD`; proof length (1), proof (over `FoxyCard/reset` and no value), nothing after it | nothing. `6B00` for a P1 or P2 not those, before anything else; `6A90` with no owner; `6A91` with no good proof; `6700` for bytes after the proof; `6982` on a locked card whose PIN has not been given in this tap; `6A8D` with anything unspent. A blocked PIN is no bar. With P1 = `01` and P2 an opening's number (software 1.22), that opening of change given up and nothing reset: the owner's proof over `FoxyCard/reset`, the nonce and the number, then the number; on a card with no owner the number alone, under the PIN and the history held for in the tap; written in the log (bit 4 of the tap's flags) |
 | `52` | SET_TAG (software 1.19) | the owner's proof; no PIN, any funds | P1 = `00` tag on, `01` tag off; P2 = `00`; proof length (1), proof (over `FoxyCard/tag` and the one byte after it), then that one byte, the same as P1 | nothing. `6B00` for a P1 or P2 not those, before anything else; `6986` on a locked card; `6A90` with no owner; `6A91` with no good proof (no PIN try); `6700` for anything but one byte after the proof; `6B00` for a byte that is not P1. The state it already has is `9000` and writes nothing (5.8) |
 | `50` | LOCK_CARD | PIN set and verified; the owner's proof | P2 = `DE` (P1 is not read); proof length (1), proof | nothing. `6982` with no verified PIN; `6B00` for a P2 not `DE`; `6985` on a card already locked; `6A90` with no owner; `6A91` with no good proof. A locked card still pays, under its PIN and its no-PIN allowance, and its settings are frozen: every write is `6986` (5.6) |
-| `53` | LOAD_CHANGE (software 1.21) | a PIN set (`6A97`); the PIN given in this tap, or `ALLOW_LOAD` in it, or this tap being the one after the payment that made the opening | P1 = the opening's number; `C_` (65, uncompressed), `K` (65, uncompressed), `e` (32), `s` (32): 194 bytes | the place the piece went into (1). The card checks NUT-12's proof against `K` and its own `B_`, takes its blinding factor off (`C = C_ − r·K`), writes the piece with the opening's keyset, amount, nonce and date, and lets the opening go (5.10). `6986` locked; `6A97`; `6A83` for a P1 past 7; `6982`; `6A88` for an opening not waiting; `6A94` for one whose piece is on the card already (it is let go); `6A84` no place free; `6700` any length but 194; `6A80` a point that is none, or a proof that does not hold |
+| `53` | LOAD_CHANGE (software 1.21) | a PIN set (`6A97`); then any reader, in any tap, locked or not, under the key bound at the payment; another key under the PIN given in this tap, in a tap that paid nothing, with `ALLOW_LOAD` in it, or on a card with no owner the history held for in it (software 1.22, 5.11) | P1 = the opening's number; `C_` (65, uncompressed), `K` (65, uncompressed), `e` (32), `s` (32): 194 bytes | the place the piece went into (1). The card checks NUT-12's proof against `K` and its own `B_`, takes its blinding factor off (`C = C_ − r·K`), writes the piece with the opening's keyset, amount, nonce and date, and lets the opening go (5.10). `6A97`; `6A83` for a P1 past 7; `6A88` for an opening not waiting; `6A94` for one whose piece is on the card already (it is let go); `6A84` no place free; `6700` any length but 194; `6A80` a point that is none, or a proof that does not hold. Software 1.22: a `K` other than the one bound at the payment is `6A80` with no PIN given, `6985` in a tap that paid and `6982` with no owner's grant (or, with no owner, no held history); with all of them it is taken, and the proof checked under it (5.11) |
 
 `21` (`SIGN_ARBITRARY`) stays unassigned. The applet's version is 1.1 and
 `FORMAT` is 3; a phone that knows only an earlier format refuses the card, as it
@@ -371,7 +371,7 @@ payment command and an owner's claim with `6A97`, before anything else.
 | `SPEND_ALL_BEGIN` | open (software 1.16; `6A97` with no PIN, 1.21); `6985` in a tap that read the history (1.22) | open; `6985` in a tap that claimed an owner (5.10) |
 | `SPEND_ALL_SIGN`, `SPEND_ALL_AGAIN` | the PIN, or the no-PIN allowance, up to the limits (since 1.22 such a card may hold pieces; `6A97` with no PIN); `6985` in a tap that read the history | the PIN, or the no-PIN allowance (5.7a), up to the limits |
 | `LOAD_PROOF` | the PIN given in this tap (software 1.22; `6A97` with no PIN, `6982` with one not given; up to 1.21 refused, `6A90`) | PIN verified, or the `ALLOW_LOAD` grant in this tap; not the tap after a payment (1.21) |
-| `LOAD_CHANGE` (`53`, software 1.21) | `6A88` (nothing is owed to it; `6A97` with no PIN) | PIN verified, or the grant, or the tap after the payment that made the opening, once for that opening (5.10) |
+| `LOAD_CHANGE` (`53`, software 1.21) | `6A88` (nothing is owed to it; `6A97` with no PIN) | any reader, under the key bound at the payment; another key under the PIN and the owner's grant, or the held history with no owner, in a tap that paid nothing (software 1.22, 5.11) |
 | `CLEAR_SPENT` | the PIN given in this tap (`6A97` with none, `6982` with one not given) | the PIN, or the grant (not the tap after a payment, 1.21) |
 | `SET_PIN` (`41`) | open while nothing is unspent (sets or replaces, unblocks); from 1.22, once the record is set, under the PIN it has and nothing owed | refused, empty or not: the owner uses `CHANGE_PIN` (from 1.16 to 1.20 a card with no PIN took one under the owner's grant, ADD PIN) |
 | `CHANGE_PIN` (`42`) | `6A90` | the owner's proof, empty or not, any PIN state |
@@ -381,7 +381,7 @@ payment command and an owner's claim with `6A97`, before anything else.
 | `SET_OWNER` (`43`) | the claim, while nothing is unspent: under the PIN given in this tap, ten askings in a row, not in a tap that signed a payment (5.10; `6A97` with no PIN) | the owner's proof, and nothing unspent |
 | `ALLOW_LOAD` (`45`) | `6A90` | the owner's proof |
 | `LOCK_CARD` (`50`) | `6A90` (after the PIN gate) | PIN set and verified, and the owner's proof |
-| `RESET_CARD` (`51`, software 1.17) | `6A90` | the owner's proof, nothing unspent; on a locked card the PIN as well |
+| `RESET_CARD` (`51`, software 1.17) | `6A90`; with P1 = `01` (1.22), one opening given up under the PIN and a held tap | the owner's proof, nothing unspent; on a locked card the PIN as well; with P1 = `01`, one opening given up under the proof |
 | `SET_TAG` (`52`, software 1.19) | `6A90` | the owner's proof, empty or not, no PIN; `6986` on a locked card |
 
 So the one thing a terminal with the PIN and an emptied card can still do is
@@ -619,7 +619,7 @@ verifier.
 | `SET_CARD` (on a card that has an owner) | `FoxyCard/set-card` | the data sent: unit, refund key, the 65 bytes where the time key was (zeros from a phone of software 1.15; the card does not read them), mint length, mint |
 | `ALLOW_LOAD` | `FoxyCard/load` | nothing |
 | `LOCK_CARD` | `FoxyCard/lock` | nothing |
-| `RESET_CARD` (software 1.17) | `FoxyCard/reset` | nothing |
+| `RESET_CARD` (software 1.17) | `FoxyCard/reset` | nothing; with P1 = `01` (software 1.22), the opening's number (1) |
 | `SET_TAG` (software 1.19) | `FoxyCard/tag` | one byte: `00` tag on, `01` tag off |
 
 So a proof for one command, or one value, is no proof for another, and an old or
@@ -1114,7 +1114,9 @@ show is that `K` is the mint's: a writer that makes up a key can make a `C_` and
 hold for it, and the piece it writes is one the mint will not take. The card writes only its
 own opening's piece, so that writer takes nothing and puts nothing of its own on; it can
 spend the holder's change of that opening. The phone that owes the change brings the mint's
-real answer.
+real answer. (1.21 as built binds `K` at the payment, so a stranger's key is refused; and a
+till that binds a key of its own leaves change nothing could load and a card nothing could
+reset. Software 1.22 closes that, 5.11: another key under the PIN and the holder's own say, and an opening given up.)
 
 No proof is kept for the piece in the store (5.9): `GET_DLEQ` answers `00` for it. The card
 has checked the proof it was given, and nobody else could check it without the blinding
@@ -1177,14 +1179,30 @@ The rules are `FOXY-CARD-DAILY-LIMIT.md`, "1.22 in one place"; in short:
   and `GET_INFO` answer any reader with no hold. On the phone: VIEW AS GUEST and TIE OWNERSHIP TO
   THIS PHONE on the FLASHCARD screen of a card with a PIN and no owner; KEEP HOLDING while the
   history is held for.
-- **A card with an owner** is 1.21's in every way. The claim (`43`) is 1.21's, and only of an empty
-  card.
+- **A card with an owner** is 1.21's in every way but the next. The claim (`43`) is 1.21's, and only
+  of an empty card.
+- **No change owed strands the card** (rule 12). An opening a till bound to a key that is not the
+  mint's is mended by `LOAD_CHANGE` under the PIN given in a tap that paid nothing, with the owner's
+  grant (`ALLOW_LOAD`) in it, or on a card with no owner the history held for in it: the key given
+  is taken in place of the bound one, and the mint's proof is checked under it (`6A80` for another
+  key with no PIN, as 1.21; `6985` in a tap that paid; `6982` with the PIN alone, which a till has,
+  so that no till can spoil the change of an earlier payment and be paid in the same tap). Or it is given up by `RESET_CARD` with
+  P1 = `01` and P2 its number: the owner's proof over `FoxyCard/reset`, the nonce and the number
+  (the PIN as well on a locked card), or, on a card with no owner, the number under the PIN and
+  the history held for in the tap. Its money is gone; the log marks the tap (bit 4 of its flags);
+  nothing owed then stops a reset or a new record. The reader with the PIN and the hold (no owner),
+  or the owner's phone, is trusted with the key as with a load: one that names its own key with a
+  proof for it spoils that opening's change.
 
 **What a phone needs to know to speak to a card of software 1.22.** `SELECT` answers `01 16`;
 `GET_INFO` is 1.21's but for the version. A phone-less set-up: `SET_PIN`, `VERIFY_PIN`, `SET_CARD`,
 `33` with eight bytes, then `LOAD_PROOF`, all in one tap. A guest's read: `VERIFY_PIN`, then
 `B0 18 00 00 00` again while it answers `6A98`, then the receipts, `B0 18 01 <back> 00`, at once.
-A phone's gate has to carry instruction `33` for the phone-less set-up. `spec/vectors/transcript.json`
+A phone's gate has to carry instruction `33` for the phone-less set-up. Mending an opening: `VERIFY_PIN`,
+then `ALLOW_LOAD` (the owner's) or the held `GET_LOG` (no owner), then `B0 53 <opening> 00 C2 <C_> <K> <e> <s>` with
+the mint's real `K`, in a tap that paid nothing. Giving one up:
+`GET_NONCE`, then `B0 51 01 <opening> <len> <proof-len> <proof> <opening>` (the owner's), or
+`B0 51 01 <opening> 01 <opening>` under the PIN in a held tap (no owner). `spec/vectors/transcript.json`
 has the phone-less set-up, the held read and the refusals as commands and answers.
 
 ## 6. A lost or blocked card is not lost money

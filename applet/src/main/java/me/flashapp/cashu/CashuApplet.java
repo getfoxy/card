@@ -49,7 +49,7 @@ import javacardx.crypto.*;
  *   0x42  CHANGE_PIN       — the owner's proof and the new PIN: no old PIN, any state
  *   0x43  SET_OWNER        — give the card its owner key: an open card claimed under its PIN, asked for six times in a row (6A98 "keep holding" to each but the last); or the old owner's proof; nothing unspent
  *   0x44  GET_NONCE        — a fresh nonce for the owner's proof
- *   0x45  ALLOW_LOAD       — the owner's proof, for this tap: the log, the receipts and the limit on one payment read, and a second payment not slowed; it opens no load (1.21)
+ *   0x45  ALLOW_LOAD       — the owner's proof, for this tap: the log, the receipts and the limit on one payment read, and a second payment not slowed; it opens no load (1.21), but with the PIN lets LOAD_CHANGE mend an opening under another key (1.22)
  *   0x50  LOCK_CARD        — freeze the card's settings and refuse every write (PIN, and the owner's proof); a locked card still pays under its PIN and allowance, and still takes its own change
  *   0x51  RESET_CARD       — back to a card out of its packet, for another person to set up (the owner's proof; nothing unspent and no change owed; the PIN too if locked)
  *   0x52  SET_TAG          — switch the card's NFC tag off or on (the owner's proof; no PIN; any funds)
@@ -432,11 +432,12 @@ public class CashuApplet extends Applet implements TagSwitch {
     static final short LOG_E_SATS           = (short) 4;   // sats signed for in it (4)
     static final short LOG_E_PIECES         = (short) 8;   // pieces signed (1, stops at 255)
     static final short LOG_E_REFUSED        = (short) 9;   // spends refused in it for being over a limit (1, stops at 255)
-    static final short LOG_E_FLAGS          = (short) 10;  // bit 0: the third refusal of a run, or one after it, was in this tap; bit 1: a payment in it waited (6a); bit 2: unused since 1.15; bit 3: a payment in it was signed with no PIN
+    static final short LOG_E_FLAGS          = (short) 10;  // bit 0: the third refusal of a run, or one after it, was in this tap; bit 1: a payment in it waited (6a); bit 2: unused since 1.15; bit 3: a payment in it was signed with no PIN; bit 4: an opening of change was given up in it (1.22)
     static final byte  LOG_FLAG_TAMPER      = (byte) 0x01;
     static final byte  LOG_FLAG_WAITED      = (byte) 0x02; // a payment in this tap was over the limit on one payment, and was waited for
     static final byte  LOG_FLAG_CLOCK       = (byte) 0x04; // set by software before 1.15, when a signed clock was moved on twice in one tap; never set since (the clock is block headers)
     static final byte  LOG_FLAG_NOPIN       = (byte) 0x08; // 1.16: a payment in this tap was signed with no PIN, on a card that has one, under its no-PIN allowance
+    static final byte  LOG_FLAG_LET_GO      = (byte) 0x10; // 1.22: an opening of change owed to the card was let go in this tap with its piece never loaded (RESET_CARD, P1 = 1)
     static final short LOG_E_LOADS          = (short) 11;  // pieces put on in it (1, stops at 255)
     static final short LOG_E_LOADED         = (short) 12;  // sats put on in it (4)
     static final short LOG_E_TOLD           = (short) 16;  // the time the terminal told at the tap (TELL_TIME, 4; zeros if it told none): a note, trusted for nothing
@@ -507,6 +508,8 @@ public class CashuApplet extends Applet implements TagSwitch {
     static final byte LOCK_CONFIRM_BYTE = (byte) 0xDE;
     // RESET_CARD confirmation byte
     static final byte RESET_CONFIRM_BYTE = (byte) 0xAD;
+    /** RESET_CARD's P1 for its other form (1.22): one opening of change, named by P2, let go with its piece never loaded. */
+    static final byte RESET_LET_GO = (byte) 0x01;
 
     /**
      * The held taps, in one place: how many times in a row a command is asked for before the card does it. Each asking but the
@@ -889,7 +892,9 @@ public class CashuApplet extends Applet implements TagSwitch {
      * the receipts and the limit on one payment may be read, and a second
      * payment in the tap is not slowed (6a). Gone with the tap. It opens no
      * load (1.21: LOAD_PROOF and CLEAR_SPENT want the PIN, whoever asks; up to
-     * 1.20 the grant let both through with none).
+     * 1.20 the grant let both through with none). With the PIN as well, it is
+     * the holder's say for LOAD_CHANGE under a key other than the bound one
+     * (1.22): the PIN alone is a till's too.
      */
     private byte[] loadGrant;
 
@@ -2083,9 +2088,65 @@ public class CashuApplet extends Applet implements TagSwitch {
         }
     }
 
-    /** Opening k let go: its piece is on the card, and the number is free for another payment's change. */
+    /** Opening k let go: its piece is on the card (or, 1.22, it was given up, `processLetGo`), and the number is free for another payment's change. */
     private void letGo(short k) {
         openState[k] = OPEN_EMPTY;
+    }
+
+    /**
+     * RESET_CARD's other form (1.22): P1 = 1, P2 = the number of one opening of change (0 to 7, as GET_CHANGE gives it), and the
+     * data ending in that number again. That opening is let go with its piece never loaded: the change it was for is given up,
+     * and nothing owed is left to keep the card from being reset (RESET_CARD) or written again (SET_CARD, SET_PIN, the PIN form
+     * of SET_LIMIT). It is for an opening nothing can load: one a till bound to a key that is not the mint's, whose real
+     * answer the holder's phone cannot bring (LOAD_CHANGE under the PIN and the owner's grant, or the held tap, takes the mint's
+     * answer under another key, and is the way to keep the money); or change the till never took to the mint at all. The card cannot tell such an opening from one
+     * whose piece is still to come, so giving it up is the owner's choice and never the card's, and the money is gone.
+     *
+     * Who may: on a card with an owner, the owner's proof (its length, the proof, the number), over "FoxyCard/reset", the nonce
+     * the card has just given and the number, the reset's own label with a value the reset never has; on a locked card the PIN
+     * given in this tap as well, as the reset wants it. On a card with no owner (a holder with no phone, 1.22), the PIN given
+     * in this tap and the history held for in it (`TAP_READ`), as a used card's rewrites want them, and the number alone: a
+     * till handed the PIN for a payment cannot give up the card's change in the tap it was paid in, nor be paid in the tap it
+     * gave some up in (the hold keeps payments out), and a stranger with no PIN cannot at all. A reader that keeps the PIN
+     * can hold a tap of its own and give up any opening still waiting: 1.22's trust in that PIN, as for SET_PIN.
+     *
+     * Order of the refusals: `6A83` for a number past 7; with an owner, the proof (`6A91`) and `6982` on a locked card whose
+     * PIN has not been given; with none, `6A97` with no PIN, `6982` for the PIN not given, `6985` in a tap that signed a
+     * payment and `6982` in one not held for; `6700` for anything but the number after the proof (with an owner) or for
+     * anything but the number (with none); `6B00` for a number that is not P2; `6A88` for an opening that waits for nothing;
+     * `6A94` for one whose piece is on the card already, which is let go as LOAD_CHANGE lets it go. The let-go is written in
+     * the log: the tap's entry, with bit 4 of its flags (LOG_FLAG_LET_GO), in the same transaction as the opening is let go.
+     */
+    private void processLetGo(APDU apdu) {
+        byte[] buf = apdu.getBuffer();
+        short k = (short)(buf[ISO7816.OFFSET_P2] & 0xFF);
+        if (k >= CHANGE_MOST) ISOException.throwIt(SW_SLOT_OUT_OF_RANGE);
+        short dataLen = apdu.setIncomingAndReceive();
+        short at = ISO7816.OFFSET_CDATA;
+        if (ownerSet[0] == (byte) 1) {
+            at = requireOwnerProof(LABEL_RESET, buf, dataLen);
+            if (cardLocked[0] == (byte) 1 && pinVerifiedFlag[0] != (byte) 1) {
+                ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
+            }
+        } else {
+            if (pinState[0] == (byte) 0) ISOException.throwIt(SW_PIN_FIRST);
+            requirePinSetAndVerified();
+            if ((tapOpen[2] & TAP_PAID) != 0) ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+            if ((tapOpen[2] & TAP_READ) == 0) ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
+        }
+        if ((short)(ISO7816.OFFSET_CDATA + dataLen) != (short)(at + 1)) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
+        if (buf[at] != buf[ISO7816.OFFSET_P2]) ISOException.throwIt(ISO7816.SW_WRONG_P1P2);
+        if (openState[k] != OPEN_PENDING) ISOException.throwIt(SW_SLOT_EMPTY);
+        if (slotWithNonce(changeOpen, (short)(k * OPEN_LEN + OPEN_NONCE)) >= 0) {
+            letGo(k);
+            ISOException.throwIt(SW_PIECE_ON_CARD);
+        }
+        JCSystem.beginTransaction();
+        short entry = logEntry();
+        cardLog[(short)(entry + LOG_E_FLAGS)] |= LOG_FLAG_LET_GO;
+        letGo(k);
+        JCSystem.commitTransaction();
+        tapOpen[0] = (byte) 1;
     }
 
     /**
@@ -2651,14 +2712,28 @@ public class CashuApplet extends Applet implements TagSwitch {
      * Who may: anyone, with no PIN, in any tap, on a locked card or a blocked one. The proof shows that C_ was made with the
      * private key of K, and K is the one the till named at the payment, under the PIN or the allowance: so the one piece that
      * can be written is the one the mint signed for this opening, and a reader that writes it gives the card what it was owed.
-     * A key made up after the payment is refused, whoever brings it: a proof holds for any key whose private key its maker
-     * knows, so without the binding a stranger could have the card write a piece the mint never made and let the opening go,
-     * and the change was lost. Receiving change changes no setting, so a lock does not refuse it.
+     * A key made up after the payment is refused, whoever brings it without the PIN: a proof holds for any key whose private
+     * key its maker knows, so without the binding a stranger could have the card write a piece the mint never made and let the
+     * opening go, and the change was lost. Receiving change changes no setting, so a lock does not refuse it.
+     *
+     * One exception (1.22): a K other than the bound one is taken under the PIN given in this tap, in a tap that has signed no
+     * payment, and with the holder's own say in it: on a card with an owner the owner's grant (ALLOW_LOAD), on one with none
+     * the history held for (TAP_READ), the gate a used card's rewrites have; and the proof is checked under the K given. A till
+     * that bound the opening to a key that is not the mint's (its own, or nonsense) has made change the mint's real answer
+     * cannot fit, and up to 1.21 nothing could ever load it, and the change owed kept the card from being reset or written
+     * again. The holder's phone brings the mint's answer under the real key. A stranger's reader has no PIN; a till handed the
+     * PIN has no owner's grant, and on a card with no owner a held tap keeps every payment out of the rest of that time in the
+     * field, so no till can mend the change of an earlier payment with a key of its own and be paid in the same tap. The proof
+     * still makes the piece a signature under the key the reader names: if that is not the mint's, the piece is one the mint
+     * will not take, of the holder's own change. On a card with no owner a reader that keeps the PIN can hold a tap of its own
+     * and do that to any opening still waiting, as it can give one up (RESET_CARD's let-go): 1.22's trust in that PIN.
      *
      * In order: `6A97` with no PIN; `6A83` for a P1 past the last opening; `6A88` for an opening that is not waiting for its
      * piece; `6A94` for one whose piece is on the card already (the opening is let go); `6A84` with no place free; `6700` for
-     * any length but 194; `6A80` for a K that is not the one the opening was bound to, a point that is none, or a proof that
-     * does not hold. Nothing is written before the piece itself.
+     * any length but 194; `6A80` for a K not in the 04 form, or one that is not the one the opening was bound to with the PIN
+     * not given in this tap; for another K, `6985` in a tap that signed a payment and `6982` with no owner's grant (with an
+     * owner) or no held history (with none); `6A80` for a point that is none or a proof that does not hold. Nothing is
+     * written before the piece itself.
      *
      * Its working room is allSlots (the field's room for B_'s y, then B_ whole), scratch (the scalars, a point at a time, the
      * hash's text) and allOut (C, compressed). No payment is in hand: this command has given it up (`process`).
@@ -2679,12 +2754,23 @@ public class CashuApplet extends Applet implements TagSwitch {
         if (apdu.setIncomingAndReceive() != LOAD_CHANGE_LEN) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         short in = ISO7816.OFFSET_CDATA;
         /* The key the opening was bound to, and no other: 04 || x || y given, the prefix of y's parity and x kept. (An opening
-         * is PENDING only after SPEND_ALL_CHANGE, which keeps its key or refuses, so `openKeys` is there.) */
+         * is PENDING only after SPEND_ALL_CHANGE, which keeps its key or refuses, so `openKeys` is there.) Another key only
+         * under the PIN given in this tap, in a tap that has signed no payment, with the owner's grant or (no owner) the held
+         * history in it (1.22): the holder's own phone mending an
+         * opening a till bound to a key that is not the mint's, with the mint's answer under its real key. The proof is
+         * checked under the key given, as it is under the bound one, so the piece is still a signature under that key. */
         short key = (short)(k * KEY_LEN);
-        if (buf[(short)(in + LC_K)] != (byte) 0x04
-            || openKeys[key] != (byte)(0x02 | (buf[(short)(in + LC_K + 64)] & 1))
+        if (buf[(short)(in + LC_K)] != (byte) 0x04) ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+        if (openKeys[key] != (byte)(0x02 | (buf[(short)(in + LC_K + 64)] & 1))
             || !sameBytes(openKeys, (short)(key + 1), buf, (short)(in + LC_K + 1), (short) 32)) {
-            ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+            if (pinState[0] != (byte) 1 || pinVerifiedFlag[0] != (byte) 1) ISOException.throwIt(ISO7816.SW_WRONG_DATA);
+            if ((tapOpen[2] & TAP_PAID) != 0) ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
+            /* and the holder's own: the PIN is a till's too, so it is not enough to reach the change of an earlier payment.
+             * With an owner, the owner's grant (ALLOW_LOAD) in this tap; with none, the history held for in it (TAP_READ),
+             * as a used card's rewrites want it, which also keeps any payment out of the rest of the time in the field. */
+            if (ownerSet[0] == (byte) 1 ? loadGrant[0] != (byte) 1 : (tapOpen[2] & TAP_READ) == 0) {
+                ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
+            }
         }
         try {
             unblind(buf, in, open);
@@ -3746,6 +3832,8 @@ public class CashuApplet extends Applet implements TagSwitch {
      * tag on (1.19). It keeps its clock (the time and the header hash it was shown;
      * the ratchet's bits go to nothing, as SET_CARD does) and its software.
      *
+     * P1 = 1 is another form, which lets one opening of change go and resets nothing (`processLetGo`, 1.22).
+     *
      * Order of the refusals: `6B00` for the P1 and P2; `6A90` with no owner; the
      * proof (`6A91`; `6700` for anything after it); `6982` on a LOCKED card whose
      * PIN has not been verified in this tap (a locked card resets for the owner's
@@ -3767,6 +3855,7 @@ public class CashuApplet extends Applet implements TagSwitch {
      */
     private void processResetCard(APDU apdu) {
         byte[] buf = apdu.getBuffer();
+        if (buf[ISO7816.OFFSET_P1] == RESET_LET_GO) { processLetGo(apdu); return; }
         if (buf[ISO7816.OFFSET_P1] != (byte) 0 || buf[ISO7816.OFFSET_P2] != RESET_CONFIRM_BYTE) {
             ISOException.throwIt(ISO7816.SW_WRONG_P1P2);
         }
@@ -4001,7 +4090,8 @@ public class CashuApplet extends Applet implements TagSwitch {
      * `6A8D` if anything unspent is on the card, or any change is owed to it (1.21): for SET_CARD and RESET_CARD, which
      * would move the refund key and the mint from under change still to come, or throw away the blinding factor it can be
      * written back with. An opening whose piece is on the card already, its letting go torn off, is let go here, as
-     * GET_CHANGE does it, and owes nothing.
+     * GET_CHANGE does it, and owes nothing. An opening nothing can load is given up by RESET_CARD's let-go form (1.22), the
+     * owner's choice or, on a card with no owner, the PIN's in a held tap, and then owes nothing either.
      */
     private void requireNothingOwed() {
         requireNothingUnspent();
@@ -4312,6 +4402,6 @@ public class CashuApplet extends Applet implements TagSwitch {
      * take away.
      */
     private static void sizeTheFile(byte[] a) {
-        // no lines at present: the 1.22 build of 21,219 bytes (227 past a multiple of 256) is a size not yet tried on the chip, and 1.21 installed at 21,109 (117 past); the 1.20 build of 19,634 bytes (178 past) installs, as a 1.19 build of 19,269 (69 past) did; 1.16 installs at 203 past a multiple of 256 (and 249), and not at 139, 164 or 176
+        // no lines at present: the 1.22 build of 21,705 bytes (201 past a multiple of 256) is a size not yet tried on the chip, and 1.21 installed at 21,109 (117 past); the 1.20 build of 19,634 bytes (178 past) installs, as a 1.19 build of 19,269 (69 past) did; 1.16 installs at 203 past a multiple of 256 (and 249), and not at 139, 164 or 176
     }
 }

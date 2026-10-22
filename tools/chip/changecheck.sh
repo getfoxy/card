@@ -1,7 +1,8 @@
 #!/bin/sh
 # Software 1.21 and 1.22 checked on the card itself (see ChangeCheck.java): a PIN first, a card set up and loaded with no owner and
 # its history read as a guest (the ten askings timed), the owner's claim (timed), a payment that makes change for the card, and
-# that change loaded in the next tap with no PIN by LOAD_CHANGE (timed), the card unblinding it itself.
+# that change loaded in the next tap with no PIN by LOAD_CHANGE (timed), the card unblinding it itself; and an opening bound by a
+# till to a key of its own, mended under the PIN and the owner's grant (timed) or given up by RESET_CARD's let-go form (1.22).
 # It refuses a card that is not blank, and ends with the card blank.
 #
 #   sh tools/chip/changecheck.sh                    the card in the reader (PC/SC)

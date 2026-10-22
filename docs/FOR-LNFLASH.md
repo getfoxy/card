@@ -373,7 +373,12 @@ from them:
    the mint's key for it; LOAD_CHANGE refuses any other key, checks the mint's proof and takes the blinding factor off
    on the card. The factor never leaves the card, so a reader in the next tap can load the real change and nothing else,
    and no grant is needed for it.
-3. **A reset, or a new record, waits until no change is owed.**
+3. **A reset, or a new record, waits until no change is owed**, and nothing owed can strand the card (1.22). A till
+   can bind an opening to a key that is not the mint's, and then the mint's real answer can never be loaded under the
+   bound key. Two ways out: LOAD_CHANGE takes the mint's answer under another key when the PIN was given in the tap,
+   the tap paid nothing, and the owner's grant (on a card with no owner, the held history) is in it (the proof is
+   still checked, under the key given; the PIN alone is a till's too), and the owner's proof (or, on a card
+   with no owner, the PIN in a held tap) gives one opening up by number, its money gone, written in the log.
 4. **An owner claimed in a tap of its own**, under the PIN, never in a tap that paid, after a held count of askings
    answered with a status word that is not `9000`.
 5. **A no-PIN allowance counted on the whole of what is spent and refilled by the PIN**, not by a clock.

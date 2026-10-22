@@ -20,7 +20,7 @@ import java.util.Arrays;
 /**
  * Software 1.21 and 1.22 on the chip: a PIN first, a card set up and loaded with no owner (a holder with no phone) and its history
  * read as a guest, the owner's claim, the card's own change unblinded on the card (LOAD_CHANGE) and the tap after a payment that
- * loads that change and nothing else. What jCardSim cannot say is how long the card's own work takes, and the three figures this
+ * loads that change and nothing else, and an opening a till bound to a key of its own, mended under the PIN or given up (1.22). What jCardSim cannot say is how long the card's own work takes, and the three figures this
  * run is for are printed: how long the guest's held read of the history takes from its first asking to the log, how long a claim
  * takes from its first asking to the owner set, and how long one LOAD_CHANGE takes (two RSA operations, two key agreements and
  * three generic mappings, and the hex of four points).
@@ -37,7 +37,16 @@ import java.util.Arrays;
  *   a new tap with no PIN: GET_INFO byte 29 is 0, LOAD_PROOF and CLEAR_SPENT are 6982; LOAD_CHANGE with a proof that does not
  *   hold is 6A80; the two openings' change by LOAD_CHANGE, with no PIN (each timed), the piece's C checked here against the mint's
  *   own signature on the opening's secret; GET_DLEQ for it reads 00;
- *   the next tap: nothing more to load with no PIN; then the change paid off, the places freed and the card reset.
+ *   1.22, an opening bound by a till to a key of its own: on the card with no owner, a piece, a payment whose change is bound to
+ *   the till's key; the let-go (RESET_CARD, P1 = 1) 6985 in that tap and 6982 with the PIN and no hold, as LOAD_CHANGE under
+ *   another key is; the history held for;
+ *   SET_PIN 6A8D with change owed; the let-go with a number not P2 6B00, then under the PIN and the hold; the log's bit 4;
+ *   and, on the card with an owner after its change is loaded, a payment whose first change is bound to the till's key:
+ *   LOAD_CHANGE of the mint's real answer 6985 in the paying tap, 6A80 with no PIN and 6982 under the PIN alone; under the PIN
+ *   and the owner's grant a spoiled proof 6A80 and
+ *   the real answer taken (timed), its C the mint's; RESET_CARD 6A8D with the second opening owed; its let-go by the PIN alone
+ *   and by another key 6A91, for another number 6B00, then by the owner's proof; the log's bit 4;
+ *   then the change paid off, the places freed and the card reset.
  *
  * This run is its own mint: it makes up a key k, signs the card's blinded messages with it (C_ = k*B_) and proves it (NUT-12), so
  * the change it writes is real to this run and to nobody else; the card cannot tell a mint's key from another, which is what the
@@ -153,6 +162,38 @@ public final class ChangeCheck {
         say("and the tenth answers the log", sw(send(0xB0, 0x18, 0, 0, null, 0)) == 0x9000);
         say("CLEAR_SPENT under the PIN, with no owner, frees the place", Arrays.equals(data(send(0xB0, 0x31, 0, 0, null, 1), 0x9000), new byte[] { 1 }));
 
+        // an opening of change a till bound to a key of its own, given up on a card with no owner under the PIN and a hold (1.22)
+        BigInteger till = new BigInteger(1, sha256("a till's own key".getBytes(StandardCharsets.US_ASCII))).mod(N);
+        retapWithPin();
+        say("a piece of 8 goes on under the PIN", Arrays.equals(data(send(0xB0, 0x30, 0, 0, piece(8, 22), 0), 0x9000), new byte[] { 0 }));
+        say("SPEND_ALL_BEGIN of it", sw(send(0xB0, 0x22, 0, 0, new byte[] { 0 }, 4)) == 0x9000);
+        say("change of 3, under a key the till made up", sw(send(0xB0, 0x26, 0, 0, cat(u32(3), compressed(mul(till, G))), 33)) == 0x9000);
+        say("the payment is signed", sign() != null);
+        say("RESET_CARD's let-go form in the tap that paid is 6985", sw(send(0xB0, 0x51, 1, 0, new byte[] { 0 }, -1)) == 0x6985);
+        retapWithPin();
+        say("the let-go under the PIN, no hold: 6982", sw(send(0xB0, 0x51, 1, 0, new byte[] { 0 }, -1)) == 0x6982);
+        byte[] owedHere = data(send(0xB0, 0x19, 0, 0, null, 0), 0x9000);
+        BigInteger mintHere = new BigInteger(1, sha256("a mint made up for one run".getBytes(StandardCharsets.US_ASCII))).mod(N);
+        byte[] answerHere = mintAnswer(mintHere, Arrays.copyOfRange(owedHere, 1, 84), BigInteger.valueOf(17));
+        say("LOAD_CHANGE under another key, the PIN and no hold: 6982", sw(send(0xB0, 0x53, 0, 0, answerHere, 83)) == 0x6982);
+        int holds = 0;
+        byte[] logged = null;
+        for (int asked = 1; asked <= 10; asked++) {
+            byte[] r = send(0xB0, 0x18, 0, 0, null, 0);
+            if (sw(r) == 0x6A98 && r.length == 2) { holds++; continue; }
+            logged = r;
+            break;
+        }
+        say("the history held for", holds == 9 && logged != null && sw(logged) == 0x9000);
+        say("SET_PIN with change owed is 6A8D", sw(send(0xB0, 0x41, 0, 0, PIN, -1)) == 0x6A8D);
+        say("the let-go of opening 0 with another number in the data is 6B00", sw(send(0xB0, 0x51, 1, 0, new byte[] { 1 }, -1)) == 0x6B00);
+        say("the let-go of opening 0, under the PIN and the hold", sw(send(0xB0, 0x51, 1, 0, new byte[] { 0 }, -1)) == 0x9000);
+        byte[] none = data(send(0xB0, 0x19, 0, 0, null, 0), 0x9000);
+        say("no opening is left", none != null && none.length == 1 && none[0] == 0);
+        byte[] flagged = data(send(0xB0, 0x18, 0, 0, null, 0), 0x9000);
+        say("the log's newest tap has bit 4 of its flags: an opening let go", flagged != null && flagged.length >= 36 && (flagged[26] & 0x10) != 0);
+        say("CLEAR_SPENT frees the place", Arrays.equals(data(send(0xB0, 0x31, 0, 0, null, 1), 0x9000), new byte[] { 1 }));
+
         // a new tap, set up as a phone sets a card up
         link.retap();
         say("selected again in a new tap", sw(select()) == 0x9000);
@@ -253,11 +294,53 @@ public final class ChangeCheck {
         byte[] left = data(send(0xB0, 0x19, 0, 0, null, 0), 0x9000);
         say("no opening is left", left != null && left.length == 1 && left[0] == 0);
 
+        // an opening a till bound to its own key (1.22): mended under the PIN with the mint's real answer, and another given up by the owner
+        retapWithPin();
+        say("SPEND_ALL_BEGIN of the 30", sw(send(0xB0, 0x22, 0, 0, new byte[] { 1 }, 4)) == 0x9000);
+        byte[] poisoned = data(send(0xB0, 0x26, 0, 0, cat(u32(10), compressed(mul(till, G))), 33), 0x9000);
+        say("change of 10 under the till's own key", poisoned != null && poisoned.length == 33);
+        say("change of 5 under the mint's", sw(send(0xB0, 0x26, 0, 0, cat(u32(5), mintKey), 33)) == 0x9000);
+        say("the payment is signed", sign() != null);
+        byte[] owed = data(send(0xB0, 0x19, 0, 0, null, 0), 0x9000);
+        say("GET_CHANGE: two openings, the first bound to the till's key", owed != null && owed.length == 167 && owed[0] == 2
+            && Arrays.equals(Arrays.copyOfRange(owed, 51, 84), compressed(mul(till, G))));
+        byte[][] stuck = { Arrays.copyOfRange(owed, 1, 84), Arrays.copyOfRange(owed, 84, 167) };
+        byte[] real = mintAnswer(k, stuck[0], BigInteger.valueOf(13));
+        say("LOAD_CHANGE of the mint's real answer in the tap that paid is 6985", sw(send(0xB0, 0x53, stuck[0][0], 0, real, 83)) == 0x6985);
+        link.retap();
+        say("selected in a stranger's tap", sw(select()) == 0x9000);
+        say("LOAD_CHANGE of the mint's real answer with no PIN is 6A80: not the bound key", sw(send(0xB0, 0x53, stuck[0][0], 0, real, 83)) == 0x6A80);
+        retapWithPin();
+        say("LOAD_CHANGE of the mint's real answer under the PIN alone is 6982: the owner's grant is wanted as well", sw(send(0xB0, 0x53, stuck[0][0], 0, real, 83)) == 0x6982);
+        say("the owner's grant for this tap", sw(send(0xB0, 0x45, 0, 0, ownerData(owner, "FoxyCard/load", new byte[0]), -1)) == 0x9000);
+        byte[] spoiled = real.clone();
+        spoiled[193] ^= 1;
+        say("LOAD_CHANGE under the PIN and the grant, the real key and a proof that does not hold, is 6A80", sw(send(0xB0, 0x53, stuck[0][0], 0, spoiled, 83)) == 0x6A80);
+        began = System.nanoTime();
+        byte[] mended = data(send(0xB0, 0x53, stuck[0][0], 0, real, 83), 0x9000);
+        long mendMs = (System.nanoTime() - began) / 1000000;
+        say("LOAD_CHANGE under the PIN and the grant, the mint's answer under its real key: the opening mended", mended != null && mended.length == 83);
+        System.out.println("      LOAD_CHANGE under another key took " + mendMs + " ms");
+        int mendedAt = mended == null ? 3 : mended[0];
+        byte[] mendedSlot = data(send(0xB0, 0x13, mendedAt, 0, null, 0), 0x9000);
+        say("its C is the mint's signature on the opening's secret",
+            mendedSlot != null && Arrays.equals(Arrays.copyOfRange(mendedSlot, 45, 78), compressed(mul(k, hashToCurve(secret(Arrays.copyOfRange(mendedSlot, 13, 45), key))))));
+        say("RESET_CARD with the other opening owed is 6A8D", sw(send(0xB0, 0x51, 0, 0xAD, ownerData(owner, "FoxyCard/reset", new byte[0]), -1)) == 0x6A8D);
+        byte[] num = { stuck[1][0] };
+        say("the let-go by the PIN alone, on a card with an owner, is 6A91", sw(send(0xB0, 0x51, 1, num[0], num, -1)) == 0x6A91);
+        say("the let-go by another key's proof is 6A91", sw(send(0xB0, 0x51, 1, num[0], ownerData(ownerKey(), "FoxyCard/reset", num), -1)) == 0x6A91);
+        say("the let-go of another number than the proof's is 6B00", sw(send(0xB0, 0x51, 1, stuck[0][0], ownerData(owner, "FoxyCard/reset", num), -1)) == 0x6B00);
+        say("the let-go by the owner's proof over the number", sw(send(0xB0, 0x51, 1, num[0], ownerData(owner, "FoxyCard/reset", num), -1)) == 0x9000);
+        byte[] gone = data(send(0xB0, 0x19, 0, 0, null, 0), 0x9000);
+        say("no opening is left", gone != null && gone.length == 1 && gone[0] == 0);
+        byte[] flags = data(send(0xB0, 0x18, 0, 0, null, 0), 0x9000);
+        say("the log's newest tap has bit 4 of its flags", flags != null && flags.length >= 36 && (flags[26] & 0x10) != 0);
+
         // the change pays; the card is emptied and reset
         retapWithPin();
         say("the owner's grant for this tap", sw(send(0xB0, 0x45, 0, 0, ownerData(owner, "FoxyCard/load", new byte[0]), -1)) == 0x9000);
-        say("the two change pieces are paid", sw(send(0xB0, 0x22, 0, 0, new byte[] { 1, 2 }, 4)) == 0x9000 && sign() != null);
-        say("CLEAR_SPENT frees the three places", Arrays.equals(data(send(0xB0, 0x31, 0, 0, null, 1), 0x9000), new byte[] { 3 }));
+        say("the two change pieces left are paid", sw(send(0xB0, 0x22, 0, 0, new byte[] { 2, (byte) mendedAt }, 4)) == 0x9000 && sign() != null);
+        say("CLEAR_SPENT frees the four places", Arrays.equals(data(send(0xB0, 0x31, 0, 0, null, 1), 0x9000), new byte[] { 4 }));
         say("RESET_CARD by the owner's proof", sw(send(0xB0, 0x51, 0, 0xAD, ownerData(owner, "FoxyCard/reset", new byte[0]), -1)) == 0x9000);
         byte[] blank = data(send(0xB0, 0x01, 0, 0, null, 0), 0x9000);
         say("the card is blank again: no owner, no record, nothing on it, no PIN",

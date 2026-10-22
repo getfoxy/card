@@ -6724,6 +6724,7 @@ class CashuAppletTest {
         byte[] b0 = Arrays.copyOfRange(first, 17, 50), b1 = Arrays.copyOfRange(second, 17, 50);
         byte[] good = mintAnswer(b0);
         newTap();
+        assertEquals(SW_OK, allowLoad(), "the owner's grant as well: another key is then checked against its proof (1.22)");
         byte[] infoBefore = info(), statusBefore = transmit(new CommandAPDU(CLA, INS_GET_SLOT_STATUS, 0, 0, 256)).getData();
 
         byte[] badE = good.clone(); badE[130 + 31] ^= 1;
@@ -6892,6 +6893,280 @@ class CashuAppletTest {
         for (byte[] late : open) assertEquals(SW_OK, loadChange(late).getSW(), "opening " + late[0] + ", three taps on, no PIN");
         assertEquals(0, info()[29]);
         assertTrue(openings().isEmpty());
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // 1.22: an opening a till bound to a key that is not the mint's, mended or given up
+    // ---------------------------------------------------------------------------------------------
+
+    /** A made-up key's private key: a till's own, which it names at SPEND_ALL_CHANGE in place of the mint's. */
+    static final java.math.BigInteger TILL_K = new java.math.BigInteger("2718281828459045235360287471352662497757247093699959574966967627", 16);
+
+    /**
+     * A payment of the place `place`, in a tap of its own with the PIN, whose first change output is bound to the key `first`
+     * and the others to the mint's: the openings then waiting, as GET_CHANGE lists them. The paying tap is left open.
+     */
+    private List<byte[]> payWithFirstKey(int place, byte[] first, long... amounts) {
+        newTap();
+        assertEquals(SW_OK, sw(beginCommand(place)));
+        for (int i = 0; i < amounts.length; i++) assertEquals(SW_OK, change(amounts[i], i == 0 ? first : mintKey()).getSW());
+        assertEquals(SW_OK, signAll().getSW());
+        return openings();
+    }
+
+    /** RESET_CARD's let-go form (1.22): P1 = 1, P2 = the opening's number, and the data as given. */
+    static CommandAPDU letGoCommand(int opening, byte[] data) { return new CommandAPDU(CLA, INS_RESET_CARD, 1, opening, data); }
+    /** The owner's phone giving up opening k: a nonce, a proof over "FoxyCard/reset" and the number, the command. */
+    private int ownerLetGo(int k) {
+        byte[] value = { (byte) k };
+        return sw(letGoCommand(k, ownerData(ownerProof(L_RESET, OWNER, nonceBytes(), value), value)));
+    }
+    /** The let-go of a card with no owner: the number alone, under the PIN and the hold given in this tap. */
+    private int pinLetGo(int k) { return sw(letGoCommand(k, new byte[] { (byte) k })); }
+    /** The flags of the newest tap in the log. */
+    private int newestFlags() { return (int) logTap(0)[4]; }
+
+    @Test
+    @DisplayName("An opening a till bound to its own key is mended under the PIN and the owner's grant (1.22): with no PIN the mint's real answer is 6A80, as in 1.21, and nothing is written; with the PIN alone it is 6982; under the PIN and the grant given in a tap that has paid nothing, the mint's answer under its real key is taken, the proof checked under that key, and the piece is the mint's, its proof holding as a wallet checks it; in the tap that paid, another key is 6985 while the bound key's answer still goes on; and a proof that does not hold under the key named, or a key with no proof for it, is 6A80 with the PIN, nothing written")
+    void testAPoisonedOpeningIsMendedUnderThePin() throws Exception {
+        ready();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 100, 1)).getSW());
+        List<byte[]> open = payWithFirstKey(0, keyOf(TILL_K), 10, 20);
+        assertEquals(2, open.size());
+        byte[] poisoned = open.get(0), fine = open.get(1);
+        assertArrayEquals(keyOf(TILL_K), Arrays.copyOfRange(poisoned, 50, 83), "the opening is bound to the till's key");
+        byte[] b0 = Arrays.copyOfRange(poisoned, 17, 50);
+        byte[] real = mintAnswer(b0);
+        // the paying tap, the PIN given: another key is refused in it, and the bound key's answer goes on as ever
+        assertEquals(SW_CONDITIONS_NOT_SATIS, loadChange(poisoned[0], real).getSW(), "the tap that paid: no other key");
+        assertEquals(SW_OK, loadChange(fine).getSW(), "the opening bound to the mint's key, in the paying tap");
+        // a stranger's tap: no PIN, and the binding is 1.21's
+        tap();
+        byte[] statusBefore = transmit(new CommandAPDU(CLA, INS_GET_SLOT_STATUS, 0, 0, 256)).getData();
+        assertEquals(SW_WRONG_DATA, loadChange(poisoned[0], real).getSW(), "no PIN: the mint's answer is not under the bound key");
+        assertEquals(SW_CARD_IN_USE, resetCard(), "the 20 on the card and the 10 owed: no reset");
+        // the PIN alone is a till's too: no other key without the owner's grant
+        newTap();
+        assertEquals(SW_SECURITY_NOT_SATIS, loadChange(poisoned[0], real).getSW(), "the PIN and no grant: 6982");
+        // the holder's tap, with the PIN and the grant: what is not a proof under the key named is refused all the same
+        assertEquals(SW_OK, allowLoad());
+        byte[] badE = real.clone(); badE[130 + 31] ^= 1;
+        assertEquals(SW_WRONG_DATA, loadChange(poisoned[0], badE).getSW(), "the PIN, the real key, and a proof that does not hold");
+        byte[] otherKey = concat(Arrays.copyOfRange(real, 0, 65), mintKey(MINT_K.add(java.math.BigInteger.ONE)), Arrays.copyOfRange(real, 130, 194));
+        assertEquals(SW_WRONG_DATA, loadChange(poisoned[0], otherKey).getSW(), "the PIN, a key with no proof for it");
+        byte[] notAPoint = real.clone(); notAPoint[65 + 64] ^= 1;
+        assertEquals(SW_WRONG_DATA, loadChange(poisoned[0], notAPoint).getSW(), "the PIN, a key that is not on the curve");
+        byte[] notUncompressed = real.clone(); notUncompressed[65] = 2;
+        assertEquals(SW_WRONG_DATA, loadChange(poisoned[0], notUncompressed).getSW(), "the PIN, a key not in the 04 form");
+        // and a key not in the 04 form whose proof was made over the key as it is sent, so that only the form refuses it
+        java.math.BigInteger[] bPt = decompressed(b0), cPt = ecMulTest(MINT_K, bPt[0], bPt[1]);
+        java.math.BigInteger nonceP = java.math.BigInteger.valueOf(99);
+        byte[] k02 = concat(new byte[] { 2 }, Arrays.copyOfRange(mintKey(MINT_K), 1, 65));
+        byte[] e02 = sha256((toHex(point65(ecMulTest(nonceP, SECP_GX, SECP_GY))) + toHex(point65(ecMulTest(nonceP, bPt[0], bPt[1])))
+            + toHex(k02) + toHex(point65(cPt))).toLowerCase().getBytes(StandardCharsets.US_ASCII));
+        byte[] form02 = concat(point65(cPt), k02, e02, unsigned32(nonceP.add(new java.math.BigInteger(1, e02).multiply(MINT_K)).mod(SECP_N)));
+        assertEquals(SW_WRONG_DATA, loadChange(poisoned[0], form02).getSW(), "the PIN, a key in the 02 form with a proof made over that form");
+        assertArrayEquals(statusBefore, transmit(new CommandAPDU(CLA, INS_GET_SLOT_STATUS, 0, 0, 256)).getData(), "nothing written");
+        assertEquals(1, openings().size(), "and the opening still waits");
+        // and the mint's real answer, under the PIN
+        byte[] k = kept(poisoned);
+        ResponseAPDU r = loadChange(poisoned[0], real);
+        assertEquals(SW_OK, r.getSW(), "the PIN, the mint's answer under its real key: the opening is mended");
+        int place = r.getData()[0];
+        assertArrayEquals(changeC(MINT_K, k), Arrays.copyOfRange(slot(place), 45, 78), "the piece is the mint's signature on the opening's secret");
+        assertTrue(pieceIsTheMints(place));
+        byte[] held = dleqAt(place);
+        assertTrue(nut12Holds(changeSecret(k, REFUND), Arrays.copyOfRange(slot(place), 45, 78), mintKey(), Arrays.copyOfRange(held, 1, 97)), "and its proof holds as a wallet checks it, under the mint's key");
+        assertTrue(openings().isEmpty(), "nothing is owed");
+        assertEquals(0, info()[29]);
+        assertEquals(30, balance());
+    }
+
+    @Test
+    @DisplayName("Under the PIN and the owner's grant the key the phone names is the one the piece is made under (1.22): a key of the till's own with a proof that holds for it is taken with both, in a tap that paid nothing, and the piece is that key's; without the PIN the same is 6A80. The PIN's reader is trusted with the key as it is with a load")
+    void testUnderThePinTheNamedKeyIsTheOneTaken() throws Exception {
+        ready();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 100, 1)).getSW());
+        List<byte[]> open = payWithFirstKey(0, mintKey(), 10);
+        byte[] b0 = Arrays.copyOfRange(open.get(0), 17, 50);
+        byte[] made = mintAnswer(TILL_K, b0, java.math.BigInteger.TEN);
+        tap();
+        assertEquals(SW_WRONG_DATA, loadChange(0, made).getSW(), "no PIN: a key made up after the payment is refused (1.21)");
+        newTap();
+        assertEquals(SW_OK, allowLoad());
+        byte[] k = kept(open.get(0));
+        ResponseAPDU r = loadChange(0, made);
+        assertEquals(SW_OK, r.getSW(), "the PIN and the grant: the key named, with a proof that holds for it");
+        assertArrayEquals(changeC(TILL_K, k), Arrays.copyOfRange(slot(r.getData()[0]), 45, 78), "and the piece is that key's, which the mint will not take");
+        assertFalse(pieceIsTheMints(r.getData()[0]));
+    }
+
+    @Test
+    @DisplayName("The owner gives up an opening nothing can load (1.22): RESET_CARD with P1 = 1 and the opening's number in P2, and the owner's proof over \"FoxyCard/reset\", the nonce and the number; refused with another key's proof, a proof over an old nonce or none asked for (6A91), a proof over another number (6A91, or 6B00 where the number sent is not P2), data after the number (6700), an opening that waits for nothing (6A88), and the PIN alone on a card with an owner (6A91); nothing changes. Then the opening is let go, its money gone, the log's entry for the tap has bit 4 of its flags, nothing is owed, and SET_CARD and RESET_CARD go through")
+    void testTheOwnerLetsAStuckOpeningGo() throws Exception {
+        ready();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 100, 1)).getSW());
+        List<byte[]> open = payWithFirstKey(0, keyOf(TILL_K), 10, 5);
+        byte[] stuck = open.get(0);
+        int k = stuck[0], second = open.get(1)[0];
+        newTap();
+        assertEquals(SW_OK, ownerLetGo(second), "the owner may give up any opening: this one, bound to the mint's key, is its choice");
+        assertEquals(SW_CARD_IN_USE, resetCard(), "change owed: no reset");
+        assertEquals(SW_CARD_IN_USE, ownerSetCard(MINT, REFUND), "nor a record");
+        assertEquals(CashuApplet.LOG_FLAG_LET_GO, newestFlags() & 0x10, "the first let-go marked the tap");
+        byte[] value = { (byte) k };
+        assertEquals(SW_OWNER_PROOF, sw(letGoCommand(k, ownerData(ownerProof(L_RESET, OTHER_OWNER, nonceBytes(), value), value))), "another key's proof");
+        assertEquals(SW_OWNER_PROOF, sw(letGoCommand(k, ownerData(ownerProof(L_RESET, OWNER, new byte[16], value), value))), "a proof over a nonce the card did not give");
+        byte[] used = nonceBytes();
+        nonceBytes();
+        assertEquals(SW_OWNER_PROOF, sw(letGoCommand(k, ownerData(ownerProof(L_RESET, OWNER, used, value), value))), "a proof over the nonce before the last");
+        assertEquals(SW_OWNER_PROOF, sw(letGoCommand(k, ownerData(ownerProof(L_RESET, OWNER, used, value), value))), "and with no nonce asked for");
+        assertEquals(SW_OWNER_PROOF, sw(letGoCommand(k, ownerData(ownerProof(L_LOCK, OWNER, nonceBytes(), value), value))), "another command's label");
+        assertEquals(SW_OWNER_PROOF, sw(letGoCommand(k, ownerData(ownerProof(L_RESET, OWNER, nonceBytes(), new byte[] { (byte)(k + 1) }), value))), "a proof over another number");
+        byte[] other = { (byte) second };
+        assertEquals(0x6B00, sw(letGoCommand(k, ownerData(ownerProof(L_RESET, OWNER, nonceBytes(), other), other))), "a good proof for another number than P2");
+        assertEquals(SW_SLOT_EMPTY, sw(letGoCommand(second, ownerData(ownerProof(L_RESET, OWNER, nonceBytes(), other), other))), "an opening that waits for nothing: the one given up");
+        assertEquals(SW_WRONG_LENGTH, sw(letGoCommand(k, ownerData(ownerProof(L_RESET, OWNER, nonceBytes(), concat(value, value)), concat(value, value)))), "a byte after the number");
+        assertEquals(SW_WRONG_LENGTH, sw(letGoCommand(k, ownerData(ownerProof(L_RESET, OWNER, nonceBytes(), new byte[0]), new byte[0]))), "no number");
+        assertEquals(SW_OWNER_PROOF, pinLetGo(k), "the PIN alone, on a card with an owner");
+        assertEquals(SW_OWNER_PROOF, sw(letGoCommand(k, new byte[0])), "nothing at all");
+        assertEquals(1, openings().size(), "none of it let anything go");
+        assertEquals(1, info()[29]);
+        long tapsBefore = logTaps();
+        // the owner's proof
+        assertEquals(SW_OK, ownerLetGo(k), "the owner's proof over the number");
+        assertTrue(openings().isEmpty(), "the opening is let go");
+        assertEquals(0, info()[29], "nothing is owed");
+        assertEquals(0, balance(), "and its money is gone: the 10 and the 5 never came");
+        assertEquals(tapsBefore, logTaps(), "the tap that let them go is one entry in the log, begun by the first");
+        assertEquals(CashuApplet.LOG_FLAG_LET_GO, newestFlags() & 0x10, "with bit 4 of its flags");
+        assertEquals(0x10, CashuApplet.LOG_FLAG_LET_GO);
+        assertEquals(SW_SLOT_EMPTY, ownerLetGo(k), "given up once");
+        assertEquals(SW_SLOT_EMPTY, loadChange(k, mintAnswer(Arrays.copyOfRange(stuck, 17, 50))).getSW(), "and nothing loads it after");
+        // the card is the owner's to write and reset again
+        assertEquals(SW_OK, ownerSetCard(MINT, REFUND), "SET_CARD");
+        assertEquals(SW_OK, clearSpent());
+        assertEquals(SW_OK, resetCard(), "RESET_CARD");
+        assertEquals(0, info()[16]);
+    }
+
+    @Test
+    @DisplayName("The let-go on a locked card wants the PIN as the reset does (6982 without it); an opening whose piece is on the card already is let go with 6A94 and nothing written in the log; a let-go in a tap that paid is the owner's to make")
+    void testTheLetGoOnALockedCardAndATornOne() throws Exception {
+        ready();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 100, 1)).getSW());
+        List<byte[]> open = payWithFirstKey(0, keyOf(TILL_K), 10, 20);
+        int stuck = open.get(0)[0], fine = open.get(1)[0];
+        assertEquals(SW_OK, loadChange(open.get(1)).getSW());
+        // torn after the piece was written and before the opening was let go
+        field("openState")[fine] = 2;
+        long tapsBefore = logTaps();
+        assertEquals(SW_PIECE_ON_CARD, ownerLetGo(fine), "its piece is on the card already");
+        assertEquals(0, field("openState")[fine], "and the opening is let go");
+        assertEquals(tapsBefore, logTaps(), "with nothing written in the log: nothing was given up");
+        assertEquals(SW_OK, lock());
+        tap();
+        assertEquals(SW_SECURITY_NOT_SATIS, ownerLetGo(stuck), "a locked card, the PIN not given");
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_OK, ownerLetGo(stuck), "and with it");
+        assertTrue(openings().isEmpty());
+    }
+
+    @Test
+    @DisplayName("On a card with no owner (a holder with no phone, 1.22) the let-go is the PIN's in a held tap: the number alone, under the PIN given in this tap and the history held for in it; refused with no PIN (6982), in the tap that paid (6985), in a tap with the PIN and no hold (6982), with a number that is not P2 (6B00), with an owner's proof in front (6700), for an opening that waits for nothing (6A88). Then the opening is let go, the log marks it, and the record and the PIN may be written again")
+    void testAPhonelessCardLetsGoUnderThePinAndTheHold() throws Exception {
+        phoneless();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 100, 1)).getSW());
+        List<byte[]> open = payWithFirstKey(0, keyOf(TILL_K), 10);
+        int k = open.get(0)[0];
+        assertEquals(SW_CONDITIONS_NOT_SATIS, pinLetGo(k), "the tap that paid: a till handed the PIN gives up nothing");
+        tap();
+        assertEquals(SW_SECURITY_NOT_SATIS, pinLetGo(k), "no PIN");
+        assertEquals(SW_NO_OWNER, sw(new CommandAPDU(CLA, INS_GET_NONCE, 0, 0, 16)), "and no owner's proof to give");
+        newTap();
+        assertEquals(SW_SECURITY_NOT_SATIS, pinLetGo(k), "the PIN and no hold");
+        assertEquals(SW_OK, heldHistory(0).getSW());
+        reselect();
+        assertEquals(SW_SECURITY_NOT_SATIS, pinLetGo(k), "the hold kept through a SELECT, and the PIN, which is not, not given again");
+        assertEquals(SW_OK, verify(TEST_PIN));
+        assertEquals(SW_CARD_IN_USE, sw(setCardOpenCommand(record(MINT, NO_REFUND, "FX2"))), "change owed: no record, held tap or not");
+        assertEquals(SW_CARD_IN_USE, setPin(NEW_PIN), "nor a PIN");
+        assertEquals(0x6B00, sw(letGoCommand(k, new byte[] { (byte)(k + 1) })), "a number that is not P2");
+        assertEquals(SW_WRONG_LENGTH, sw(letGoCommand(k, ownerData(new byte[8], new byte[] { (byte) k }))), "an owner's proof in front: there is no owner");
+        assertEquals(SW_WRONG_LENGTH, sw(letGoCommand(k, new byte[0])), "no number");
+        assertEquals(SW_SLOT_EMPTY, pinLetGo(k + 1), "an opening that waits for nothing");
+        assertEquals(1, openings().size());
+        assertEquals(SW_OK, pinLetGo(k), "the PIN and the hold");
+        assertTrue(openings().isEmpty());
+        assertEquals(0, info()[29]);
+        assertEquals(CashuApplet.LOG_FLAG_LET_GO, newestFlags() & 0x10, "the log marks the tap");
+        assertEquals(SW_OK, sw(setCardOpenCommand(record(MINT, NO_REFUND, "FX2"))), "the record, in the same held tap");
+        assertEquals(SW_OK, setPin(NEW_PIN), "and the PIN");
+        assertEquals(0, info()[16], "no owner");
+    }
+
+    @Test
+    @DisplayName("The PIN alone mends nothing (1.22): on a card with an owner, a till handed the PIN cannot bind an earlier payment's opening to a key of its own and be paid in the same tap (6982 with no owner's grant), nor in a tap it cut and began again, and the opening still waits for the mint's real answer under the bound key")
+    void testAnEarlierOpeningIsNotSpoiledUnderThePinAlone() throws Exception {
+        ready();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 100, 1)).getSW());
+        assertEquals(SW_OK, load(buildProof(KEYSET, 50, 2)).getSW());
+        List<byte[]> open = payWithFirstKey(0, mintKey(), 10);       // an honest till; the change not yet brought
+        byte[] b0 = Arrays.copyOfRange(open.get(0), 17, 50);
+        byte[] tills = mintAnswer(TILL_K, b0, java.math.BigInteger.TEN);
+        newTap();                                                    // the next till's tap, the PIN typed for its payment
+        assertEquals(SW_SECURITY_NOT_SATIS, loadChange(open.get(0)[0], tills).getSW(), "before paying: the PIN and no grant");
+        assertEquals(SW_OK, sw(beginCommand(1)));
+        assertEquals(SW_OK, signAll().getSW(), "its payment goes on");
+        assertEquals(SW_CONDITIONS_NOT_SATIS, loadChange(open.get(0)[0], tills).getSW(), "after paying: 6985");
+        newTap();                                                    // the field cut and begun again, the PIN typed again
+        assertEquals(SW_SECURITY_NOT_SATIS, loadChange(open.get(0)[0], tills).getSW(), "a new tap, the PIN and no grant");
+        assertEquals(1, openings().size(), "the honest opening still waits");
+        ResponseAPDU r = loadChange(open.get(0));
+        assertEquals(SW_OK, r.getSW(), "and its real change loads under the bound key");
+        assertTrue(pieceIsTheMints(r.getData()[0]));
+    }
+
+    @Test
+    @DisplayName("On a card with no owner another key is the PIN's in a held tap (1.22): the PIN alone is 6982, before or after paying is no way round it (6985 after), and the hold, once given, keeps any payment out of the rest of the time in the field (6985); under the PIN and the hold the mint's real answer mends a poisoned opening")
+    void testAPhonelessCardMendsUnderThePinAndTheHold() throws Exception {
+        phoneless();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 100, 1)).getSW());
+        assertEquals(SW_OK, load(buildProof(KEYSET, 50, 2)).getSW());
+        List<byte[]> open = payWithFirstKey(0, keyOf(TILL_K), 10);   // a till bound the change to its own key
+        int k = open.get(0)[0];
+        byte[] real = mintAnswer(Arrays.copyOfRange(open.get(0), 17, 50));
+        newTap();
+        assertEquals(SW_SECURITY_NOT_SATIS, loadChange(k, real).getSW(), "the PIN and no hold");
+        assertEquals(SW_OK, heldHistory(0).getSW());
+        ResponseAPDU r = loadChange(k, real);
+        assertEquals(SW_OK, r.getSW(), "the PIN and the hold: the mint's real answer is taken");
+        assertTrue(pieceIsTheMints(r.getData()[0]));
+        assertTrue(openings().isEmpty());
+        assertEquals(SW_CONDITIONS_NOT_SATIS, sw(beginCommand(1)), "and no payment in the rest of this time in the field");
+    }
+
+    @Test
+    @DisplayName("The bound key is the bound point, its parity too (1.21): the mint's answer under -K, which has K's x and the other y, with a proof that holds for it, is 6A80 with no PIN and 6982 with the PIN and no grant, as any other key is")
+    void testTheBoundKeysParityIsChecked() throws Exception {
+        ready();
+        assertEquals(SW_OK, load(buildProof(KEYSET, 100, 1)).getSW());
+        List<byte[]> open = payWithFirstKey(0, mintKey(), 10);
+        byte[] b0 = Arrays.copyOfRange(open.get(0), 17, 50);
+        byte[] negK = mintAnswer(SECP_N.subtract(MINT_K), b0, java.math.BigInteger.TEN);
+        assertArrayEquals(Arrays.copyOfRange(mintKey(MINT_K), 1, 33), Arrays.copyOfRange(negK, 66, 98), "the same x");
+        tap();
+        assertEquals(SW_WRONG_DATA, loadChange(open.get(0)[0], negK).getSW(), "no PIN: another key");
+        newTap();
+        assertEquals(SW_SECURITY_NOT_SATIS, loadChange(open.get(0)[0], negK).getSW(), "the PIN, no grant: another key");
+        assertEquals(1, openings().size());
+    }
+
+    @Test
+    @DisplayName("The let-go of a card with no PIN and no owner is 6A97, before its opening is looked at (1.22)")
+    void testTheLetGoWithNoPin() throws Exception {
+        assertEquals(0, info()[7], "no PIN");
+        assertEquals(SW_PIN_FIRST, pinLetGo(0));
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -8843,8 +9118,10 @@ class CashuAppletTest {
         // SPEND_ALL_SIGN (the owner's phone, taking a whole card off in more than one signature, is not slowed for a second payment in the tap);
         // and nowhere else. 1.16 to 1.20 read it in loadOne (a load with neither cleared the change note) and in SET_PIN (ADD PIN), and up to
         // 1.20 in the load authority and CLEAR_SPENT; 1.21 has none of them: the grant opens no load. 1.22 reads it for the log and the
-        // receipts in one place, the history's gate (requireHistory)
-        assertEquals(5, uses, "loadGrant is set by ALLOW_LOAD and read by GET_INFO, the history's gate and SPEND_ALL_SIGN, and let go by RESET_CARD (1.17): " + uses);
+        // receipts in one place, the history's gate (requireHistory); and in LOAD_CHANGE, where with the PIN it lets another key mend an
+        // opening on a card with an owner (1.22), which loads nothing a phone can name freely: the mint's proof is checked under that key
+        assertEquals(6, uses, "loadGrant is set by ALLOW_LOAD and read by GET_INFO, the history's gate, SPEND_ALL_SIGN and LOAD_CHANGE's other key, and let go by RESET_CARD (1.17): " + uses);
+        assertTrue(body(code, "private void processLoadChange(", "private void unblind(").contains("loadGrant[0] != (byte) 1"), "LOAD_CHANGE reads it for another key only");
         assertFalse(body(code, "private void requireLoadAuthority(", "private void requireNothingUnspent(").contains("loadGrant"), "the load authority does not read it");
         assertFalse(body(code, "private void processClearSpent(", "private short freeSpent(").contains("loadGrant"), "nor CLEAR_SPENT");
         String getInfo = body(code, "private void processGetInfo(", "private void processGetPubkey(");
@@ -8861,9 +9138,11 @@ class CashuAppletTest {
         String history = body(code, "private void requireHistory(", "private boolean dayIsOver(");
         assertTrue(history.contains("if (loadGrant[0] != (byte) 1 && (receipts || pinVerifiedFlag[0] != (byte) 1)) {"), "on a card with an owner the receipts are the grant's and not the PIN's, and the log either's");
         assertFalse(getReceipts.contains("beginTransaction") || getReceipts.contains("cardReceipts[") && getReceipts.contains("cardReceipts[3] ="), "and reading them writes nothing");
-        // the log is written in three places: the spend, the refusal of one, and the putting on of pieces (a clock moved on twice in a tap was a fourth, before 1.15)
+        // the log is written in four places: the spend, the refusal of one, the putting on of pieces, and an opening of change let go
+        // unloaded (1.22) (a clock moved on twice in a tap was another, before 1.15)
         assertEquals(1, count(code, "private short logEntry("));
-        assertEquals(4, count(code, "logEntry()"), "its declaration, and the three that ask for it: the spend, the refusal and LOAD_PROOF, and nowhere else");
+        assertEquals(5, count(code, "logEntry()"), "its declaration, and the four that ask for it: the spend, the refusal, LOAD_PROOF and the let-go, and nowhere else");
+        assertTrue(body(code, "private void processLetGo(", "private void processSpendAllSign(").contains("logEntry()"), "the let-go of an opening (1.22)");
         assertTrue(body(code, "private void processSpendAllSign(", "private void processSpendAllAgain(").contains("logEntry()"));
         assertTrue(body(code, "private void refuseOverLimit(", "private void processGetLog(").contains("logEntry()"));
         assertTrue(body(code, "private void processLoadProof(", "private short emptySlot(").contains("logEntry()"));
@@ -8925,7 +9204,7 @@ class CashuAppletTest {
         assertTrue(signing.indexOf("requireAllowanceOrPin()") < signing.indexOf("requireUnderLimits("), "before the limits: a reader that has not the PIN writes nothing in the log");
         assertTrue(signing.indexOf("requireAllowanceOrPin()") < signing.indexOf("if (waits > 0) {"), "and before the wait: a wait is not given to a terminal that has not the PIN");
         assertTrue(signing.lastIndexOf("requireAllowanceOrPin()") < signing.indexOf("short sigLen = schnorrHW.sign("), "and the last stands before the signature");
-        String load = body(code, "private void processLoadProof(", "private void processClearSpent(");
+        String load = body(code, "private void processLoadProof(", "private void processLoadChange(") + body(code, "private void unblind(", "private void processClearSpent(");
         assertTrue(load.indexOf("requireLoadAuthority()") < load.indexOf("SW_NO_CARD_RECORD")
             && load.indexOf("SW_NO_CARD_RECORD") < load.indexOf("SW_NO_SPACE"), "load: the PIN, a record, a place free");
         assertFalse(load.contains("SW_NO_OWNER") || load.contains("ownerSet"), "and no owner (1.22): a card with no owner is loaded under its PIN");
@@ -11257,7 +11536,8 @@ class CashuAppletTest {
         say(out, "the PIN", "exact", SW_OK, verifyOk);
         byte[] resetNonce = sayNonce(out);
         say(out, "RESET_CARD without its byte", "exact", 0x6B00, new CommandAPDU(CLA, INS_RESET_CARD, 0, 0, ownerData(ownerProof(L_RESET, OWNER, resetNonce, new byte[0]), new byte[0])));
-        say(out, "RESET_CARD with P1 = 1", "exact", 0x6B00, new CommandAPDU(CLA, INS_RESET_CARD, 1, RESET_CONFIRM, ownerData(ownerProof(L_RESET, OWNER, resetNonce, new byte[0]), new byte[0])));
+        say(out, "RESET_CARD with P1 = 2", "exact", 0x6B00, new CommandAPDU(CLA, INS_RESET_CARD, 2, RESET_CONFIRM, ownerData(ownerProof(L_RESET, OWNER, resetNonce, new byte[0]), new byte[0])));
+        say(out, "RESET_CARD with P1 = 1, the let-go form (1.22), for an opening past the last: 6A83, the nonce left", "exact", SW_SLOT_OUT_OF_RANGE, new CommandAPDU(CLA, INS_RESET_CARD, 1, RESET_CONFIRM, ownerData(ownerProof(L_RESET, OWNER, resetNonce, new byte[] { (byte) 0xAD }), new byte[] { (byte) 0xAD })));
         say(out, "RESET_CARD with no proof asked for", "exact", SW_OWNER_PROOF, resetCommand(new byte[8]));
         owner(out, "RESET_CARD with LOCK_CARD's proof", SW_OWNER_PROOF, L_LOCK, OWNER, new byte[0], p -> resetCommand(p));
         owner(out, "RESET_CARD with a proof for a value", SW_WRONG_LENGTH, L_RESET, OWNER, new byte[] { 1 },
@@ -11326,6 +11606,53 @@ class CashuAppletTest {
         say(out, "a piece loads", "exact", SW_OK, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 16, 1), 1));
         assertArrayEquals(none, say(out, "and has no mint's proof of the last owner's to be given (1.20)", "exact", SW_OK, getDleqCommand(0, 255)).getData());
         owner(out, "RESET_CARD with a piece on the card", SW_CARD_IN_USE, L_RESET, OTHER_OWNER, new byte[0], p -> resetCommand(p));
+
+        /* 1.22: an opening a till bound to a key that is not the mint's. Without the PIN the mint's real answer is refused, as in 1.21;
+         * under the PIN and the owner's grant, in a tap that paid nothing, it is taken under the mint's real key and the proof checked under that key. And
+         * the owner gives up an opening by RESET_CARD's let-go form (P1 = 1, P2 the number), so that nothing owed stops a reset. The
+         * change entries carry the nonce and the blinding factor the card drew, as the first payment's change does above. */
+        sayReset(out, "taken away and put back: a tap to pay in, the claim's tap being over");
+        say(out, "select", "exact", SW_OK, select);
+        say(out, "the PIN", "exact", SW_OK, new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, NEW_PIN));
+        int poisonAt = out.length();
+        say(out, "a payment of the 16, with change", "exact", SW_OK, beginCommand(0));
+        ResponseAPDU poisonOut = say(out, "the card's own change: 10, under a key the till made up", "exact", SW_OK, changeCommand(10, keyOf(TILL_K)));
+        say(out, "and 4, under the mint's", "exact", SW_OK, changeCommand(4, mintKey()));
+        say(out, "the signature", "sigall", SW_OK, SIGN_ALL);
+        ResponseAPDU poisonList = say(out, "the openings: the first bound to the till's key", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_CHANGE, 0, 0, 256));
+        byte[] recP = Arrays.copyOfRange(poisonList.getData(), 1, 1 + CHANGE_REC), recQ = Arrays.copyOfRange(poisonList.getData(), 1 + CHANGE_REC, 1 + 2 * CHANGE_REC);
+        assertArrayEquals(poisonOut.getData(), Arrays.copyOfRange(recP, 17, 50));
+        byte[] openP = kept(recP), openQ = kept(recQ);
+        String withP = "\"nonce\": \"" + toHex(Arrays.copyOfRange(openP, 16, 48)) + "\", \"r\": \"" + toHex(Arrays.copyOfRange(openP, 48, 80)) + "\", \"kind\": \"exact\"";
+        String withQ = "\"nonce\": \"" + toHex(Arrays.copyOfRange(openQ, 16, 48)) + "\", \"r\": \"" + toHex(Arrays.copyOfRange(openQ, 48, 80)) + "\", \"kind\": \"exact\"";
+        int p2 = out.indexOf("\"kind\": \"exact\"", out.indexOf("under a key the till made up", poisonAt));
+        out.replace(p2, p2 + "\"kind\": \"exact\"".length(), withP);
+        int q2 = out.indexOf("\"kind\": \"exact\"", out.indexOf("and 4, under the mint's", poisonAt));
+        out.replace(q2, q2 + "\"kind\": \"exact\"".length(), withQ);
+        byte[] realP = mintAnswer(Arrays.copyOfRange(recP, 17, 50));
+        say(out, "LOAD_CHANGE of the first, the mint's answer under its real key, in the tap that paid: 6985", "exact", SW_CONDITIONS_NOT_SATIS, loadChangeCommand(recP[0], realP));
+        sayReset(out, "taken away and put back: a stranger's tap");
+        say(out, "select", "exact", SW_OK, select);
+        say(out, "LOAD_CHANGE of the first, the mint's answer, with no PIN: 6A80, the key is not the one bound (1.21)", "exact", SW_WRONG_DATA, loadChangeCommand(recP[0], realP));
+        sayReset(out, "taken away and put back: the holder's tap");
+        say(out, "select", "exact", SW_OK, select);
+        say(out, "the PIN", "exact", SW_OK, new CommandAPDU(CLA, INS_VERIFY_PIN, 0, 0, NEW_PIN));
+        say(out, "LOAD_CHANGE under the PIN alone, another key: 6982, the owner's grant is wanted as well", "exact", SW_SECURITY_NOT_SATIS, loadChangeCommand(recP[0], realP));
+        owner(out, "the owner's grant, for this tap", SW_OK, L_LOAD, OTHER_OWNER, new byte[0], p -> allowLoadCommand(p));
+        byte[] badP = realP.clone(); badP[193] ^= 1;
+        say(out, "LOAD_CHANGE under the PIN and the grant, another key, a proof that does not hold: 6A80", "exact", SW_WRONG_DATA, loadChangeCommand(recP[0], badP));
+        int mended = say(out, "LOAD_CHANGE under the PIN and the grant, the mint's answer under its real key: the opening mended (1.22)", "exact", SW_OK, loadChangeCommand(recP[0], realP)).getData()[0];
+        assertArrayEquals(changeC(MINT_K, openP), Arrays.copyOfRange(slot(mended), 45, 78), "the mended piece is the mint's");
+        owner(out, "RESET_CARD with the second opening owed", SW_CARD_IN_USE, L_RESET, OTHER_OWNER, new byte[0], p -> resetCommand(p));
+        byte[] numQ = { recQ[0] };
+        owner(out, "RESET_CARD's let-go form, by another owner's key: 6A91", SW_OWNER_PROOF, L_RESET, OWNER, numQ, p -> new CommandAPDU(CLA, INS_RESET_CARD, 1, recQ[0], ownerData(p, numQ)));
+        owner(out, "RESET_CARD's let-go form (P1 = 1, P2 the number), the owner's proof over the number: the second opening given up (1.22)", SW_OK, L_RESET, OTHER_OWNER, numQ,
+            p -> new CommandAPDU(CLA, INS_RESET_CARD, 1, recQ[0], ownerData(p, numQ)));
+        say(out, "nothing owed: no openings", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_CHANGE, 0, 0, 256));
+        say(out, "the log: this tap's entry has bit 4 of its flags, an opening let go", "exact", SW_OK, getLog);
+        saySpend(out, "the mended 10 spent", SW_OK, mended);
+        say(out, "CLEAR_SPENT", "exact", SW_OK, clear);
+        owner(out, "RESET_CARD: nothing on the card, nothing owed", SW_OK, L_RESET, OTHER_OWNER, new byte[0], p -> resetCommand(p));
 
         String text = out.toString();
         text = text.substring(0, text.lastIndexOf(",\n")) + "\n]\n";
@@ -11964,7 +12291,7 @@ class CashuAppletTest {
     }
 
     @Test
-    @DisplayName("RESET_CARD is instruction 0x51, with P2 = 0xAD and P1 = 0 (6B00 for any other, before the owner is looked at and with the nonce left unspent), and the constants are the applet's")
+    @DisplayName("RESET_CARD is instruction 0x51, with P2 = 0xAD and P1 = 0 (6B00 for any other but P1 = 1, before the owner is looked at and with the nonce left unspent); P1 = 1 is the let-go form (1.22), whose P2 is an opening's number, 6A83 past 7 before the owner or the proof is looked at; and the constants are the applet's")
     void testResetCardShape() throws Exception {
         assertEquals(0x51, CashuApplet.INS_RESET_CARD);
         assertEquals((byte) 0xAD, CashuApplet.RESET_CONFIRM_BYTE);
@@ -11972,7 +12299,10 @@ class CashuAppletTest {
         for (int p2 : new int[] { 0, 0xDE, 0xAC, 0xAE, 0xFF }) {
             assertEquals(0x6B00, sw(new CommandAPDU(CLA, INS_RESET_CARD, 0, p2, new byte[8])), "no owner, P2 = " + p2);
         }
-        assertEquals(0x6B00, sw(new CommandAPDU(CLA, INS_RESET_CARD, 1, RESET_CONFIRM, new byte[8])), "no owner, P1 = 1");
+        assertEquals(0x6B00, sw(new CommandAPDU(CLA, INS_RESET_CARD, 2, RESET_CONFIRM, new byte[8])), "no owner, P1 = 2");
+        assertEquals(0x6B00, sw(new CommandAPDU(CLA, INS_RESET_CARD, 0xFF, RESET_CONFIRM, new byte[8])), "no owner, P1 = FF");
+        assertEquals(1, CashuApplet.RESET_LET_GO, "P1 = 1: the let-go form (1.22)");
+        assertEquals(SW_SLOT_OUT_OF_RANGE, sw(new CommandAPDU(CLA, INS_RESET_CARD, 1, RESET_CONFIRM, new byte[8])), "no owner, P1 = 1: the let-go form, and AD is no opening's number");
         assertEquals(SW_NO_OWNER, sw(resetCommand(new byte[8])), "and with the byte right, 6A90");
         ready();
         byte[] n = nonceBytes();
@@ -11980,7 +12310,9 @@ class CashuAppletTest {
         for (int p2 : new int[] { 0, 0xDE, 0xAC, 0xAE, 0xFF }) {
             assertEquals(0x6B00, sw(new CommandAPDU(CLA, INS_RESET_CARD, 0, p2, ownerData(proof, new byte[0]))), "P2 = " + p2);
         }
-        assertEquals(0x6B00, sw(new CommandAPDU(CLA, INS_RESET_CARD, 1, RESET_CONFIRM, ownerData(proof, new byte[0]))), "P1 = 1");
+        assertEquals(0x6B00, sw(new CommandAPDU(CLA, INS_RESET_CARD, 2, RESET_CONFIRM, ownerData(proof, new byte[0]))), "P1 = 2");
+        assertEquals(SW_SLOT_OUT_OF_RANGE, sw(new CommandAPDU(CLA, INS_RESET_CARD, 1, RESET_CONFIRM, ownerData(proof, new byte[0]))), "P1 = 1, the let-go form: AD is no opening's number");
+        assertEquals(SW_SLOT_OUT_OF_RANGE, sw(new CommandAPDU(CLA, INS_RESET_CARD, 1, 8, ownerData(proof, new byte[] { 8 }))), "nor is 8");
         assertEquals(SW_OK, sw(resetCommand(proof)), "the proof was not spent by those: it works with the right bytes");
         assertEquals(0, info()[16]);
     }
