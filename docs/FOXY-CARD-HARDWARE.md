@@ -90,6 +90,11 @@ store, took about 130 ms on the chip, and a `RESET_CARD`, which fills the
 store with zeros, about 270 ms (`tools/chip/proofstore.sh`, 27 checks, all
 held on the chip).
 
+Software 1.22 was refused at INSTALL (`6F00`) at 21,740 bytes (236 past a
+multiple of 256), and installed in about two seconds at 21,830 (70 past), with
+fifteen lines of `sizeTheFile` and nothing else changed; its chip check held
+(110 checks). Software 1.21 had installed at 21,109 (117 past).
+
 What the software does: `CashuApplet.sizeTheFile` is never called and is in
 the package for its length alone, about six bytes a line, so that a build
 can be moved to a size that is known to install; `tools/refcheck.py`, after

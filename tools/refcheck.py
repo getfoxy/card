@@ -39,6 +39,7 @@ SIZES = {
     18123: True, 18315: False, 18337: False, 18340: False, 18352: False, 18425: True, 18486: True,
     19267: True, 19269: True, 19280: True,
     19634: True, 21109: True,
+    21740: False, 21830: True,
 }
 NEAR = 8  # bytes: a size this close to one that failed is treated as that one
 PAGE = 256

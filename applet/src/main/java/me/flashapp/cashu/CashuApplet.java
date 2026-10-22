@@ -4402,6 +4402,21 @@ public class CashuApplet extends Applet implements TagSwitch {
      * take away.
      */
     private static void sizeTheFile(byte[] a) {
-        // no lines at present: the 1.22 build of 21,705 bytes (201 past a multiple of 256) is a size not yet tried on the chip, and 1.21 installed at 21,109 (117 past); the 1.20 build of 19,634 bytes (178 past) installs, as a 1.19 build of 19,269 (69 past) did; 1.16 installs at 203 past a multiple of 256 (and 249), and not at 139, 164 or 176
+        // fifteen lines, six bytes each: the 1.22 build of 21,740 bytes (236 past a multiple of 256) was refused at INSTALL (6F00); at 21,830 (70 past) it installed in two seconds, as 1.21 did at 21,109 (117 past) and 1.19 at 19,269 (69 past)
+        a[10] = (byte) 20;
+        a[11] = (byte) 21;
+        a[12] = (byte) 22;
+        a[13] = (byte) 23;
+        a[14] = (byte) 24;
+        a[15] = (byte) 25;
+        a[16] = (byte) 26;
+        a[17] = (byte) 27;
+        a[18] = (byte) 28;
+        a[19] = (byte) 29;
+        a[20] = (byte) 30;
+        a[21] = (byte) 31;
+        a[22] = (byte) 32;
+        a[23] = (byte) 33;
+        a[24] = (byte) 34;
     }
 }
