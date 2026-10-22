@@ -33,6 +33,10 @@ import java.util.Arrays;
  *   a plain piece into the freed place reads 00, and not the proof the place held before;
  *   RESET_CARD by the owner's proof (the store zeroed on the chip), and the card is blank again.
  *
+ * On software 1.23 (01 17) the same first SET_CARD reserves the book as well, the table of keysets and the three small things
+ * beside it (75 bytes, docs/FOXY-CARD-KEYSETS.md 3.6): GET_INFO with P1 = 3 says 00 for it before, 01 after, an entry for the
+ * keyset of the pieces loaded, and after RESET_CARD a book of zeros (no entry, no last unit; GET_CARD P1 = 2 answers 00).
+ *
  * It makes up an owner key of its own and uses it once; nothing is kept. It ends with the card blank and holding nothing, but it
  * refuses to begin on a card that is not blank (an owner, a record or any piece), so it cannot disturb a card in use. A run that
  * stops part way leaves test pieces on the card: install the software again (~/.foxycard/install-1.20.sh refuses a card that
@@ -101,12 +105,20 @@ public final class ProofStoreCheck {
         say("GET_DLEQ for a place there is not (128) is 6A83", sw(send(0xB0, 0x1A, 128, 0xFF, null, 0)) == 0x6A83);
 
         // set up as a phone sets a card up, the owner last (a key made here): the PIN, then the record, which is the command that reserves the store
+        boolean units = (selected[1] & 0xFF) >= 0x17;
+        byte[] book = units ? data(send(0xB0, 0x01, 3, 0, null, 0), 0x9000) : null;
+        if (units) say("1.23: GET_INFO P1 = 3 is 51 bytes, and says whether the book is there (00 on a card just installed, 01 on one set up before)", book != null && book.length == 51);
+        boolean fresh = units && book != null && book[43] == 0;
         say("SET_PIN on a card with no owner", sw(send(0xB0, 0x41, 0, 0, PIN, -1)) == 0x9000);
         say("VERIFY_PIN", sw(send(0xB0, 0x40, 0, 0, PIN, -1)) == 0x9000);
         long began = System.nanoTime();
         int setCard = sw(send(0xB0, 0x32, 0, 0, record(), -1));
-        System.out.println("      SET_CARD took " + (System.nanoTime() - began) / 1000000 + " ms (the first, which reserves 12,288 bytes after the install)");
+        System.out.println("      SET_CARD took " + (System.nanoTime() - began) / 1000000 + " ms (" + (fresh ? "the first, which reserves 12,288 bytes for the proofs, 264 for the openings' keys and 75 for the book after the install" : "the first on this install reserved the stores; this one reserves nothing") + ")");
         say("SET_CARD goes through, with or without the room for proofs", setCard == 0x9000);
+        if (units) {
+            book = data(send(0xB0, 0x01, 3, 0, null, 0), 0x9000);
+            say("1.23: the book is made by the first SET_CARD: P1 = 3 byte 43 is 01, no entry, no last unit", book != null && book[43] == 1 && book[48] == 0 && book[50] == 0);
+        }
         KeyPair owner = ownerKey();
         say("SET_OWNER, asked again while the card says not yet", claim(uncompressed(owner)));
         // a card claimed in a tap pays in the next (1.21): a new tap, the PIN again
@@ -128,6 +140,10 @@ public final class ProofStoreCheck {
         say("a proof of 96 zero bytes is 6A80", sw(send(0xB0, 0x30, 1, 0, cat(piece(4, 3), new byte[96]), 0)) == 0x6A80);
         say("P1 = 1 with the 81 bytes of a plain piece is 6700", sw(send(0xB0, 0x30, 1, 0, piece(4, 4), 0)) == 0x6700);
         say("nothing was written by either refusal: the count is two", Arrays.equals(data(send(0xB0, 0x12, 0, 0, null, 1), 0x9000), new byte[] { 2 }));
+        if (units) {
+            byte[] table = data(send(0xB0, 0x16, 2, 0, null, 0), 0x9000);
+            say("1.23: the table has the pieces' keyset, entered as the record's unit (40)", Arrays.equals(table, cat(new byte[] { 1 }, KEYSET, new byte[] { 0x40 })));
+        }
 
         // paid: the chip signs, the proofs of spent places are not given, CLEAR_SPENT frees them
         byte[] signature = pay(new int[] { 0, 1 });
@@ -154,6 +170,12 @@ public final class ProofStoreCheck {
         say("the card is blank again: no owner, no record, nothing on it, no PIN, the same software",
             blank != null && blank.length == 30 && blank[16] == 0 && blank[11] == 0 && blank[3] == 0 && blank[4] == 0 && blank[7] == 0 && blank[1] == selected[1]);
         say("and GET_DLEQ reads 00", Arrays.equals(data(send(0xB0, 0x1A, 0, 0xFF, null, 0), 0x9000), NONE));
+        if (units) {
+            book = data(send(0xB0, 0x01, 3, 0, null, 0), 0x9000);
+            say("1.23: the book after RESET_CARD: there, and zeros (no entry, no last unit, no rate)",
+                book != null && book[43] == 1 && book[48] == 0 && book[49] == 0 && book[50] == 0 && Arrays.equals(Arrays.copyOfRange(book, 44, 48), new byte[4]));
+            say("and GET_CARD P1 = 2 answers 00", Arrays.equals(data(send(0xB0, 0x16, 2, 0, null, 0), 0x9000), NONE));
+        }
 
         System.out.println(checks + " checks, " + failed + " failed.");
         return failed == 0 ? 0 : 1;
@@ -161,11 +183,15 @@ public final class ProofStoreCheck {
 
     // ---- what a phone sends -----------------------------------------------------------------------------------------------
 
-    /** SET_OWNER on a card with no owner, sent again while it answers "not yet" (9000 and 00 01), ten times at most. Whether it ended in the claim. */
+    /**
+     * SET_OWNER on a card with no owner, sent again while it answers "not yet" (1.20: 9000 and 00 01; from 1.21, 6A98, keep
+     * holding), ten times at most. Whether it ended in the claim.
+     */
     private static boolean claim(byte[] key) throws Exception {
         long began = System.nanoTime();
         for (int asked = 1; asked <= 10; asked++) {
             byte[] r = send(0xB0, 0x43, 0, 0, key, -1);
+            if (sw(r) == 0x6A98 && r.length == 2) continue;
             if (sw(r) != 0x9000) return false;
             if (r.length == 2) {
                 System.out.println("      the claim took " + asked + " asking" + (asked == 1 ? "" : "s") + ", " + (System.nanoTime() - began) / 1000000 + " ms");

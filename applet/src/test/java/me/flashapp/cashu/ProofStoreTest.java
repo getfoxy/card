@@ -733,7 +733,7 @@ class ProofStoreTest {
             f.setAccessible(true);
             if (f.get(c.runtime.appletAt(c.aid)) == null) missing.add(f.getName());
         }
-        assertEquals(new TreeSet<>(Arrays.asList("dleq", "openKeys")), missing, "every other array of the applet is made at install, the store and the openings' keys after it");
+        assertEquals(new TreeSet<>(Arrays.asList("book", "dleq", "openKeys")), missing, "every other array of the applet is made at install, the store, the openings' keys and the book (1.23) after it");
         c.setPin();
         c.pin();
         assertNull(c.store(), "a PIN does not reserve it");
@@ -760,22 +760,24 @@ class ProofStoreTest {
     }
 
     @Test
-    @DisplayName("GET_INFO is as it was but for the version: 01 14, 30 bytes for P1 = 0 (and any P1 but 1 and 2), 42 for P1 = 1, 43 for P1 = 2, byte for byte the same whether pieces came with proofs or not")
+    @DisplayName("GET_INFO is as it was but for the version: 30 bytes for P1 = 0 (and any P1 but 1, 2 and 3), 42 for P1 = 1, 43 for P1 = 2, 51 for P1 = 3 (1.23), byte for byte the same whether pieces came with proofs or not")
     void getInfoIsAsItWasButForTheVersion() throws Exception {
         Card c = new Card();
-        for (int p1 : new int[] { 0, 3, 4, 0x7F, 0xFF }) {
+        for (int p1 : new int[] { 0, 4, 0x7F, 0xFF }) {
             byte[] d = c.info(p1);
             assertEquals(30, d.length, "P1 = " + p1);
             assertEquals(1, d[0]);
-            assertEquals(0x16, d[1], "version 1.22");
+            assertEquals(0x17, d[1], "version 1.23");
             assertEquals((byte) 0xFF, d[6], "capabilities as they were");
             assertEquals(4, d[8], "format 4");
         }
         assertEquals(42, c.info(1).length);
         assertEquals(43, c.info(2).length);
+        assertEquals(51, c.info(3).length);
         assertArrayEquals(c.info(1), Arrays.copyOf(c.info(2), 42));
+        assertArrayEquals(c.info(2), Arrays.copyOf(c.info(3), 43));
         assertEquals(0, c.info(2)[42], "the tag is on");
-        assertArrayEquals(new byte[] { 0x01, 0x16 }, c.send(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR))).getData(), "SELECT says 1.22");
+        assertArrayEquals(new byte[] { 0x01, 0x17 }, c.send(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR))).getData(), "SELECT says 1.23");
         // with pieces on, the same on a card whose pieces came with proofs and one whose did not
         Card plain = new Card().ready(), proofed = new Card().ready();
         for (int i = 0; i < 4; i++) {

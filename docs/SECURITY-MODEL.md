@@ -41,6 +41,8 @@ get around it rather than through it.
 | 20 | A till that was given the PIN reads the history of a card with no owner (software 1.22) | **Not in the paying tap, and no payment in the reading tap** | On a card with a PIN and no owner (a holder with no phone) the log and the receipts are the PIN's, and held for: ten askings in a row, `6A98` to each but the last, some five seconds of the card held still. A till that saw the PIN cannot read the history in the tap it was paid in (`6985`, before any asking is counted), nor take a payment in a tap in which it read the history (`6985` to every payment command for the rest of that time in the field). With the PIN, and the card held for the seconds of a tap of its own, it can. The balance and the pieces are not held for: any reader may read them, as before, and so does what is not the history: the dates and amounts in the openings of change owed (`GET_CHANGE`), GET_INFO's bytes 21 to 28 and 38 to 41, and the places of spent pieces (`GET_PIECES`). The limit on one payment is told to the PIN in a held tap on such a card (a guest has no owner's grant to see it by), so a till that keeps the PIN learns it in a tap of its own, which signs nothing, and can ask for just under it; the hold does not stop a till that keeps the PIN, only one that is handed it for a payment, and the log does not mark a tap whose history was read. A card with an owner is as 1.21: the log to the PIN, the receipts to the owner's grant. |
 | 21 | A reader replaces the PIN of a card with no owner, or rewrites it, after it has been emptied (software 1.22) | **Closed: the PIN it has, and a hold once used** | A card with no owner can be spent to nothing, or owe change, while it holds a holder's history. Without a rule, anyone could then put a PIN of their own on it (it was open while empty, as a card that holds nothing must be), read the history, write a refund key of their own into its record, take the change it was owed and claim it. From 1.22, once the record is set, `SET_PIN` wants the PIN the card has given in the tap, nothing unspent and no change owed; a blocked PIN is replaced only with nothing owed, and the log and receipts go with it. On a card that has been used, `SET_CARD`, the PIN form of `SET_LIMIT` and `SET_PIN` also want the history held for in the tap (`6985` in a tap that paid), so a till that was handed the PIN cannot, in the tap that took the money, put its own refund key, a large no-PIN allowance or another mint on the card. Still open: a till that keeps the PIN can hold a tap of its own and rewrite the card there (as it can read the history, 20); the record it wrote is the card's record, for the holder's phone to see. |
 | 22 | A till binds the card's change to a key that is not the mint's (software 1.21; closed in 1.22) | **Closed for the strand; the change of that payment is still the holder's to bring back** | At `SPEND_ALL_CHANGE` the paying reader names the mint's key for the change, and the card keeps it with the opening; it cannot tell the key is the mint's. A till that names its own key, or nonsense, made the real change unloadable for good: the mint's answer is under the real key, `LOAD_CHANGE` refused it (`6A80`), and the change owed kept `SET_CARD` and `RESET_CARD` (and on a card with no owner `SET_PIN` and the PIN form of `SET_LIMIT`) at `6A8D` for ever. From 1.22 `LOAD_CHANGE` takes another key under the PIN given in a tap that signed no payment, with the holder's own say in the tap as well (the owner's grant, `ALLOW_LOAD`; on a card with no owner the history held for), and still checks the mint's proof under the key it is given, so the holder's phone brings the mint's real answer (NUT-09 restore, from the opening's `B_`) and the money is back; and `RESET_CARD` with P1 = 1 gives up one opening by number (the owner's proof; on a card with no owner the PIN and the history held for in the tap), so that a card whose change the till never took to the mint can be reset or written again. A stranger has no PIN and can do neither. The PIN alone is not enough, because a till has it: with the PIN alone a till could bind an earlier payment's opening, still waiting, to a key of its own and be paid in the same tap; a till has no owner's grant, and a held tap keeps every payment out of the rest of that time in the field. What remains: on a card with no owner, a reader that keeps the PIN can hold a tap of its own and load a piece under a key of its own making (with a proof that holds for it) for any opening still waiting, and so spoil the holder's change, as it can give that opening up (#20's trust in the PIN); on a card with an owner, only the owner's own phone can. It takes nothing. The piece it leaves is one the mint will not take, and a phone that checks the mint's proof (`GET_DLEQ`) against the mint's keys sees it. Giving an opening up is the owner's choice, and its money is gone. A card with no owner whose PIN is blocked cannot give an opening up, and stays as it was (#14). See below. |
+| 23 | A payment weighed at the wrong worth: the other unit used to walk round the ceiling, a rate that is stale or wrong, or a rate written by a till (software 1.23) | **One ceiling, in cents; the rate the owner's, rounded against the payer** | Every limit is in cents whatever the record's unit, and a payment in sats is turned into cents at the rate before it is held to them, so a terminal with the PIN takes one ceiling's worth in either unit and a thief has one allowance, not one a unit. The rate is written only with the limits: by the owner's proof, or on a card with no owner under the PIN while it is empty and owed nothing. The phone rounds it down and the card rounds the cents up, so a payment in sats is never counted for less than its worth at the phone's price; a quotient past four bytes is over every limit. A card with a limit and no rate refuses every payment in sats (`6A99`), never signs one unbounded, and refuses sats at the load (`6A99`), so a card with no owner, whose rate is written only while it is empty, never holds sats it cannot pay. What is left: between two reads by the owner's phone the rate does not follow the market, and a sats limit's worth in dollars moves with the price as it did on 1.22; a rate the owner's own phone writes wrong lets sats go in proportion (the phone asks before writing one more than twice or under half the card's). See below |
+| 24 | A piece put in the wrong unit, two units in one payment, or the table filled by a reader that is not the holder's (software 1.23) | **One entry a keyset, never moved; one unit a payment; two entries at most without the holder's say** | A keyset is entered once, as one unit, and is never changed in place: a piece of it labelled the other unit is refused (`6A9B`). A new keyset of the other unit than the record's, not the last payment's, needs the holder's say in the tap (`6A9D`). At most two live entries lack that say's mark, so a till with the PIN can squat on two and the holder keeps four (`6A9C`). `SPEND_ALL_BEGIN` refuses places of both units, or of no entry, before anything is hashed (`6A9A`). The card's format byte says 5 while it holds both units, so a phone of 1.22 refuses the card and never reads cents as sats. What is left: a terminal can label a piece of its own money wrongly where the tap may enter its keyset; the mint refuses it there and the phone counts it nowhere, and it is the terminal's own money. See below |
 
 ## The offline double-spend problem (#5)
 
@@ -287,6 +289,35 @@ no owner, a reader that keeps the PIN can hold a tap of its own and name a key o
 proof that holds for it, for any opening still waiting, as it can give one up; on a card with an
 owner, the owner's own phone can. It takes nothing.
 
+## Two units and the rate (#23, #24, software 1.23)
+
+A card of 1.23 holds dollars and sats at its one mint (`FOXY-CARD-KEYSETS.md`;
+`FOXY-CARD-DAILY-LIMIT.md` 8.5). Two things are new on the card, and each has a row above.
+
+**The table of keysets.** The card cannot ask a mint which unit a keyset is, so it is told,
+once, at the load that first brings the keyset (`LOAD_PROOF` with P2 = 1, or the record's
+unit for a plain load), and it keeps the answer in a table of six entries in the book the
+first `SET_CARD` reserves. The rules that keep the table honest: an entry is written before
+anything of the place, its state byte last, so that a load torn halfway leaves an entry that
+nothing names and the next reclaim frees; an entry is never changed in place and is let go
+only when no unspent place and no opening of change names it; a load of a keyset entered as
+the other unit is refused; a new keyset of the other unit needs the holder's say unless it is
+the unit of the last payment (a till's refund in the mint's new keyset); and two live entries
+at most lack that say, so the four the holder needs stay free. A payment is of one unit: the
+card refuses places of both before it hashes anything.
+
+**The rate.** Every limit is in cents. A payment in dollars is held to them as it is; one in
+sats is turned into cents with the rate, sats to the dollar, which the owner's phone writes
+with the limits, in the same transaction and under the same proof. The arithmetic is done on
+bytes, in five bytes for every product a four-byte amount can make, and its rounding is up:
+the tests hold it to `BigInteger` across thousands of values and every edge. The rate is the
+owner's phone's word, as the limits are: the card cannot judge a price, and keeps what it was
+told until it is told again. A rate of 0 with any limit set refuses every payment in sats.
+
+The rate is told to the holder (the owner's grant, or the PIN in a held tap on a card with no
+owner) and to nobody else, as the limit on one payment is: a till that knew it would know what
+a payment in sats is weighed at.
+
 ## What has and has not been tested
 
 **Verified in simulation (jCardSim) and by construction:**
@@ -295,6 +326,11 @@ owner, the owner's own phone can. It takes nothing.
 - Slot lifecycle, PIN gating, APDU encodings
 - The tag (1.19), byte for byte, the switch and its refusals, and that nothing the tag
   says differs between two cards
+- Two units on one card (1.23): the table's rules at every load, one unit a payment, the
+  cents of a payment in sats against `BigInteger`, the limits held to cents in either unit,
+  and a long random history after every step of which every unspent piece is in an entry of
+  its own unit and the counts of each unit add up; a card of one unit answering the whole
+  1.22 transcript as 1.22 did, but for the version (`UnitsTest`). Not yet on the chip
 - The mint's proof kept with a piece (1.20): given back as it was loaded, never served for
   a spent, empty or plain place, and never another piece's through any long history of
   loads, payments and clears; every refusal of the load with nothing written; no payment

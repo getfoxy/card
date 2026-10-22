@@ -48,6 +48,24 @@ import java.util.Arrays;
  *   and by another key 6A91, for another number 6B00, then by the owner's proof; the log's bit 4;
  *   then the change paid off, the places freed and the card reset.
  *
+ * On a card of software 1.23 (01 17) a second run follows, blank card to blank card, of dollars and sats on one card
+ * (docs/FOXY-CARD-KEYSETS.md 10.7), with a keyset made up for each unit as the run makes up its mint's key:
+ *
+ *   GET_INFO P1 = 3, 51 bytes, format 4; the PIN, a record in sats, the owner's claim; SET_LIMIT of sixteen bytes ($1.00 on one
+ *   payment, $2.00 with no PIN, 1,000 sats to the dollar), read back by the owner's grant, and GET_CARD's 29 bytes still zeros;
+ *   a new tap and the PIN: a plain load of sats (entered 40), a load labelled dollars 6A9D, then with the grant taken (C1);
+ *   format 5; the table lists both; a payment of a sats piece and a dollar piece 6A9A;
+ *   a new tap with no PIN: 2,000 sats paid with 1,500 of change (200 cents, the whole allowance; the SIGN timed), the change back
+ *   by LOAD_CHANGE; a new tap with no PIN, 10 sats more: 6A94;
+ *   1,500 sats under the PIN: 150 cents, a limit and a half, ten waits counted (timed);
+ *   a dollar payment with change: the dollar entry kept while the opening is owed, through a CLEAR_SPENT; the change back;
+ *   SET_LIMIT with no rate: a sats payment 6A99, a dollar payment signs; the dollars paid off and CLEAR_SPENT: the dollar entry let
+ *   go, format 4; a drawer of 120 pieces: GET_BALANCE P1 = 1 and the reclaim over it timed, paid in one payment;
+ *   SET_CARD again on the empty card (the table empty, the last unit gone); RESET_CARD; blank.
+ *
+ * Each command's time is printed beside the transactions it holds: SIGN's (the payment and its receipt), LOAD_PROOF's log,
+ * SET_LIMIT's (the rate with the figures), SET_CARD's (the reclaim before it).
+ *
  * This run is its own mint: it makes up a key k, signs the card's blinded messages with it (C_ = k*B_) and proves it (NUT-12), so
  * the change it writes is real to this run and to nobody else; the card cannot tell a mint's key from another, which is what the
  * run relies on. It makes up an owner key as well and uses it once. Nothing is kept.
@@ -128,8 +146,11 @@ public final class ChangeCheck {
         say("LOAD_PROOF with the PIN set and not given is 6982", sw(send(0xB0, 0x30, 0, 0, piece(8, 21), 0)) == 0x6982);
         say("VERIFY_PIN", sw(send(0xB0, 0x40, 0, 0, PIN, -1)) == 0x9000);
         say("SET_CARD under the PIN, no refund key: a cash card", sw(send(0xB0, 0x32, 0, 0, record(), -1)) == 0x9000);
-        say("SET_LIMIT's PIN form, eight bytes: the limit on one payment and the no-PIN allowance",
-            sw(send(0xB0, 0x33, 0, 0, cat(u32(1000), u32(0)), -1)) == 0x9000);
+        // 1.23 takes the PIN form in twelve bytes on a sats record, the rate after the two figures (100 sats to the dollar: a sat is a cent)
+        boolean units = (selected[1] & 0xFF) >= 0x17;
+        say("SET_LIMIT's PIN form, " + (units ? "twelve bytes: the limit on one payment, the no-PIN allowance and the rate" : "eight bytes: the limit on one payment and the no-PIN allowance"),
+            sw(send(0xB0, 0x33, 0, 0, units ? cat(u32(1000), u32(0), u32(100)) : cat(u32(1000), u32(0)), -1)) == 0x9000);
+        if (units) say("1.22's eight bytes on a sats record are 6700 (1.23)", sw(send(0xB0, 0x33, 0, 0, cat(u32(1000), u32(0)), -1)) == 0x6700);
         say("a piece of 8 goes on under the PIN, with no owner", Arrays.equals(data(send(0xB0, 0x30, 0, 0, piece(8, 21), 0), 0x9000), new byte[] { 0 }));
         byte[] owned = data(send(0xB0, 0x01, 0, 0, null, 0), 0x9000);
         say("and the card has no owner", owned != null && owned[16] == 0 && owned[3] == 1);
@@ -346,8 +367,204 @@ public final class ChangeCheck {
         say("the card is blank again: no owner, no record, nothing on it, no PIN",
             blank != null && blank.length == 30 && blank[16] == 0 && blank[11] == 0 && blank[3] == 0 && blank[4] == 0 && blank[7] == 0);
 
+        if ((selected[1] & 0xFF) >= 0x17) units123();
+
         System.out.println(checks + " checks, " + failed + " failed.");
         return failed == 0 ? 0 : 1;
+    }
+
+    // ---- 1.23: dollars and sats on one card ------------------------------------------------------------------------------
+
+    private static final byte[] SATS = hex("00aa000000000001"), USD = hex("00bb000000000001");
+
+    /** A piece of `keyset` worth `amount`, its nonce its own (the seed in its first byte, 0x80 and up: none of the run before's). */
+    private static byte[] piece(byte[] keyset, long amount, int seed) {
+        byte[] p = piece(amount, 0);
+        System.arraycopy(keyset, 0, p, 0, 8);
+        for (int i = 0; i < 32; i++) p[12 + i] = (byte) (0x80 + seed + i);
+        p[12] = (byte) seed;
+        p[13] = (byte) 0xA5;
+        return p;
+    }
+
+    private static byte[] labelled(int unit, byte[]... pieces) {
+        byte[] out = { (byte) unit };
+        for (byte[] p : pieces) out = cat(out, p);
+        return out;
+    }
+
+    /** SIGN, again while the card says "not yet": the signature (or null) and, in `waited[0]`, how many times it said so. */
+    private static byte[] sign(int[] waited) throws Exception {
+        waited[0] = 0;
+        for (int i = 0; i < 1100; i++) {
+            byte[] r = send(0xB0, 0x24, 0, 0, null, 64);
+            if (sw(r) != 0x9000) return null;
+            if (r.length != 4) return Arrays.copyOf(r, r.length - 2);
+            waited[0]++;
+        }
+        return null;
+    }
+
+    /** The table as GET_CARD P1 = 2 says it: the count and the entries. */
+    private static byte[] table() throws Exception { return data(send(0xB0, 0x16, 2, 0, null, 0), 0x9000); }
+
+    private static int units123Checks;
+
+    private static void units123() throws Exception {
+        int before = checks;
+        System.out.println("software 1.23: dollars and sats on one card.");
+        link.retap();
+        byte[] selected = select();
+        say("SELECT answers 01 17", sw(selected) == 0x9000 && selected.length == 4 && selected[1] == 0x17);
+        byte[] three = data(send(0xB0, 0x01, 3, 0, null, 0), 0x9000);
+        say("GET_INFO P1 = 3: 51 bytes, format 4", three != null && three.length == 51 && three[8] == 4);
+        say("SET_PIN", sw(send(0xB0, 0x41, 0, 0, PIN, -1)) == 0x9000);
+        say("VERIFY_PIN", sw(send(0xB0, 0x40, 0, 0, PIN, -1)) == 0x9000);
+        byte[] unitTwo = record();
+        unitTwo[0] = 2;
+        say("SET_CARD of a unit the card does not know is 6A80", sw(send(0xB0, 0x32, 0, 0, unitTwo, -1)) == 0x6A80);
+        long began = System.nanoTime();
+        say("SET_CARD in sats", sw(send(0xB0, 0x32, 0, 0, record(), -1)) == 0x9000);
+        System.out.println("      SET_CARD took " + (System.nanoTime() - began) / 1000000 + " ms (the reclaim and the last unit before its transaction)");
+        three = data(send(0xB0, 0x01, 3, 0, null, 0), 0x9000);
+        say("the book is there: P1 = 3 byte 43 is 01", three != null && three[43] == 1);
+        KeyPair owner = ownerKey();
+        byte[] ownerPub = uncompressed(owner);
+        int notYet = 0;
+        for (int asked = 1; asked <= 6; asked++) {
+            byte[] r = send(0xB0, 0x43, 0, 0, ownerPub, -1);
+            if (sw(r) == 0x6A98) { notYet++; continue; }
+            say("the owner's claim at the sixth asking", sw(r) == 0x9000 && notYet == 5);
+            break;
+        }
+        byte[] ceiling = cat(u32(0), u32(100), u32(200), u32(1000));
+        began = System.nanoTime();
+        say("SET_LIMIT of sixteen bytes: $1.00 on one payment, $2.00 with no PIN, 1,000 sats to the dollar", sw(send(0xB0, 0x34, 0, 0, ownerData(owner, "FoxyCard/set-limit", ceiling), -1)) == 0x9000);
+        System.out.println("      SET_LIMIT took " + (System.nanoTime() - began) / 1000000 + " ms (the figures and the rate in one transaction)");
+        say("1.22's twelve bytes on a sats record are 6700", sw(send(0xB0, 0x34, 0, 0, ownerData(owner, "FoxyCard/set-limit", cat(u32(0), u32(100), u32(200))), -1)) == 0x6700);
+        say("the owner's grant", sw(send(0xB0, 0x45, 0, 0, ownerData(owner, "FoxyCard/load", new byte[0]), -1)) == 0x9000);
+        three = data(send(0xB0, 0x01, 3, 0, null, 0), 0x9000);
+        say("GET_INFO P1 = 3 with the grant reads the rate back", three != null && be32(three, 44) == 1000 && be32(three, 30) == 100 && be32(three, 34) == 200);
+        byte[] card = data(send(0xB0, 0x16, 0, 0, null, 0), 0x9000);
+        say("GET_CARD answers the rate's bytes as zeros", card != null && Arrays.equals(Arrays.copyOfRange(card, 76, 105), new byte[29]));
+
+        // a new tap and the PIN: sats plain, dollars labelled, the table
+        retapWithPin();
+        began = System.nanoTime();
+        byte[] put = data(send(0xB0, 0x30, 0, 0, cat(piece(SATS, 2000, 1), piece(SATS, 1500, 2), piece(SATS, 10, 3)), 0), 0x9000);
+        System.out.println("      LOAD_PROOF of three new pieces, a new keyset among them, took " + (System.nanoTime() - began) / 1000000 + " ms");
+        say("three pieces of sats loaded plain: places 0, 1 and 2", Arrays.equals(put, new byte[] { 0, 1, 2 }));
+        say("the table: the sats keyset, entered 40", Arrays.equals(table(), cat(new byte[] { 1 }, SATS, new byte[] { 0x40 })));
+        say("a load labelled dollars under the PIN alone is 6A9D", sw(send(0xB0, 0x30, 0, 1, labelled(1, piece(USD, 300, 4)), 0)) == 0x6A9D);
+        say("the owner's grant", sw(send(0xB0, 0x45, 0, 0, ownerData(owner, "FoxyCard/load", new byte[0]), -1)) == 0x9000);
+        put = data(send(0xB0, 0x30, 0, 1, labelled(1, piece(USD, 300, 4), piece(USD, 50, 5)), 0), 0x9000);
+        say("with the grant: two dollar pieces, $3.00 and $0.50, places 3 and 4", Arrays.equals(put, new byte[] { 3, 4 }));
+        say("the sats keyset labelled dollars is 6A9B", sw(send(0xB0, 0x30, 0, 1, labelled(1, piece(SATS, 5, 6)), 0)) == 0x6A9B);
+        say("the table lists both: 40 and C1", Arrays.equals(table(), cat(new byte[] { 2 }, SATS, new byte[] { 0x40 }, USD, new byte[] { (byte) 0xC1 })));
+        say("format 5", data(send(0xB0, 0x01, 0, 0, null, 0), 0x9000)[8] == 5);
+        began = System.nanoTime();
+        byte[] each = data(send(0xB0, 0x11, 1, 0, null, 0), 0x9000);
+        System.out.println("      GET_BALANCE P1 = 1 took " + (System.nanoTime() - began) / 1000000 + " ms");
+        say("GET_BALANCE P1 = 1: 3,510 sats in three, $3.50 in two", Arrays.equals(each, cat(new byte[] { 2, 0, 3 }, u32(3510), new byte[] { 1, 2 }, u32(350))));
+        say("GET_BALANCE: the record's unit alone", Arrays.equals(data(send(0xB0, 0x11, 0, 0, null, 4), 0x9000), u32(3510)));
+        say("a payment of a sats piece and a dollar piece is 6A9A", sw(send(0xB0, 0x22, 0, 0, new byte[] { 0, 3 }, 4)) == 0x6A9A);
+
+        // a new tap with no PIN: the allowance, in cents, of sats
+        BigInteger k = new BigInteger(1, sha256("a mint made up for one run".getBytes(StandardCharsets.US_ASCII))).mod(N);
+        byte[] mintKey = compressed(mul(k, G));
+        link.retap();
+        say("selected, no PIN", sw(select()) == 0x9000);
+        say("2,000 sats begun", sw(send(0xB0, 0x22, 0, 0, new byte[] { 0 }, 4)) == 0x9000);
+        say("1,500 of it the card's own change", sw(send(0xB0, 0x26, 0, 0, cat(u32(1500), mintKey), 33)) == 0x9000);
+        int[] waited = new int[1];
+        began = System.nanoTime();
+        byte[] signed = sign(waited);
+        long signMs = (System.nanoTime() - began) / 1000000;
+        say("signed with no PIN: 200 cents of pieces, the whole allowance; 50 cents leave the card, no wait", signed != null && signed.length == 64 && waited[0] == 0);
+        System.out.println("      SPEND_ALL_SIGN (the first and the last in one: two conversions to cents, the payment's and the receipt's transactions) took " + signMs + " ms");
+        say("the allowance's count: 200 cents", be32(data(send(0xB0, 0x01, 1, 0, null, 0), 0x9000), 38) == 200);
+        byte[] owed = data(send(0xB0, 0x19, 0, 0, null, 0), 0x9000);
+        say("the change back by LOAD_CHANGE, with no PIN", owed != null && owed[0] == 1 && data(send(0xB0, 0x53, owed[1], 0, mintAnswer(k, Arrays.copyOfRange(owed, 1, 84), BigInteger.valueOf(31)), 83), 0x9000) != null);
+        link.retap();
+        say("selected, no PIN", sw(select()) == 0x9000);
+        say("10 sats more with no PIN: past the allowance by a cent, 6A94",
+            sw(send(0xB0, 0x22, 0, 0, new byte[] { 2 }, 4)) == 0x9000 && sw(send(0xB0, 0x24, 0, 0, null, 64)) == 0x6A94);
+
+        // under the PIN: the wait in cents
+        retapWithPin();
+        say("1,500 sats begun", sw(send(0xB0, 0x22, 0, 0, new byte[] { 1 }, 4)) == 0x9000);
+        began = System.nanoTime();
+        signed = sign(waited);
+        long waitMs = (System.nanoTime() - began) / 1000000;
+        say("150 cents, a limit and a half: ten waits counted to the asking, then the signature", signed != null && waited[0] == 10);
+        System.out.println("      the ten waits and the signature took " + waitMs + " ms");
+
+        // a dollar payment with change: the entry stays while the opening is owed
+        retapWithPin();
+        say("$3.50 begun", sw(send(0xB0, 0x22, 0, 0, new byte[] { 3, 4 }, 4)) == 0x9000);
+        say("$1.00 of it the card's own change", sw(send(0xB0, 0x26, 0, 0, cat(u32(100), mintKey), 33)) == 0x9000);
+        signed = sign(waited);
+        say("signed: $2.50 leave the card, three limits' worth: fourteen waits (one change output buys none back)", signed != null && waited[0] == 14);
+        say("CLEAR_SPENT", sw(send(0xB0, 0x31, 0, 0, null, 1)) == 0x9000);
+        byte[] t = table();
+        say("the dollar entry stays: the opening owed names its keyset", t != null && t[0] == 2);
+        owed = data(send(0xB0, 0x19, 0, 0, null, 0), 0x9000);
+        byte[] back = owed == null || owed[0] != 1 ? null : data(send(0xB0, 0x53, owed[1], 0, mintAnswer(k, Arrays.copyOfRange(owed, 1, 84), BigInteger.valueOf(37)), 83), 0x9000);
+        say("the dollar change back by LOAD_CHANGE: $1.00", back != null && be32(back, 2 + 8) == 100 && Arrays.equals(Arrays.copyOfRange(back, 2, 10), USD));
+        int dollarsAt = back == null ? 0 : back[0];
+
+        // no rate: a sats payment is refused, a dollar one signs
+        byte[] noRate = cat(u32(0), u32(100), u32(200), u32(0));
+        say("SET_LIMIT with no rate", sw(send(0xB0, 0x34, 0, 0, ownerData(owner, "FoxyCard/set-limit", noRate), -1)) == 0x9000);
+        int satsAt = -1;
+        for (int place = 0; place < 128 && satsAt < 0; place++) {
+            byte[] s = data(send(0xB0, 0x13, place, 0, null, 0), 0x9000);
+            if (s != null && s[0] == 1 && Arrays.equals(Arrays.copyOfRange(s, 1, 9), SATS)) satsAt = place;
+        }
+        say("a sats payment with a limit and no rate: 6A99", sw(send(0xB0, 0x22, 0, 0, new byte[] { (byte) satsAt }, 4)) == 0x9000 && sw(send(0xB0, 0x24, 0, 0, null, 64)) == 0x6A99);
+        say("and given up: 6985", sw(send(0xB0, 0x24, 0, 0, null, 64)) == 0x6985);
+        say("a dollar payment asks for no rate", sw(send(0xB0, 0x22, 0, 0, new byte[] { (byte) dollarsAt }, 4)) == 0x9000 && sign(waited) != null);
+        say("CLEAR_SPENT: the dollars paid off, the entry let go", sw(send(0xB0, 0x31, 0, 0, null, 1)) == 0x9000);
+        say("the table holds the sats keyset alone, and the format is 4",
+            Arrays.equals(table(), cat(new byte[] { 1 }, SATS, new byte[] { 0x40 })) && data(send(0xB0, 0x01, 0, 0, null, 0), 0x9000)[8] == 4);
+
+        // a drawer of 120 pieces: the reclaim and GET_BALANCE over it
+        say("no ceiling, the rate kept", sw(send(0xB0, 0x34, 0, 0, ownerData(owner, "FoxyCard/set-limit", cat(u32(0), u32(0), u32(0), u32(1000))), -1)) == 0x9000);
+        retapWithPin();
+        boolean loaded = true;
+        for (int i = 0; i < 40 && loaded; i++) {
+            loaded = sw(send(0xB0, 0x30, 0, 0, cat(piece(SATS, 1, 10 + 3 * i), piece(SATS, 1, 11 + 3 * i), piece(SATS, 1, 12 + 3 * i)), 0)) == 0x9000;
+        }
+        say("120 pieces of a sat loaded", loaded);
+        began = System.nanoTime();
+        each = data(send(0xB0, 0x11, 1, 0, null, 0), 0x9000);
+        long balanceMs = (System.nanoTime() - began) / 1000000;
+        say("GET_BALANCE P1 = 1 over them: 122 pieces of sats, the two before them among them", each != null && each[0] == 1 && each[1] == 0 && (each[2] & 0xFF) == 122);
+        began = System.nanoTime();
+        say("CLEAR_SPENT over a full drawer: the reclaim's pass", sw(send(0xB0, 0x31, 0, 0, null, 1)) == 0x9000);
+        long reclaimMs = (System.nanoTime() - began) / 1000000;
+        System.out.println("      over 122 unspent places: GET_BALANCE P1 = 1 took " + balanceMs + " ms, CLEAR_SPENT and its reclaim " + reclaimMs + " ms");
+        byte[] everyone = new byte[122];
+        int n = 0;
+        for (int place = 0; place < 128; place++) {
+            byte[] s = data(send(0xB0, 0x13, place, 0, null, 0), 0x9000);
+            if (s != null && s[0] == 1) everyone[n++] = (byte) place;
+        }
+        say("all 122 paid in one payment", n == 122 && sw(send(0xB0, 0x22, 0, 0, everyone, 4)) == 0x9000 && sign(waited) != null);
+        say("CLEAR_SPENT frees them, and the table", sw(send(0xB0, 0x31, 0, 0, null, 1)) == 0x9000 && Arrays.equals(table(), new byte[] { 0 }));
+
+        // SET_CARD on the empty card, RESET_CARD, blank
+        byte[] rec = record();
+        began = System.nanoTime();
+        say("SET_CARD again by the owner's proof, on the empty card", sw(send(0xB0, 0x32, 0, 0, ownerData(owner, "FoxyCard/set-card", rec), -1)) == 0x9000);
+        System.out.println("      SET_CARD with a book took " + (System.nanoTime() - began) / 1000000 + " ms");
+        three = data(send(0xB0, 0x01, 3, 0, null, 0), 0x9000);
+        say("the table empty, the last payment's unit gone", three != null && three[48] == 0 && three[50] == 0);
+        say("RESET_CARD by the owner's proof", sw(send(0xB0, 0x51, 0, 0xAD, ownerData(owner, "FoxyCard/reset", new byte[0]), -1)) == 0x9000);
+        byte[] blank = data(send(0xB0, 0x01, 0, 0, null, 0), 0x9000);
+        say("the card is blank again", blank != null && blank.length == 30 && blank[16] == 0 && blank[11] == 0 && blank[3] == 0 && blank[4] == 0 && blank[7] == 0);
+        units123Checks = checks - before;
+        System.out.println("      " + units123Checks + " checks in the run of 1.23");
     }
 
     // ---- the mint of this run, and the card's secret --------------------------------------------------------------------

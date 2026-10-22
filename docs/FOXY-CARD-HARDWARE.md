@@ -95,6 +95,13 @@ multiple of 256), and installed in about two seconds at 21,830 (70 past), with
 fifteen lines of `sizeTheFile` and nothing else changed; its chip check held
 (110 checks). Software 1.21 had installed at 21,109 (117 past).
 
+Software 1.23 came to 24,196 bytes (132 past a multiple of 256) with 1.22's fifteen
+lines of `sizeTheFile`, and is built at 24,390 (70 past, the residue 1.22 installed
+at) with thirty-three lines more, as a first candidate. Neither size has been tried on
+the chip, and the file is 2,560 bytes past any that has. Its constructors make what
+1.22's made, and its book (75 bytes) is asked for by the first `SET_CARD`, beside the
+mint's proofs and the openings' keys.
+
 What the software does: `CashuApplet.sizeTheFile` is never called and is in
 the package for its length alone, about six bytes a line, so that a build
 can be moved to a size that is known to install; `tools/refcheck.py`, after

@@ -320,15 +320,36 @@ class CashuAppletTest {
     private static CommandAPDU changePinCommand(byte[] proof, byte[] newPin) {
         return new CommandAPDU(CLA, INS_CHANGE_PIN, 0, 0, ownerData(proof, newPin));
     }
-    private static CommandAPDU setLimitCommand(byte[] proof, long sats) {
-        return new CommandAPDU(CLA, INS_SET_LIMIT_OWNER, 0, 0, ownerData(proof, u32(sats)));
+    /**
+     * SET_LIMIT by the owner (1.23): the proof, then the value, sixteen bytes on a sats record (the daily limit, the limit on one
+     * payment and the allowance, in cents, and the rate). The tests' rate is RATE, 100 sats to the dollar, at which a sat is a cent:
+     * every figure a test of 1.22 wrote in sats is the same number of cents, and is held to the same figures.
+     */
+    static CommandAPDU setLimitCommand(byte[] proof, byte[] value) {
+        return new CommandAPDU(CLA, INS_SET_LIMIT_OWNER, 0, 0, ownerData(proof, value));
     }
-    /** Both limits in one command: the day's, then the tap's. */
-    private static CommandAPDU setLimitsCommand(byte[] proof, long day, long tap) {
-        return new CommandAPDU(CLA, INS_SET_LIMIT_OWNER, 0, 0, ownerData(proof, concat(u32(day), u32(tap))));
+    /** The rate the tests write with every limit: 100 sats to the dollar, so that a payment of S sats is S cents. */
+    static final long RATE = 100;
+    /** SET_LIMIT's sixteen bytes (1.23): the daily limit, the limit on one payment, the no-PIN allowance and the rate RATE. */
+    static byte[] limits16(long day, long tap, long allowance) {
+        return concat(u32(day), u32(tap), u32(allowance), u32(RATE));
     }
-    private static CommandAPDU setLimitByPinCommand(long sats) {
-        return new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, u32(sats));
+    /** The value that sets the daily limit alone, as 1.22's four bytes did: the limit on one payment and the allowance as the card has them. */
+    byte[] dayValue(long day) {
+        byte[] rec = recordNow();
+        return limits16(day, readUint32(rec, CashuApplet.CARD_TAP_LIMIT_OFFSET), readUint32(rec, CashuApplet.CARD_NOPIN_LIMIT_OFFSET));
+    }
+    /** The value that sets the daily limit and the limit on one payment, as 1.22's eight bytes did: the allowance as the card has it. */
+    byte[] dayTapValue(long day, long tap) {
+        return limits16(day, tap, readUint32(recordNow(), CashuApplet.CARD_NOPIN_LIMIT_OFFSET));
+    }
+    /** The card's record as it is, read without a command. */
+    byte[] recordNow() {
+        try { return field("cardRecord").clone(); } catch (Exception e) { throw new IllegalStateException(e); }
+    }
+    /** The PIN form (1.23), twelve bytes: the limit on one payment, the allowance as the card has it, and the rate RATE. */
+    private CommandAPDU setLimitByPinCommand(long sats) {
+        return new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(sats), u32(readUint32(recordNow(), CashuApplet.CARD_NOPIN_LIMIT_OFFSET)), u32(RATE)));
     }
     private static CommandAPDU lockCommand(byte[] proof) {
         return new CommandAPDU(CLA, INS_LOCK_CARD, 0, 0xDE, ownerData(proof, new byte[0]));
@@ -517,7 +538,7 @@ class CashuAppletTest {
         return sw(changePinCommand(ownerProof(L_PIN, OWNER, nonceBytes(), newPin), newPin));
     }
     private int setLimit(long sats) {
-        return sw(setLimitCommand(ownerProof(L_LIMIT, OWNER, nonceBytes(), u32(sats)), sats));
+        return sw(setLimitCommand(ownerProof(L_LIMIT, OWNER, nonceBytes(), dayValue(sats)), dayValue(sats)));
     }
     private int allowLoad() {
         return sw(allowLoadCommand(ownerProof(L_LOAD, OWNER, nonceBytes(), new byte[0])));
@@ -565,7 +586,7 @@ class CashuAppletTest {
     }
     /** The owner's phone setting both limits: a nonce, a proof over the eight bytes, the command. */
     private int setLimits(long day, long tap) {
-        return sw(setLimitsCommand(ownerProof(L_LIMIT, OWNER, nonceBytes(), concat(u32(day), u32(tap))), day, tap));
+        return sw(setLimitCommand(ownerProof(L_LIMIT, OWNER, nonceBytes(), dayTapValue(day, tap)), dayTapValue(day, tap)));
     }
     /** GET_LOG: the four counts, then the last taps, newest first, twenty bytes each (1.15; sixteen before it). */
     private ResponseAPDU logAnswer() { return transmit(new CommandAPDU(CLA, INS_GET_LOG, 0, 0, 256)); }
@@ -786,7 +807,7 @@ class CashuAppletTest {
             if (withAHeader) assertEquals(SW_OK, sim.transmitCommand(setTimeCommand(T0)).getSW());
             if (limit > 0) {
                 byte[] n = sim.transmitCommand(new CommandAPDU(CLA, INS_GET_NONCE, 0, 0, 16)).getData();
-                assertEquals(SW_OK, sim.transmitCommand(setLimitCommand(ownerProof(L_LIMIT, OWNER, n, u32(limit)), limit)).getSW());
+                assertEquals(SW_OK, sim.transmitCommand(setLimitCommand(ownerProof(L_LIMIT, OWNER, n, limits16(limit, 0, 0)), limits16(limit, 0, 0))).getSW());
             }
             /* A card claimed in this time in the field pays nothing in it (1.21): the set-up is the holder's tap, and what the
              * test does next is in a tap of its own, the PIN given, as at a till. */
@@ -825,7 +846,7 @@ class CashuAppletTest {
         // what a phone sends: iOS chooses by the name in the app's Info.plist, and Foxy by the same ten bytes
         ResponseAPDU whole = transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_HEX), 256));
         assertEquals(SW_OK, whole.getSW());
-        assertArrayEquals(new byte[] { 0x01, 0x16 }, whole.getData(), "the same answer either way: version 1.22");
+        assertArrayEquals(new byte[] { 0x01, 0x17 }, whole.getData(), "the same answer either way: version 1.23");
         assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_GET_INFO, 0, 0, 256)), "and its instructions follow");
     }
 
@@ -834,17 +855,17 @@ class CashuAppletTest {
     void testSelect() {
         ResponseAPDU resp = transmit(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR)));
         assertEquals(SW_OK, resp.getSW());
-        assertArrayEquals(new byte[] { 0x01, 0x16 }, resp.getData(), "version 1.22: a card with a PIN and no owner is set up, loaded and read under its PIN, its history held for (1.21: a card has a PIN before anything goes on it, the tap after a payment loads that payment's change and nothing else, the card unblinds its own change, and an owner is claimed slowly (1.20: the card keeps the mint's proof with each piece, which it does not check and a phone reads back (1.19: the card answers as an NFC tag, which its owner switches off and on; 1.18: four waits for each limit's worth over the limit past the first; 1.17: a card can be reset; 1.16: the PIN is optional, and a card with one has a no-PIN allowance; 1.15 was the clock: the time written in the newest Bitcoin block header the card has taken))");
+        assertArrayEquals(new byte[] { 0x01, 0x17 }, resp.getData(), "version 1.23: a card holds dollars and sats at its one mint, a table saying which unit each keyset is, every limit in cents and a payment in sats weighed at the rate (1.22: a card with a PIN and no owner is set up, loaded and read under its PIN, its history held for (1.21: a card has a PIN before anything goes on it, the tap after a payment loads that payment's change and nothing else, the card unblinds its own change, and an owner is claimed slowly (1.20: the card keeps the mint's proof with each piece, which it does not check and a phone reads back (1.19: the card answers as an NFC tag, which its owner switches off and on; 1.18: four waits for each limit's worth over the limit past the first; 1.17: a card can be reset; 1.16: the PIN is optional, and a card with one has a no-PIN allowance; 1.15 was the clock: the time written in the newest Bitcoin block header the card has taken)))");
         assertNotEquals(SW_OK, sw(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(UPSTREAM_AID))),
             "an upstream reader must not find this applet under upstream's AID: the wire is not the same");
     }
 
     @Test
-    @DisplayName("GET_INFO on a new card: 30 bytes: version 1.22, 128 empty slots, no PIN, three tries, format 4, capabilities FF, no record, no limit, no owner, no block header seen, no change due")
+    @DisplayName("GET_INFO on a new card: 30 bytes: version 1.23, 128 empty slots, no PIN, three tries, format 4, capabilities FF, no record, no limit, no owner, no block header seen, no change due")
     void testInfoFresh() {
         byte[] d = info();
         assertEquals(30, d.length);
-        assertEquals(1, d[0]); assertEquals(22, d[1]);
+        assertEquals(1, d[0]); assertEquals(23, d[1]);
         assertEquals(MAX_PROOFS, d[2] & 0xFF);
         assertEquals(0, d[3]); assertEquals(0, d[4]);
         assertEquals(MAX_PROOFS, d[5] & 0xFF);
@@ -1643,6 +1664,7 @@ class CashuAppletTest {
     @DisplayName("A second keyset or a second date in the middle of an answer brings the twelve bytes back, for that entry only: compared with the entry before it and with none other, whole (a keyset or a date that differs in its last byte counts)")
     void testASecondKeysetOrDateBringsTheTwelveBytesBack() {
         ready();
+        assertEquals(SW_OK, allowLoad(), "the owner's grant: four keysets, each entered with the mark (1.23: a third live one without it is 6A9C)");
         long d1 = 1900000000L;
         Object[][] pieces = {
             // keyset, date, amount
@@ -2534,7 +2556,7 @@ class CashuAppletTest {
 
         // ---- the transaction: the payment itself, and no place in it
         String tx = sign.substring(begins, commit);
-        assertTrue(tx.contains("burnPending[0] = (byte) 1;") && tx.contains("openState, (short) 0, CHANGE_MOST);") && tx.contains("CARD_SPENT_OFFSET") && tx.contains("logEntry()")
+        assertTrue(tx.contains("burnPending[0] = (byte) 1;") && tx.contains("openState, (short) 0, CHANGE_MOST);") && tx.contains("CARD_SPENT_OFFSET") && tx.contains("logEntry(unit)")
                 && tx.contains("addUint32Stop(cardLog, LOG_SATS_OFFSET") && tx.contains("lastSig[0] = noPin ? (byte) 2 : (byte) 1;") && tx.contains("LOG_FLAG_NOPIN") && tx.contains("CARD_NOPIN_SPENT_OFFSET") && tx.contains(", lastSig, (short) 1, (short) 64)"),
             "burnPending is set in it with the day's count, the openings' states, the log and the last signature");
         assertFalse(tx.contains("proofStorage") || tx.contains("STATUS_SPENT") || tx.contains("allSlots") || tx.contains("burnList")
@@ -2762,7 +2784,7 @@ class CashuAppletTest {
                 // and the answer says what the marked places make it say
                 byte[] d = torn.getData();
                 if (name.equals("SELECT")) {
-                    assertArrayEquals(new byte[] { 0x01, 0x16 }, d, what);
+                    assertArrayEquals(new byte[] { 0x01, 0x17 }, d, what);
                 } else if (name.equals("GET_INFO")) {
                     assertEquals(others, d[3] & 0xFF, what + ": unspent");
                     assertEquals(n + others, d[4] & 0xFF, what + ": spent");
@@ -3855,16 +3877,16 @@ class CashuAppletTest {
     }
 
     @Test
-    @DisplayName("GET_LOG with a P1 other than 0 or 1 is refused (the applet's word is 6A86, ISO7816.SW_INCORRECT_P1P2), before the PIN is looked at, and answers nothing")
+    @DisplayName("GET_LOG with a P1 other than 0 to 3 is refused (the applet's word is 6A86, ISO7816.SW_INCORRECT_P1P2), before the PIN is looked at, and answers nothing (1.23: P1 = 2 and 3 are forms of 0 and 1; up to 1.22 they were refused)")
     void testGetLogRefusesAP1ItDoesNotHave() {
         ready();
-        for (int p1 : new int[] { 2, 3, 0x10, 0x7f, 0x80, 0xff }) {
+        for (int p1 : new int[] { 4, 5, 0x10, 0x7f, 0x80, 0xff }) {
             ResponseAPDU r = transmit(new CommandAPDU(CLA, INS_GET_LOG, p1, 0, 256));
             assertEquals(SW_INCORRECT_P1P2, r.getSW(), "P1 = " + p1);
             assertEquals(0, r.getData().length);
         }
         reselect();     // no PIN: the refusal is the same, and not a demand for the PIN
-        assertEquals(SW_INCORRECT_P1P2, sw(new CommandAPDU(CLA, INS_GET_LOG, 2, 0, 256)));
+        assertEquals(SW_INCORRECT_P1P2, sw(new CommandAPDU(CLA, INS_GET_LOG, 4, 0, 256)));
         assertEquals(SW_SECURITY_NOT_SATIS, sw(new CommandAPDU(CLA, INS_GET_LOG, 0, 0, 256)), "P1 = 0 still wants the PIN or the grant");
         assertEquals(SW_SECURITY_NOT_SATIS, sw(new CommandAPDU(CLA, INS_GET_LOG, 1, 0, 256)), "and so do the receipts");
     }
@@ -3905,7 +3927,7 @@ class CashuAppletTest {
         assertEquals(124, CashuApplet.CARD_HEADER_OFFSET);
         assertEquals(CashuApplet.CARD_BITS_OFFSET + 4 + 32 + 29, CashuApplet.CARD_NOW_OFFSET, "bits, hash and 29 zeros take the 65 bytes the time key had, and the clock is where it was");
         assertEquals(185, CashuApplet.CARD_NOW_OFFSET);
-        assertEquals(0x16, CashuApplet.VERSION_MINOR);
+        assertEquals(0x17, CashuApplet.VERSION_MINOR);
         assertEquals(212, CashuApplet.CARD_RECORD_LEN, "and the record is the length it was");
         assertEquals(212, field("cardRecord").length);
     }
@@ -4614,8 +4636,12 @@ class CashuAppletTest {
     private Object[][] gated() {
         return new Object[][] {
             { "LOAD_PROOF",  new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 4, 50), 1) },
+            // 1.23: the labelled forms, of the record's unit and of the other, with the mint's proof and without
+            { "LOAD_PROOF, labelled sats", new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 1, concat(new byte[] { 0 }, buildProof(KEYSET, 4, 51)), 1) },
+            { "LOAD_PROOF, labelled dollars", new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 1, concat(new byte[] { 1 }, buildProof(KEYSET_B, 4, 52)), 1) },
+            { "LOAD_PROOF, labelled, with the proof", new CommandAPDU(CLA, INS_LOAD_PROOF, 1, 1, concat(new byte[] { 0 }, buildProof(KEYSET, 4, 53), dleqProof(53)), 2) },
             { "CLEAR_SPENT", new CommandAPDU(CLA, INS_CLEAR_SPENT, 0, 0, 1) },
-            { "SET_LIMIT (PIN form)", setLimitByPinCommand(1) },
+            { "SET_LIMIT (PIN form, twelve bytes: 1.23)", setLimitByPinCommand(1) },
             { "LOCK_CARD",   lockCommand(new byte[72]) },
         };
     }
@@ -4789,8 +4815,8 @@ class CashuAppletTest {
             },
             new OwnerCommand() {
                 public String label() { return L_LIMIT; }
-                public byte[] value() { return u32(777); }
-                public CommandAPDU build(byte[] proof) { return setLimitCommand(proof, 777); }
+                public byte[] value() { return limits16(777, 0, 0); }
+                public CommandAPDU build(byte[] proof) { return setLimitCommand(proof, limits16(777, 0, 0)); }
                 public void assertDone(CashuAppletTest t) { assertEquals(777, t.limit()); }
                 public String toString() { return "SET_LIMIT (owner's form)"; }
             },
@@ -4800,8 +4826,8 @@ class CashuAppletTest {
                 public CommandAPDU build(byte[] proof) { return setOwnerCommand(proof, OTHER_OWNER); }
                 public void assertDone(CashuAppletTest t) {
                     // the new owner can now be proved, and the old one cannot
-                    assertEquals(SW_OK, sw2(t, setLimitCommand(ownerProof(L_LIMIT, OTHER_OWNER, t.nonceBytes(), u32(9)), 9)));
-                    assertEquals(SW_OWNER_PROOF, sw2(t, setLimitCommand(ownerProof(L_LIMIT, OWNER, t.nonceBytes(), u32(10)), 10)));
+                    assertEquals(SW_OK, sw2(t, setLimitCommand(ownerProof(L_LIMIT, OTHER_OWNER, t.nonceBytes(), t.dayValue(9)), t.dayValue(9))));
+                    assertEquals(SW_OWNER_PROOF, sw2(t, setLimitCommand(ownerProof(L_LIMIT, OWNER, t.nonceBytes(), t.dayValue(10)), t.dayValue(10))));
                 }
                 public String toString() { return "SET_OWNER (replacing one)"; }
             },
@@ -4989,7 +5015,7 @@ class CashuAppletTest {
         assertEquals(SW_OK, setCard(MINT, REFUND));
         assertEquals(SW_NO_OWNER, nonce().getSW());
         assertEquals(SW_NO_OWNER, sw(changePinCommand(new byte[8], NEW_PIN)));
-        assertEquals(SW_NO_OWNER, sw(setLimitCommand(new byte[8], 100)));
+        assertEquals(SW_NO_OWNER, sw(setLimitCommand(new byte[8], dayValue(100))));
         assertEquals(SW_NO_OWNER, sw(allowLoadCommand(new byte[8])));
         assertEquals(SW_NO_OWNER, sw(lockCommand(new byte[8])));
         assertEquals(SW_NO_OWNER, sw(resetCommand(new byte[8])), "RESET_CARD (1.17): a card with no owner has nothing to reset by");
@@ -5068,7 +5094,7 @@ class CashuAppletTest {
         assertEquals(0, windowStart(), "and no window");
         assertEquals(SW_OK, sw(setLimitByPinCommand(0)), "none needs none");
         assertEquals(SW_OK, setTime(T0));
-        assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(500), u32(200)))), "and with the allowance after it: the holder's own numbers, with the PIN");
+        assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(500), u32(200), u32(RATE)))), "and with the allowance after it: the holder's own numbers, with the PIN");
         assertEquals(500, paymentLimitInTheRecord());
         assertEquals(200, noPinLimit());
         assertEquals(0, windowStart(), "neither begins the day's window");
@@ -5133,7 +5159,7 @@ class CashuAppletTest {
             n = nonceBytes();
             assertEquals(SW_OWNER_PROOF, sw(changePinCommand(ownerProof(L_PIN, attacker, n, NEW_PIN), NEW_PIN)), "its own PIN, signed by itself");
             n = nonceBytes();
-            assertEquals(SW_OWNER_PROOF, sw(setLimitCommand(ownerProof(L_LIMIT, attacker, n, u32(0)), 0)), "its own limit, signed by itself");
+            assertEquals(SW_OWNER_PROOF, sw(setLimitCommand(ownerProof(L_LIMIT, attacker, n, dayValue(0)), dayValue(0))), "its own limit, signed by itself");
             // a header it made itself, to move the clock: with none of the work in it, which is all that is asked of a header
             assertEquals(SW_LITTLE_WORK, sw(setHeaderCommand(unmined(T0 + 5 * DAY, TEST_BITS))), "its own header");
             assertEquals(SW_LITTLE_WORK, sw(setHeaderCommand(unmined(T0 + 9 * DAY, TEST_BITS))), "and another");
@@ -6159,8 +6185,8 @@ class CashuAppletTest {
         // the owner's proof is what changes it, and a terminal has none
         byte[] terminalProof = new byte[8];
         nonceBytes();
-        assertEquals(SW_OWNER_PROOF, sw(setLimitsCommand(terminalProof, 0, 0)));
-        assertEquals(SW_OWNER_PROOF, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(0), u32(0)))), "nor does the PIN, on a card with an owner");
+        assertEquals(SW_OWNER_PROOF, sw(setLimitCommand(terminalProof, dayTapValue(0, 0))));
+        assertEquals(SW_OWNER_PROOF, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(0), u32(0), u32(RATE)))), "nor does the PIN, on a card with an owner");
         assertEquals(100, paymentLimit());
     }
 
@@ -6292,15 +6318,15 @@ class CashuAppletTest {
         assertEquals(SW_OK, verify(TEST_PIN));
         assertEquals(SW_OK, setCard(MINT, REFUND));
         assertEquals(0, now());
-        assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(100), u32(0)))), "by the PIN: 100 on a payment and no allowance, with no time (1.21)");
+        assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(100), u32(0), u32(RATE)))), "by the PIN: 100 on a payment and no allowance, with no time (1.21)");
         // a card with no owner can give nobody the grant that GET_INFO wants for it, so it is read from the record itself
         assertEquals(100, paymentLimitInTheRecord());
         assertEquals(0, paymentLimitAsATerminalSeesIt(), "and a terminal under the PIN is told nothing of it");
-        assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(100), u32(50)))), "an allowance needs no clock, either");
+        assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(100), u32(50), u32(RATE)))), "an allowance needs no clock, either");
         assertEquals(50, noPinLimit());
         assertEquals(0, limit(), "and the PIN sets no daily limit (1.21: the owner's form does)");
         assertEquals(0, windowStart());
-        assertEquals(SW_OK, sw(setLimitByPinCommand(60)), "in four bytes, the limit on one payment alone");
+        assertEquals(SW_OK, sw(setLimitByPinCommand(60)), "the limit on one payment, the allowance as it was (twelve bytes, 1.23)");
         assertEquals(60, paymentLimitInTheRecord());
         assertEquals(50, noPinLimit(), "and the allowance is as it was");
         assertEquals(0, limit());
@@ -7494,9 +7520,9 @@ class CashuAppletTest {
         reselect();
         assertEquals(0, field("nonceLive")[1], "a SELECT clears it");
         assertEquals(SW_OK, verify(TEST_PIN));
-        // a refused asking adds nothing: P1 = 2 is not the history
+        // a refused asking adds nothing: P1 = 4 is not the history (1.23: P1 = 2 and 3 are, as 0 and 1)
         for (int asked = 1; asked < 5; asked++) assertEquals(SW_KEEP_HOLDING, history(0).getSW());
-        assertEquals(SW_INCORRECT_P1P2, history(2).getSW());
+        assertEquals(SW_INCORRECT_P1P2, history(4).getSW());
         assertEquals((byte)(0x80 | 4), field("nonceLive")[1], "a GET_LOG with a P1 that is no history neither counts nor ends the count");
         // the claim's count and the history's
         for (int asked = 1; asked < CLAIM_ASKINGS; asked++) assertEquals(SW_KEEP_HOLDING, asking(OWNER), "the claim's askings");
@@ -7607,17 +7633,17 @@ class CashuAppletTest {
         byte[] record = cardRecord();
         byte[] info = info();
         assertEquals(SW_CONDITIONS_NOT_SATIS, sw(setCardOpenCommand(record(MINT, REFUND, "ZZZ"))), "SET_CARD in the tap that paid");
-        assertEquals(SW_CONDITIONS_NOT_SATIS, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(1), u32(1000000)))), "a huge allowance, in the tap that paid");
+        assertEquals(SW_CONDITIONS_NOT_SATIS, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(1), u32(1000000), u32(RATE)))), "a huge allowance, in the tap that paid");
         assertEquals(SW_CONDITIONS_NOT_SATIS, setPin(OTHER_PIN), "a PIN of the till's, in the tap that paid");
         assertArrayEquals(record, cardRecord(), "the record is as it was");
         assertEquals(0, readUint32(infoTap(), 34), "and the allowance");
         newTap();
         assertEquals(SW_SECURITY_NOT_SATIS, sw(setCardOpenCommand(record(MINT, REFUND, "ZZZ"))), "SET_CARD in a tap with the PIN and no hold");
-        assertEquals(SW_SECURITY_NOT_SATIS, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(1), u32(1000000)))), "the allowance, no hold");
+        assertEquals(SW_SECURITY_NOT_SATIS, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(1), u32(1000000), u32(RATE)))), "the allowance, no hold");
         assertEquals(SW_SECURITY_NOT_SATIS, setPin(OTHER_PIN), "a PIN, no hold");
         assertArrayEquals(record, cardRecord());
         assertEquals(SW_OK, heldHistory(0).getSW());
-        assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(1), u32(7)))), "the hold done: the holder's numbers");
+        assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(1), u32(7), u32(RATE)))), "the hold done: the holder's numbers");
         assertEquals(7, readUint32(infoTap(), 34));
         assertEquals(SW_OK, sw(setCardOpenCommand(record(MINT, REFUND, "ZZZ"))), "the record");
         assertEquals(SW_CONDITIONS_NOT_SATIS, sw(beginCommand(0)), "and no payment in that tap (a till cannot rewrite the card and be paid in one tap)");
@@ -7678,18 +7704,22 @@ class CashuAppletTest {
     }
 
     @Test
-    @DisplayName("The PIN form of SET_LIMIT (0x33) on a card with no owner: four bytes set the limit on one payment, eight that and the no-PIN allowance, under the PIN given in the tap (6982), while nothing is unspent (6A8D); once the card has an owner, 6A91")
+    @DisplayName("The PIN form of SET_LIMIT (0x33) on a card with no owner: twelve bytes (1.23) set the limit on one payment, the no-PIN allowance and the rate, under the PIN given in the tap (6982), while nothing is unspent (6A8D); four and eight are 6700 on a sats record; once the card has an owner, 6A91")
     void testThePinFormOfTheLimitOnAPhonelessCard() throws Exception {
         phoneless();
         assertEquals(SW_OK, sw(setLimitByPinCommand(250)));
-        assertEquals(250, paymentLimitInTheRecord(), "four bytes: the limit on one payment");
+        assertEquals(250, paymentLimitInTheRecord(), "the limit on one payment");
         assertEquals(0, readUint32(infoTap(), 34), "and no allowance");
-        assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(300), u32(40)))));
-        assertEquals(300, paymentLimitInTheRecord(), "eight: the limit on one payment");
+        assertEquals(SW_OK, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(300), u32(40), u32(RATE)))));
+        assertEquals(300, paymentLimitInTheRecord(), "the limit on one payment");
         assertEquals(40, readUint32(infoTap(), 34), "and the no-PIN allowance");
+        assertEquals(RATE, readUint32(recordNow(), CashuApplet.CARD_RATE_OFFSET), "and the rate");
         assertEquals(0, readUint32(infoTap(), 30), "the limit on one payment is not said to the PIN");
         assertEquals(0, limit(), "and no daily limit: the PIN form does not set it");
-        assertEquals(SW_WRONG_LENGTH, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, new byte[12])), "twelve bytes are the owner's form's");
+        assertEquals(SW_WRONG_LENGTH, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, new byte[16])), "sixteen bytes are the owner's form's");
+        assertEquals(SW_WRONG_LENGTH, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, u32(7))), "four bytes, 1.22's, carry no rate: refused on a sats record (1.23)");
+        assertEquals(SW_WRONG_LENGTH, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(7), u32(7)))), "and eight");
+        assertEquals(300, paymentLimitInTheRecord(), "nothing written");
         reselect();
         assertEquals(SW_SECURITY_NOT_SATIS, sw(setLimitByPinCommand(1)), "without the PIN");
         assertEquals(SW_OK, verify(TEST_PIN));
@@ -7701,7 +7731,7 @@ class CashuAppletTest {
         newTap();
         assertEquals(SW_OK, setOwner(OWNER), "tied to a phone");
         assertEquals(SW_OWNER_PROOF, sw(setLimitByPinCommand(1)), "and the PIN form is refused");
-        assertEquals(SW_OWNER_PROOF, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(1), u32(1)))), "both its shapes");
+        assertEquals(SW_OWNER_PROOF, sw(new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(1), u32(1), u32(RATE)))), "both its shapes");
         assertEquals(300, paymentLimitInTheRecord(), "the numbers stand");
     }
 
@@ -8185,7 +8215,7 @@ class CashuAppletTest {
         readyWithLimit(0);
         byte[] more = infoTap();
         assertEquals(1, more[0]);
-        assertEquals(22, more[1], "version 1.22");
+        assertEquals(23, more[1], "version 1.23");
         assertEquals((byte) 0xFF, more[6], "capabilities FF: the limit on one payment is waited for, not refused, the 1.6 forms are there, so are 128 places with the short listing, a payment burned outside its transaction, and the PIN taken sealed");
         assertEquals(SW_OK, setLimits(1000, 100));
         assertEquals(100, paymentLimit());
@@ -8705,7 +8735,7 @@ class CashuAppletTest {
         // everything else the PIN opens
         byte[] terminalProof = new byte[8];
         nonceBytes();
-        assertEquals(SW_OWNER_PROOF, sw(setLimitCommand(terminalProof, 0)));
+        assertEquals(SW_OWNER_PROOF, sw(setLimitCommand(terminalProof, dayValue(0))));
         assertEquals(SW_OWNER_PROOF, sw(changePinCommand(terminalProof, NEW_PIN)));
         assertEquals(SW_OWNER_PROOF, sw(lockCommand(terminalProof)));
         assertEquals(SW_OWNER_PROOF, sw(setLimitByPinCommand(0)));
@@ -8955,7 +8985,7 @@ class CashuAppletTest {
         assertEquals(SW_OK, setTime(T0 + 400 * DAY));
         assertEquals(SW_OK, spend(0).getSW(), "a year on, the first spend begins a window at the clock");
         assertEquals(T0 + 400 * DAY, windowStart());
-        assertEquals(SW_OK, setLimit(100), "set again: a window from the clock");
+        assertEquals(SW_OK, setLimit(101), "set again, to another number: a window from the clock (1.23: the same number, in the sixteen bytes, keeps its window)");
         assertEquals(0, spentToday());
         assertEquals(SW_OK, spend(1).getSW());
         assertEquals(100, spentToday());
@@ -9070,11 +9100,12 @@ class CashuAppletTest {
         assertTrue(begin.contains("Util.setShort(allState, (short) 2, (short) -1);"), "and leaves it to be worked out");
         String sign = body(code, "private void processSpendAllSign(", "private void finishBurn(");
         int net = sign.indexOf("subUint32(allNet, (short) 0, allChange, (short) 0);");
-        int day = sign.indexOf("requireUnderLimits(allNet, (short) 0, (short) 0);");
-        int wait = sign.indexOf("waitsFor(allNet, (short) 0, (short)(allState[6] & 0xFF), allState[7] != (byte) 0,");
+        int cents = sign.indexOf("if (waits <= 0) centsOfPayment();");
+        int day = sign.indexOf("requireUnderLimits(scratch, (short)(X_CENTS + 4), (short) 0);");
+        int wait = sign.indexOf("waitsFor(scratch, (short)(X_CENTS + 4), (short)(allState[6] & 0xFF), allState[7] != (byte) 0,");
         int work = sign.indexOf("if (waits > 0) {");
-        assertTrue(net > 0 && net < day && day < wait && wait < work,
-            "what leaves the card first; the day (and the time it needs) is asked about before the wait is worked out; both before any work is done");
+        assertTrue(net > 0 && net < cents && cents < day && day < wait && wait < work,
+            "what leaves the card first, then its cents (1.23: a payment in sats turned at the rate); the day (and the time it needs) is asked about before the wait is worked out; both before any work is done");
         assertTrue(sign.indexOf("if (waits < 0) {") < day, "and once, at the first SIGN");
         String waits = body(code, "private short waitsFor(", "private static void subUint32(");
         assertTrue(waits.contains("CARD_TAP_LIMIT_OFFSET") && waits.contains("sum") && waits.contains("WAIT_OVER_SIGNS") && waits.contains("WAIT_UNITS_MOST"),
@@ -9119,8 +9150,11 @@ class CashuAppletTest {
         // and nowhere else. 1.16 to 1.20 read it in loadOne (a load with neither cleared the change note) and in SET_PIN (ADD PIN), and up to
         // 1.20 in the load authority and CLEAR_SPENT; 1.21 has none of them: the grant opens no load. 1.22 reads it for the log and the
         // receipts in one place, the history's gate (requireHistory); and in LOAD_CHANGE, where with the PIN it lets another key mend an
-        // opening on a card with an owner (1.22), which loads nothing a phone can name freely: the mint's proof is checked under that key
-        assertEquals(6, uses, "loadGrant is set by ALLOW_LOAD and read by GET_INFO, the history's gate, SPEND_ALL_SIGN and LOAD_CHANGE's other key, and let go by RESET_CARD (1.17): " + uses);
+        // opening on a card with an owner (1.22), which loads nothing a phone can name freely: the mint's proof is checked under that key.
+        // 1.23 reads it in loadOne, for the holder's say: a new keyset of the other unit, and the mark on a new entry. It opens no load
+        assertEquals(7, uses, "loadGrant is set by ALLOW_LOAD and read by GET_INFO, the history's gate, SPEND_ALL_SIGN, LOAD_CHANGE's other key and loadOne's holder's say (1.23), and let go by RESET_CARD (1.17): " + uses);
+        assertTrue(body(code, "private short loadOne(", "private void processClearSpent(").contains("boolean say = ownerSet[0] == (byte) 1 ? loadGrant[0] == (byte) 1 : (tapOpen[2] & TAP_READ) != 0;"),
+            "loadOne reads it as the holder's say, for the table alone, after the load's own gate");
         assertTrue(body(code, "private void processLoadChange(", "private void unblind(").contains("loadGrant[0] != (byte) 1"), "LOAD_CHANGE reads it for another key only");
         assertFalse(body(code, "private void requireLoadAuthority(", "private void requireNothingUnspent(").contains("loadGrant"), "the load authority does not read it");
         assertFalse(body(code, "private void processClearSpent(", "private short freeSpent(").contains("loadGrant"), "nor CLEAR_SPENT");
@@ -9141,13 +9175,13 @@ class CashuAppletTest {
         // the log is written in four places: the spend, the refusal of one, the putting on of pieces, and an opening of change let go
         // unloaded (1.22) (a clock moved on twice in a tap was another, before 1.15)
         assertEquals(1, count(code, "private short logEntry("));
-        assertEquals(5, count(code, "logEntry()"), "its declaration, and the four that ask for it: the spend, the refusal, LOAD_PROOF and the let-go, and nowhere else");
-        assertTrue(body(code, "private void processLetGo(", "private void processSpendAllSign(").contains("logEntry()"), "the let-go of an opening (1.22)");
-        assertTrue(body(code, "private void processSpendAllSign(", "private void processSpendAllAgain(").contains("logEntry()"));
-        assertTrue(body(code, "private void refuseOverLimit(", "private void processGetLog(").contains("logEntry()"));
-        assertTrue(body(code, "private void processLoadProof(", "private short emptySlot(").contains("logEntry()"));
-        assertFalse(body(code, "private void processSetHeader(", "private static void targetOf(").contains("logEntry()"), "SET_HEADER, which needs no PIN, begins no entry: nobody near the card can push its eight taps out of the ring");
-        assertFalse(body(code, "private void processTellTime(", "private void processVerifyPin(").contains("logEntry()"), "nor does TELL_TIME");
+        assertEquals(5, count(code, "logEntry("), "its declaration, and the four that ask for it: the spend, the refusal, LOAD_PROOF and the let-go, and nowhere else");
+        assertTrue(body(code, "private void processLetGo(", "private void processSpendAllSign(").contains("logEntry(LOG_ANY)"), "the let-go of an opening (1.22), which has no amount and so no unit (1.23)");
+        assertTrue(body(code, "private void processSpendAllSign(", "private void processSpendAllAgain(").contains("logEntry(unit)"));
+        assertTrue(body(code, "private void refuseOverLimit(", "private void processGetLog(").contains("logEntry(unit)"));
+        assertTrue(body(code, "private void processLoadProof(", "private short emptySlot(").contains("logEntry(unit)"));
+        assertFalse(body(code, "private void processSetHeader(", "private static void targetOf(").contains("logEntry("), "SET_HEADER, which needs no PIN, begins no entry: nobody near the card can push its eight taps out of the ring");
+        assertFalse(body(code, "private void processTellTime(", "private void processVerifyPin(").contains("logEntry("), "nor does TELL_TIME");
         // the receipts are written by the spend and read by GET_LOG's receipts, and nothing else names them: nothing clears them
         String withoutThose = code.replace(body(code, "private void processSpendAllSign(", "private void processSpendAllAgain("), "").replace(getReceipts, "");
         assertEquals(4, count(withoutThose, "cardReceipts"), "outside those two, the declaration, the allocation, RESET_CARD (1.17, which makes the card a new one) and SET_PIN on a blocked card with no owner (1.22, which takes the history with the PIN it was the PIN's to read) are all there is: CLEAR_SPENT, SET_CARD, SET_OWNER and CHANGE_PIN do not touch them");
@@ -9200,14 +9234,17 @@ class CashuAppletTest {
         assertTrue(spend.indexOf("needsAllowance()") < spend.indexOf("requireUnderLimits("), "and before the limit would be refused and written down");
         String signing = body(code, "private void processSpendAllSign(", "private void processSpendAllAgain(");
         assertFalse(signing.contains("requirePinIfSet()"), "the signature's gate is the PIN or the allowance");
-        assertEquals(2, count(signing, "requireAllowanceOrPin()"), "asked at the first SIGN, and again at the last, as the limits are");
-        assertTrue(signing.indexOf("requireAllowanceOrPin()") < signing.indexOf("requireUnderLimits("), "before the limits: a reader that has not the PIN writes nothing in the log");
-        assertTrue(signing.indexOf("requireAllowanceOrPin()") < signing.indexOf("if (waits > 0) {"), "and before the wait: a wait is not given to a terminal that has not the PIN");
-        assertTrue(signing.lastIndexOf("requireAllowanceOrPin()") < signing.indexOf("short sigLen = schnorrHW.sign("), "and the last stands before the signature");
+        assertEquals(2, count(signing, "requireAllowanceOrPin(scratch, X_CENTS)"), "asked at the first SIGN, and again at the last, as the limits are, of the whole of the pieces in cents (1.23)");
+        assertTrue(signing.indexOf("requireAllowanceOrPin(") < signing.indexOf("requireUnderLimits("), "before the limits: a reader that has not the PIN writes nothing in the log");
+        assertTrue(signing.indexOf("requireAllowanceOrPin(") < signing.indexOf("if (waits > 0) {"), "and before the wait: a wait is not given to a terminal that has not the PIN");
+        assertTrue(signing.lastIndexOf("requireAllowanceOrPin(") < signing.indexOf("short sigLen = schnorrHW.sign("), "and the last stands before the signature");
+        assertTrue(signing.indexOf("centsOfPayment()") < signing.indexOf("requireAllowanceOrPin("), "and the cents, with the refusal of a payment in sats with no rate (6A99), before the PIN (1.23)");
         String load = body(code, "private void processLoadProof(", "private void processLoadChange(") + body(code, "private void unblind(", "private void processClearSpent(");
         assertTrue(load.indexOf("requireLoadAuthority()") < load.indexOf("SW_NO_CARD_RECORD")
             && load.indexOf("SW_NO_CARD_RECORD") < load.indexOf("SW_NO_SPACE"), "load: the PIN, a record, a place free");
-        assertFalse(load.contains("SW_NO_OWNER") || load.contains("ownerSet"), "and no owner (1.22): a card with no owner is loaded under its PIN");
+        assertFalse(load.contains("SW_NO_OWNER"), "and no owner (1.22): a card with no owner is loaded under its PIN");
+        assertEquals(1, count(load, "ownerSet"), "the owner is read once, for the holder's say over a new keyset of the other unit (1.23), and never to refuse a load");
+        assertTrue(load.indexOf("ownerSet") > load.indexOf("SW_NO_SPACE"), "after the load's own gates");
         assertFalse(load.contains("SW_NO_TIME") || load.contains("CARD_NOW_OFFSET"), "and no time: a card with no clock loads (the first day is on trust)");
     }
 
@@ -9326,8 +9363,10 @@ class CashuAppletTest {
      * Owner vectors, for whoever builds the other side of the owner's proof: the
      * owner key and one proof for each label over a nonce and a value; the limit's
      * label twice, once over the four bytes of a day's limit and once over the
-     * twelve bytes of all three limits (1.16); and, from 1.19, the tag's label over
-     * the one byte that switches it off. (Until
+     * twelve bytes of all three limits (1.16), both taken by a card of 1.23 on a
+     * dollars record only, and so made on one; from 1.19, the tag's label over
+     * the one byte that switches it off; and from 1.23 the limit's label over
+     * sixteen bytes, the three limits and the rate, on a sats record. (Until
      * 1.15 there were also a time key and a signed time; the clock is block
      * headers now, and there is neither.) ECDSA signatures are randomised, so
      * each is one the card has verified, and the other side verifies it again
@@ -9340,15 +9379,19 @@ class CashuAppletTest {
         StringBuilder out = new StringBuilder("{\n");
         out.append(" \"curve\": \"P-256 (secp256r1)\",\n \"signature\": \"ECDSA, SHA-256, DER\",\n");
         out.append(" \"ownerKey\": \"").append(toHex(OWNER.pub)).append("\",\n \"proofs\": [\n");
-        String[] labels = { L_PIN, L_LIMIT, L_LOAD, L_CARD, L_OWNER, L_LOCK, L_LIMIT, L_RESET, L_TAG };
-        byte[][] values = { NEW_PIN, u32(5000), new byte[0], record(MINT, REFUND), OTHER_OWNER.pub, new byte[0], concat(u32(5000), u32(100), u32(50)), new byte[0], new byte[] { 1 } };
+        String[] labels = { L_PIN, L_LIMIT, L_LOAD, L_CARD, L_OWNER, L_LOCK, L_LIMIT, L_RESET, L_TAG, L_LIMIT };
+        byte[][] values = { NEW_PIN, u32(5000), new byte[0], record(MINT, REFUND), OTHER_OWNER.pub, new byte[0], concat(u32(5000), u32(100), u32(50)), new byte[0], new byte[] { 1 },
+            concat(u32(5000), u32(100), u32(50), u32(1000)) };
         for (int i = 0; i < labels.length; i++) {
             simulator = freshCard();
             ready();
+            // the old lengths of the limit's value are taken on a dollars record alone (1.23): the record's unit, put as a phone's SET_CARD would have it
+            if (i == 1 || i == 6) field("cardRecord")[CashuApplet.CARD_UNIT_OFFSET] = 1;
             byte[] n = nonceBytes();
             byte[] proof = ownerProof(labels[i], OWNER, n, values[i]);
-            CommandAPDU[] commands = { changePinCommand(proof, NEW_PIN), setLimitCommand(proof, 5000), allowLoadCommand(proof),
-                setCardCommand(proof, values[3]), setOwnerCommand(proof, OTHER_OWNER), lockCommand(proof), setLimits3Command(proof, 5000, 100, 50), resetCommand(proof), setTagCommand(proof, 1) };
+            CommandAPDU[] commands = { changePinCommand(proof, NEW_PIN), setLimitCommand(proof, values[1]), allowLoadCommand(proof),
+                setCardCommand(proof, values[3]), setOwnerCommand(proof, OTHER_OWNER), lockCommand(proof), setLimitCommand(proof, values[6]), resetCommand(proof), setTagCommand(proof, 1),
+                setLimitCommand(proof, values[9]) };
             assertEquals(SW_OK, sw(commands[i]), labels[i] + " is the owner's proof, to the card");
             out.append("  {\"label\": \"").append(labels[i]).append("\", \"nonce\": \"").append(toHex(n))
                .append("\", \"value\": \"").append(toHex(values[i])).append("\", \"signature\": \"").append(toHex(proof))
@@ -10849,7 +10892,7 @@ class CashuAppletTest {
         say(out, "the info: the card has no clock of its own yet", "exact", SW_OK, info);
         say(out, "a card with no owner has no nonce to give", "exact", SW_NO_OWNER, new CommandAPDU(CLA, INS_GET_NONCE, 0, 0, 16));
         say(out, "nor an ALLOW_LOAD", "exact", SW_NO_OWNER, allowLoadCommand(new byte[8]));
-        say(out, "nor a limit by an owner", "exact", SW_NO_OWNER, setLimitCommand(new byte[8], 100));
+        say(out, "nor a limit by an owner", "exact", SW_NO_OWNER, setLimitCommand(new byte[8], dayValue(100)));
         say(out, "nor a CHANGE_PIN", "exact", SW_NO_OWNER, changePinCommand(new byte[8], NEW_PIN));
         say(out, "nor a SET_TAG (1.19)", "exact", SW_NO_OWNER, setTagCommand(new byte[8], 1));
         say(out, "nor can it be locked, by a reader with no PIN", "exact", SW_SECURITY_NOT_SATIS, lockCommand(new byte[8]));
@@ -10933,7 +10976,7 @@ class CashuAppletTest {
         // 1.15: the first day is on trust. A card that has seen no block header loads, takes a day's limit whose window has no start, and spends up
         // to the limit and no further; the first header begins the window. The time the terminal tells moves nothing.
         say(out, "a piece loads before the card has seen a block header: nothing answers 'never told the time' any more", "exact", SW_OK, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 16, 1), 1));
-        owner(out, "the owner's day limit of 16, set with no clock: its window has no start", SW_OK, L_LIMIT, OWNER, u32(16), p -> setLimitCommand(p, 16));
+        owner(out, "the owner's day limit of 16, set with no clock: its window has no start", SW_OK, L_LIMIT, OWNER, dayValue(16), p -> setLimitCommand(p, dayValue(16)));
         say(out, "the info: the limit, no clock, no window, nothing spent", "exact", SW_OK, info);
         told(out, "the terminal tells its own clock: a note, and the card still has none of its own", OLD_TIME + 20);
         say(out, "the info: the clock is still nothing", "exact", SW_OK, info);
@@ -10945,20 +10988,20 @@ class CashuAppletTest {
         say(out, "the info: the clock, the window begun at the block's time, and the 16 still counted in it", "exact", SW_OK, info);
         say(out, "the record: the older block's difficulty and hash", "exact", SW_OK, getCard);
         saySpend(out, "still the day it was", SW_OVER_LIMIT, 1);
-        owner(out, "the owner takes the limit off", SW_OK, L_LIMIT, OWNER, u32(0), p -> setLimitCommand(p, 0));
+        owner(out, "the owner takes the limit off", SW_OK, L_LIMIT, OWNER, dayValue(0), p -> setLimitCommand(p, dayValue(0)));
         saySpend(out, "and the piece goes", SW_OK, 1);
         say(out, "CLEAR_SPENT: the card is empty again", "exact", SW_OK, clear);
         block(out, "the same block again is taken for nothing", SW_OK, old);
         say(out, "the info after the block", "exact", SW_OK, info);
 
         byte[] n = sayNonce(out);
-        say(out, "a limit by the owner with another key's proof", "exact", SW_OWNER_PROOF, setLimitCommand(ownerProof(L_LIMIT, OTHER_OWNER, n, u32(1000)), 1000));
-        owner(out, "a limit with a proof for another number", SW_OWNER_PROOF, L_LIMIT, OWNER, u32(1000), p -> setLimitCommand(p, 5000));
-        owner(out, "a limit with CHANGE_PIN's proof", SW_OWNER_PROOF, L_PIN, OWNER, u32(1000), p -> setLimitCommand(p, 1000));
+        say(out, "a limit by the owner with another key's proof", "exact", SW_OWNER_PROOF, setLimitCommand(ownerProof(L_LIMIT, OTHER_OWNER, n, dayValue(1000)), dayValue(1000)));
+        owner(out, "a limit with a proof for another number", SW_OWNER_PROOF, L_LIMIT, OWNER, dayValue(1000), p -> setLimitCommand(p, dayValue(5000)));
+        owner(out, "a limit with CHANGE_PIN's proof", SW_OWNER_PROOF, L_PIN, OWNER, u32(1000), p -> setLimitCommand(p, dayValue(1000)));
         byte[] limitNonce = sayNonce(out);
-        byte[] limitProof = ownerProof(L_LIMIT, OWNER, limitNonce, u32(1000));
-        say(out, "a limit of 1000 by the owner, with no PIN needed", "exact", SW_OK, setLimitCommand(limitProof, 1000));
-        say(out, "the same proof again", "exact", SW_OWNER_PROOF, setLimitCommand(limitProof, 1000));
+        byte[] limitProof = ownerProof(L_LIMIT, OWNER, limitNonce, dayValue(1000));
+        say(out, "a limit of 1000 by the owner, with no PIN needed", "exact", SW_OK, setLimitCommand(limitProof, dayValue(1000)));
+        say(out, "the same proof again", "exact", SW_OWNER_PROOF, setLimitCommand(limitProof, dayValue(1000)));
         say(out, "the info: the limit, and a window begun at the clock", "exact", SW_OK, info);
         say(out, "the record, read back", "exact", SW_OK, getCard);
 
@@ -11004,10 +11047,10 @@ class CashuAppletTest {
         saySpend(out, "the next day: slot 2, one sat", SW_OK, 2);
         say(out, "the window began at the clock, with one sat in it", "exact", SW_OK, info);
         saySpend(out, "2000 is still over the limit by itself", SW_OVER_LIMIT, 3);
-        owner(out, "the owner takes the limit off", SW_OK, L_LIMIT, OWNER, u32(0), p -> setLimitCommand(p, 0));
+        owner(out, "the owner takes the limit off", SW_OK, L_LIMIT, OWNER, dayValue(0), p -> setLimitCommand(p, dayValue(0)));
         saySpend(out, "and 2000 goes", SW_OK, 3);
         say(out, "nothing is counted with no limit", "exact", SW_OK, info);
-        owner(out, "the owner puts a limit of 50 back", SW_OK, L_LIMIT, OWNER, u32(50), p -> setLimitCommand(p, 50));
+        owner(out, "the owner puts a limit of 50 back", SW_OK, L_LIMIT, OWNER, dayValue(50), p -> setLimitCommand(p, dayValue(50)));
         say(out, "its window, begun at the clock", "exact", SW_OK, info);
         say(out, "spent places are listed by their tags alone", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_PIECES, 0, 0, 256));
         say(out, "CLEAR_SPENT", "exact", SW_OK, clear);
@@ -11112,7 +11155,7 @@ class CashuAppletTest {
         say(out, "the PIN", "exact", SW_OK, verifyOk);
 
         // a new record does not touch the clock (a different time key used to clear it, before 1.15): an empty card, the owner's proof, other bytes where the key was
-        owner(out, "the owner takes the limit off, to empty the card", SW_OK, L_LIMIT, OWNER, u32(0), p -> setLimitCommand(p, 0));
+        owner(out, "the owner takes the limit off, to empty the card", SW_OK, L_LIMIT, OWNER, dayValue(0), p -> setLimitCommand(p, dayValue(0)));
         for (int i = 0; i < MAX_PROOFS; i++) {
             byte[] st = slot(i);
             if (st.length == 0 || st[0] != 1) continue;
@@ -11132,8 +11175,8 @@ class CashuAppletTest {
         say(out, "the PIN", "exact", SW_OK, verifyOk);
         CommandAPDU infoTap = new CommandAPDU(CLA, INS_GET_INFO, 1, 0, 256);
         say(out, "the info asked for the limit on one payment as well: twelve bytes more, and no limit", "exact", SW_OK, infoTap);
-        owner(out, "both limits in one command, with a proof for the day's alone", SW_OWNER_PROOF, L_LIMIT, OWNER, u32(0), p -> setLimitsCommand(p, 0, 100));
-        owner(out, "both limits by the owner: none on the day, 100 on one payment", SW_OK, L_LIMIT, OWNER, concat(u32(0), u32(100)), p -> setLimitsCommand(p, 0, 100));
+        owner(out, "both limits in one command, with a proof for the day's alone", SW_OWNER_PROOF, L_LIMIT, OWNER, dayValue(0), p -> setLimitCommand(p, dayTapValue(0, 100)));
+        owner(out, "both limits by the owner: none on the day, 100 on one payment", SW_OK, L_LIMIT, OWNER, dayTapValue(0, 100), p -> setLimitCommand(p, dayTapValue(0, 100)));
         say(out, "the info: the limit on one payment, and eight bytes after it that are always nothing", "exact", SW_OK, infoTap);
         say(out, "and the thirty bytes say nothing of it", "exact", SW_OK, info);
         for (int i = 0; i < 9; i++) {
@@ -11218,9 +11261,9 @@ class CashuAppletTest {
         ResponseAPDU placedB = say(out, "LOAD_CHANGE: the second opening too, so that nothing is owed to the card", "exact", SW_OK,
             loadChangeCommand(recB[0], mintAnswer(Arrays.copyOfRange(recB, 17, 50))));
         saySpend(out, "and spent", SW_OK, placedB.getData()[0]);
-        owner(out, "the day's limit alone, in four bytes", SW_OK, L_LIMIT, OWNER, u32(900), p -> setLimitCommand(p, 900));
+        owner(out, "the day's limit alone, the others as they are (sixteen bytes, 1.23; four up to 1.22)", SW_OK, L_LIMIT, OWNER, dayValue(900), p -> setLimitCommand(p, dayValue(900)));
         say(out, "the info: the limit on one payment is left as it was", "exact", SW_OK, infoTap);
-        owner(out, "both taken off", SW_OK, L_LIMIT, OWNER, concat(u32(0), u32(0)), p -> setLimitsCommand(p, 0, 0));
+        owner(out, "both taken off", SW_OK, L_LIMIT, OWNER, dayTapValue(0, 0), p -> setLimitCommand(p, dayTapValue(0, 0)));
         say(out, "the info: no limits", "exact", SW_OK, infoTap);
         say(out, "CLEAR_SPENT: the card is empty again", "exact", SW_OK, clear);
 
@@ -11232,7 +11275,7 @@ class CashuAppletTest {
         say(out, "the log is not for a reader with no PIN", "exact", SW_SECURITY_NOT_SATIS, getLog);
         owner(out, "the owner's grant", SW_OK, L_LOAD, OWNER, new byte[0], p -> allowLoadCommand(p));
         say(out, "opens it, with no PIN", "exact", SW_OK, getLog);
-        owner(out, "a limit of 100 on the day, to be tried", SW_OK, L_LIMIT, OWNER, concat(u32(100), u32(0)), p -> setLimitsCommand(p, 100, 0));
+        owner(out, "a limit of 100 on the day, to be tried", SW_OK, L_LIMIT, OWNER, dayTapValue(100, 0), p -> setLimitCommand(p, dayTapValue(100, 0)));
         say(out, "the PIN: loads want it (1.21)", "exact", SW_OK, verifyOk);
         for (int i = 0; i < 3; i++) {
             say(out, "load 100, for the log", "exact", SW_OK, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 100, 31 + i), 1));
@@ -11247,10 +11290,10 @@ class CashuAppletTest {
         say(out, "select", "exact", SW_OK, select);
         say(out, "the PIN", "exact", SW_OK, verifyOk);
         told(out, "the terminal tells its own clock: the entry this tap gets will have it, beside the card's own", TIP_TIME + 3_600);
-        owner(out, "the owner raises the limit by a sat: the day's window begins afresh at the clock", SW_OK, L_LIMIT, OWNER, concat(u32(101), u32(0)), p -> setLimitsCommand(p, 101, 0));
+        owner(out, "the owner raises the limit by a sat: the day's window begins afresh at the clock", SW_OK, L_LIMIT, OWNER, dayTapValue(101, 0), p -> setLimitCommand(p, dayTapValue(101, 0)));
         saySpend(out, "the next tap, a new window: a spend within the limit", SW_OK, 1);
         say(out, "the log: a third tap, newest first, with nothing refused in it, and the time told in it", "exact", SW_OK, getLog);
-        owner(out, "the limit taken off again", SW_OK, L_LIMIT, OWNER, concat(u32(0), u32(0)), p -> setLimitsCommand(p, 0, 0));
+        owner(out, "the limit taken off again", SW_OK, L_LIMIT, OWNER, dayTapValue(0, 0), p -> setLimitCommand(p, dayTapValue(0, 0)));
         saySpend(out, "spend the last", SW_OK, 2);
         say(out, "CLEAR_SPENT", "exact", SW_OK, clear);
         say(out, "leaves the log as it is", "exact", SW_OK, getLog);
@@ -11340,10 +11383,10 @@ class CashuAppletTest {
          * payment (version 1.6). The card is empty and the PIN is in force. What is done here is undone at its end: the limit is set
          * and taken off, the pieces are paid and freed, and the card is selected again, so that no grant goes on to what follows. */
         CommandAPDU receiptsAsked = new CommandAPDU(CLA, INS_GET_LOG, 1, 0, 256);
-        owner(out, "a limit of 100 on one payment, by the owner", SW_OK, L_LIMIT, OWNER, concat(u32(0), u32(100)), p -> setLimitsCommand(p, 0, 100));
+        owner(out, "a limit of 100 on one payment, by the owner", SW_OK, L_LIMIT, OWNER, dayTapValue(0, 100), p -> setLimitCommand(p, dayTapValue(0, 100)));
         say(out, "the info asked for the limit on one payment, under the PIN alone: zeros, as on a card with none", "exact", SW_OK, infoTap);
         say(out, "the receipts are not for the PIN", "exact", SW_SECURITY_NOT_SATIS, receiptsAsked);
-        say(out, "a form of GET_LOG there is not", "exact", SW_INCORRECT_P1P2, new CommandAPDU(CLA, INS_GET_LOG, 2, 0, 256));
+        say(out, "a form of GET_LOG there is not", "exact", SW_INCORRECT_P1P2, new CommandAPDU(CLA, INS_GET_LOG, 4, 0, 256));
         say(out, "a form of GET_PIECES there is not", "exact", SW_INCORRECT_P1P2, new CommandAPDU(CLA, INS_GET_PIECES, 0, 4, 256));
         owner(out, "the owner's grant, for this tap", SW_OK, L_LOAD, OWNER, new byte[0], p -> allowLoadCommand(p));
         say(out, "the info with the grant: the limit on one payment", "exact", SW_OK, infoTap);
@@ -11360,7 +11403,7 @@ class CashuAppletTest {
         say(out, "the PIN", "exact", SW_OK, verifyOk);
         say(out, "the receipts are refused again under the PIN", "exact", SW_SECURITY_NOT_SATIS, receiptsAsked);
         say(out, "and so is the limit on one payment: zeros", "exact", SW_OK, infoTap);
-        owner(out, "the owner takes the limit off", SW_OK, L_LIMIT, OWNER, concat(u32(0), u32(0)), p -> setLimitsCommand(p, 0, 0));
+        owner(out, "the owner takes the limit off", SW_OK, L_LIMIT, OWNER, dayTapValue(0, 0), p -> setLimitCommand(p, dayTapValue(0, 0)));
         say(out, "CLEAR_SPENT: the card is empty again", "exact", SW_OK, clear);
 
         /* The terminal's own clock is a note: told, it goes into the entry a tap gets and into the receipt of a payment made in the time in the
@@ -11387,8 +11430,7 @@ class CashuAppletTest {
         byte[] al0 = buildProof(KEYSET, 30, 91), al1 = buildProof(KEYSET, 30, 92), al2 = buildProof(KEYSET, 30, 93);
         byte[] eleven = new byte[11];
         owner(out, "eleven bytes are no limit", SW_WRONG_LENGTH, L_LIMIT, OWNER, eleven, p -> new CommandAPDU(CLA, INS_SET_LIMIT_OWNER, 0, 0, ownerData(p, eleven)));
-        owner(out, "twelve bytes: a day of 1000, none on one payment, and an allowance of 50 a day with no PIN", SW_OK, L_LIMIT, OWNER, concat(u32(1000), u32(0), u32(50)),
-            p -> setLimits3Command(p, 1000, 0, 50));
+        owner(out, "sixteen bytes (1.23): a day of 1000, none on one payment, an allowance of 50 with no PIN, and the rate", SW_OK, L_LIMIT, OWNER, limits16(1000, 0, 50), p -> setLimitCommand(p, limits16(1000, 0, 50)));
         say(out, "the info asked for the tap, under the PIN: the allowance and what is counted against it; the limit on one payment is the grant's alone", "exact", SW_OK, infoTap);
         say(out, "three pieces of 30", "exact", SW_OK, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, concat(al0, al1, al2), 3));
         sayReset(out, "taken away and put back: a new time in the field, with no PIN given");
@@ -11411,7 +11453,7 @@ class CashuAppletTest {
         say(out, "the last signature was given with the PIN: asked for again it is the PIN's", "exact", SW_SECURITY_NOT_SATIS, new CommandAPDU(CLA, INS_SPEND_ALL_AGAIN, 0, 0, 64));
         say(out, "the PIN", "exact", SW_OK, verifyOk);
         saySpend(out, "pay the third", SW_OK, 2);
-        owner(out, "the limits taken off, the allowance too", SW_OK, L_LIMIT, OWNER, concat(u32(0), u32(0), u32(0)), p -> setLimits3Command(p, 0, 0, 0));
+        owner(out, "the limits taken off, the allowance too", SW_OK, L_LIMIT, OWNER, limits16(0, 0, 0), p -> setLimitCommand(p, limits16(0, 0, 0)));
         say(out, "the info: no limits and no allowance", "exact", SW_OK, infoTap);
         say(out, "CLEAR_SPENT: the card is empty again", "exact", SW_OK, clear);
 
@@ -11505,7 +11547,7 @@ class CashuAppletTest {
         say(out, "a locked card says so", "exact", SW_OK, info);
         say(out, "and takes no more writes: a load", "exact", SW_NOT_ALLOWED, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 4, 11), 1));
         say(out, "a grant", "exact", SW_NOT_ALLOWED, allowLoadCommand(new byte[8]));
-        say(out, "a limit", "exact", SW_NOT_ALLOWED, setLimitCommand(new byte[8], 5));
+        say(out, "a limit", "exact", SW_NOT_ALLOWED, setLimitCommand(new byte[8], dayValue(5)));
         say(out, "a PIN", "exact", SW_NOT_ALLOWED, changePinCommand(new byte[8], NEW_PIN));
         say(out, "an owner", "exact", SW_NOT_ALLOWED, setOwnerOpenCommand(OTHER_OWNER));
         say(out, "a record", "exact", SW_NOT_ALLOWED, setCardOpenCommand(record(MINT, REFUND)));
@@ -11564,7 +11606,7 @@ class CashuAppletTest {
         say(out, "a record with the PIN set and not given: 6982", "exact", SW_SECURITY_NOT_SATIS, setCardOpenCommand(record(MINT, NO_REFUND, "FX1")));
         say(out, "the PIN", "exact", SW_OK, verifyOk);
         say(out, "the record under the PIN, with no refund key (a cash card) and the design", "exact", SW_OK, setCardOpenCommand(record(MINT, NO_REFUND, "FX1")));
-        say(out, "the holder's limit on one payment and no-PIN allowance, by the PIN form, on a card with no owner", "exact", SW_OK, new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(100), u32(10))));
+        say(out, "the holder's limit on one payment and no-PIN allowance, by the PIN form, on a card with no owner", "exact", SW_OK, new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(100), u32(10), u32(RATE))));
         say(out, "a piece of 16 under the PIN, on a card with no owner (1.22; 6A90 up to 1.21)", "exact", SW_OK, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 16, 61), 1));
         say(out, "and a piece of 8", "exact", SW_OK, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(KEYSET, 8, 62), 1));
         say(out, "the info: no owner, two pieces", "exact", SW_OK, info);
@@ -11654,6 +11696,79 @@ class CashuAppletTest {
         say(out, "CLEAR_SPENT", "exact", SW_OK, clear);
         owner(out, "RESET_CARD: nothing on the card, nothing owed", SW_OK, L_RESET, OTHER_OWNER, new byte[0], p -> resetCommand(p));
 
+        /* 1.23: dollars and sats on one card (docs/FOXY-CARD-KEYSETS.md). The table of keysets, made by the first SET_CARD (this
+         * card's was made long ago, and RESET_CARD zeroed it); the labelled load and its refusals; one unit a payment; a ceiling in
+         * cents with the rate, a payment in sats weighed at it; the forms that say the book, the table, each unit's balance, the
+         * other unit's count and the receipts' units. */
+        String satsA = "00aa000000000001", satsB = "00aa000000000002", satsC = "00aa000000000003", satsD = "00aa000000000004", usdA = "00bb000000000001";
+        CommandAPDU info3 = new CommandAPDU(CLA, INS_GET_INFO, 3, 0, 256);
+        CommandAPDU table = new CommandAPDU(CLA, INS_GET_CARD, 2, 0, 256);
+        CommandAPDU each = new CommandAPDU(CLA, INS_GET_BALANCE, 1, 0, 256);
+        say(out, "1.23: GET_INFO P1 = 3 on a card just reset: 51 bytes, format 4, the book there and empty, no rate", "exact", SW_OK, info3);
+        say(out, "the PIN", "exact", SW_OK, new CommandAPDU(CLA, INS_SET_PIN, 0, 0, TEST_PIN));
+        say(out, "given", "exact", SW_OK, verifyOk);
+        byte[] unitTwo = record(MINT, REFUND); unitTwo[0] = 2;
+        say(out, "a record of a unit the card does not know: 6A80", "exact", SW_WRONG_DATA, setCardOpenCommand(unitTwo));
+        say(out, "a record in sats", "exact", SW_OK, setCardOpenCommand(record(MINT, REFUND)));
+        sayReset(out, "taken away and put back: a tap of its own for the claim, the last one having paid");
+        say(out, "select", "exact", SW_OK, select);
+        say(out, "the PIN", "exact", SW_OK, verifyOk);
+        sayClaim(out, "an owner", OWNER);
+        byte[] ceiling = concat(u32(0), u32(100), u32(200), u32(1000));
+        owner(out, "the owner's ceiling, sixteen bytes: no daily limit, $1.00 on one payment, $2.00 with no PIN, 1,000 sats to the dollar", SW_OK, L_LIMIT, OWNER, ceiling, p -> setLimitCommand(p, ceiling));
+        byte[] old12 = concat(u32(0), u32(100), u32(200));
+        owner(out, "1.22's twelve bytes on a sats record: 6700, nothing written", SW_WRONG_LENGTH, L_LIMIT, OWNER, old12, p -> setLimitCommand(p, old12));
+        say(out, "GET_CARD with a rate set: the 29 bytes after the header's hash are zeros", "exact", SW_OK, getCard);
+        sayReset(out, "taken away and put back: a tap to load and pay in");
+        say(out, "select", "exact", SW_OK, select);
+        say(out, "the PIN", "exact", SW_OK, verifyOk);
+        say(out, "a plain load of 2,000 sats: its keyset entered as the record's unit, unmarked", "exact", SW_OK, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(satsA, 2000, 71), 1));
+        say(out, "a load labelled dollars under the PIN alone: 6A9D, not this tap's to start", "exact", 0x6A9D, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 1, concat(new byte[] { 1 }, buildProof(usdA, 150, 72)), 1));
+        say(out, "a load with P2 = 2: 6B00", "exact", 0x6B00, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 2, concat(new byte[] { 1 }, buildProof(usdA, 150, 72)), 1));
+        owner(out, "the owner's grant: the holder's say", SW_OK, L_LOAD, OWNER, new byte[0], p -> allowLoadCommand(p));
+        say(out, "the load labelled dollars under the PIN and the grant: $1.50, entered, marked", "exact", SW_OK, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 1, concat(new byte[] { 1 }, buildProof(usdA, 150, 72)), 1));
+        say(out, "the sats keyset labelled dollars: 6A9B, the other unit", "exact", 0x6A9B, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 1, concat(new byte[] { 1 }, buildProof(satsA, 5, 73)), 1));
+        say(out, "GET_INFO P1 = 3 with the grant: format 5, the rate, two entries, one without the mark, no payment yet", "exact", SW_OK, info3);
+        say(out, "GET_CARD P1 = 2: the table", "exact", SW_OK, table);
+        say(out, "GET_BALANCE P1 = 1: 2,000 sats and $1.50", "exact", SW_OK, each);
+        say(out, "GET_BALANCE: the record's unit alone", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_BALANCE, 0, 0, 4));
+        sayReset(out, "taken away and put back: a till's tap");
+        say(out, "select", "exact", SW_OK, select);
+        say(out, "GET_INFO P1 = 3 to a till: the rate is zeros", "exact", SW_OK, info3);
+        say(out, "the PIN", "exact", SW_OK, verifyOk);
+        say(out, "SPEND_ALL_BEGIN of a sats piece and a dollar piece: 6A9A, two units", "exact", 0x6A9A, beginCommand(0, 1));
+        sayPay(out, "a payment of the 2,000 sats: 200 cents, two limits' worth of $1.00, ten waits", SW_OK, 10, 0);
+        owner(out, "the owner's grant", SW_OK, L_LOAD, OWNER, new byte[0], p -> allowLoadCommand(p));
+        say(out, "GET_INFO P1 = 3: the last payment's unit, the record's", "exact", SW_OK, info3);
+        sayReset(out, "taken away and put back: loads under the PIN alone");
+        say(out, "select", "exact", SW_OK, select);
+        say(out, "the PIN", "exact", SW_OK, verifyOk);
+        say(out, "a second sats keyset under the PIN alone, unmarked", "exact", SW_OK, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(satsB, 300, 74), 1));
+        say(out, "a third, unmarked: the cap reached, the reclaim lets the dead first one go", "exact", SW_OK, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 1, concat(new byte[] { 0 }, buildProof(satsC, 400, 75)), 1));
+        say(out, "a fourth: 6A9C, two live entries without the mark already", "exact", 0x6A9C, new CommandAPDU(CLA, INS_LOAD_PROOF, 0, 0, buildProof(satsD, 500, 76), 1));
+        say(out, "GET_CARD P1 = 2: the table", "exact", SW_OK, table);
+        byte[] noRate = concat(u32(0), u32(100), u32(200), u32(0));
+        owner(out, "the ceiling with no rate", SW_OK, L_LIMIT, OWNER, noRate, p -> setLimitCommand(p, noRate));
+        say(out, "a payment in sats: the places named", "exact", SW_OK, beginCommand(2));
+        say(out, "a payment in sats with a limit and no rate: 6A99, the payment given up", "exact", 0x6A99, SIGN_ALL);
+        sayPay(out, "a payment in dollars asks no rate: $1.50, a limit and a half, ten waits", SW_OK, 10, 1);
+        owner(out, "the owner's grant", SW_OK, L_LOAD, OWNER, new byte[0], p -> allowLoadCommand(p));
+        say(out, "GET_LOG P1 = 2: the counts, the other unit's after them", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_LOG, 2, 0, 256));
+        say(out, "GET_LOG P1 = 3: the receipts with their units", "exact", SW_OK, new CommandAPDU(CLA, INS_GET_LOG, 3, 0, 256));
+        say(out, "GET_INFO P1 = 3: the last payment's unit, the other", "exact", SW_OK, info3);
+        say(out, "GET_BALANCE P1 = 1: sats alone now", "exact", SW_OK, each);
+        owner(out, "no ceiling, the rate kept", SW_OK, L_LIMIT, OWNER, concat(u32(0), u32(0), u32(0), u32(1000)), p -> setLimitCommand(p, concat(u32(0), u32(0), u32(0), u32(1000))));
+        sayPay(out, "the two sats pieces paid", SW_OK, -1, 2, 3);
+        say(out, "CLEAR_SPENT: the table reclaimed", "exact", SW_OK, clear);
+        say(out, "GET_CARD P1 = 2: the table empty", "exact", SW_OK, table);
+        owner(out, "RESET_CARD", SW_OK, L_RESET, OWNER, new byte[0], p -> resetCommand(p));
+        say(out, "a PIN", "exact", SW_OK, new CommandAPDU(CLA, INS_SET_PIN, 0, 0, TEST_PIN));
+        say(out, "given", "exact", SW_OK, verifyOk);
+        say(out, "a record in sats, no owner", "exact", SW_OK, setCardOpenCommand(record(MINT, NO_REFUND)));
+        say(out, "the PIN form, twelve bytes: $1.00 on one payment, $0.50 with no PIN, 1,000 sats to the dollar", "exact", SW_OK, new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, concat(u32(100), u32(50), u32(1000))));
+        say(out, "the PIN form's four bytes of 1.22 on a sats record: 6700", "exact", SW_WRONG_LENGTH, new CommandAPDU(CLA, INS_SET_LIMIT, 0, 0, u32(100)));
+        say(out, "GET_INFO P1 = 3 to the PIN with no hold: the rate is zeros", "exact", SW_OK, info3);
+
         String text = out.toString();
         text = text.substring(0, text.lastIndexOf(",\n")) + "\n]\n";
         java.nio.file.Path target = appletFolder();
@@ -11675,12 +11790,9 @@ class CashuAppletTest {
     // written in the log.
 
     /** SET_LIMIT by the owner, with the three numbers: the day's, the limit on one payment and the no-PIN allowance (twelve bytes). */
-    private static CommandAPDU setLimits3Command(byte[] proof, long day, long tap, long allowance) {
-        return new CommandAPDU(CLA, INS_SET_LIMIT_OWNER, 0, 0, ownerData(proof, concat(u32(day), u32(tap), u32(allowance))));
-    }
-    /** The owner's phone setting all three limits: a nonce, a proof over the twelve bytes, the command. */
+    /** The owner's phone setting all three limits (1.23: and the rate RATE): a nonce, a proof over the sixteen bytes, the command. */
     private int setAllowance(long day, long tap, long allowance) {
-        return sw(setLimits3Command(ownerProof(L_LIMIT, OWNER, nonceBytes(), concat(u32(day), u32(tap), u32(allowance))), day, tap, allowance));
+        return sw(setLimitCommand(ownerProof(L_LIMIT, OWNER, nonceBytes(), limits16(day, tap, allowance)), limits16(day, tap, allowance)));
     }
     /** The card taken out of the field and put back: a new time in the field, with no PIN given. */
     private void tap() {
@@ -11697,15 +11809,16 @@ class CashuAppletTest {
 
 
     @Test
-    @DisplayName("SET_LIMIT by the owner takes twelve bytes: the day's limit, the limit on one payment and the no-PIN allowance; a number that does not change keeps its count; GET_INFO P1 = 1 says the allowance to anyone")
+    @DisplayName("SET_LIMIT by the owner takes sixteen bytes on a sats record (1.23): the day's limit, the limit on one payment and the no-PIN allowance, in cents, and the rate; 1.22's four, eight and twelve are 6700 there; a number that does not change keeps its count; GET_INFO P1 = 1 says the allowance to anyone")
     void testSetLimitTakesTheAllowance() throws Exception {
         ready();
         assertEquals(SW_OK, load(buildProof(KEYSET, 16, 1)).getSW());
-        // the shapes: 4, 8 and 12; nothing between, nothing past
-        for (int n : new int[] { 0, 1, 5, 9, 11, 13, 16 }) {
+        // the shapes: sixteen; on a sats record nothing else, 1.22's four, eight and twelve among them (U23 pins them on a dollars record)
+        for (int n : new int[] { 0, 1, 4, 5, 8, 9, 11, 12, 13, 15, 17, 20 }) {
             byte[] v = new byte[n];
             assertEquals(SW_WRONG_LENGTH, sw(new CommandAPDU(CLA, INS_SET_LIMIT_OWNER, 0, 0, ownerData(ownerProof(L_LIMIT, OWNER, nonceBytes(), v), v))), n + " bytes");
         }
+        assertEquals(0, limit(), "and nothing was written");
         assertEquals(SW_OK, setAllowance(1000, 100, 50));
         assertEquals(1000, limit());
         assertEquals(100, paymentLimit());
@@ -11749,7 +11862,7 @@ class CashuAppletTest {
         assertEquals(16, noPinSpent(), "a new day's limit begins the window again, but the allowance renews on the PIN alone (1.21), so its count stays");
         assertEquals(0, spentToday());
         assertEquals(T0 + 1000, windowStart());
-        // the four-byte and the eight-byte forms leave the allowance as it is
+        // the day's alone, and the day's and the payment's, as 1.22's four and eight bytes set them, leave the allowance as it is
         assertEquals(SW_OK, verify(TEST_PIN));
         assertEquals(SW_OK, load(buildProof(KEYSET, 8, 3)).getSW());
         tap();
@@ -11757,7 +11870,7 @@ class CashuAppletTest {
         assertEquals(8, noPinSpent());
         assertEquals(SW_OK, setLimit(2000));
         assertEquals(80, noPinLimit(), "the day's alone: the allowance as it was");
-        assertEquals(8, noPinSpent(), "(four bytes begin the window again, as ever, but the allowance renews on the PIN alone in 1.21)");
+        assertEquals(8, noPinSpent(), "(the allowance renews on the PIN alone, 1.21)");
         assertEquals(SW_OK, setLimits(2000, 100));
         assertEquals(80, noPinLimit(), "the day's and the payment's: the allowance as it was");
         assertEquals(100, paymentLimit());
@@ -11768,7 +11881,7 @@ class CashuAppletTest {
         assertEquals(SW_OK, load(buildProof(KEYSET, 8, 4)).getSW());
         tap();
         assertEquals(SW_PIN_NEEDED, spend(3).getSW(), "an allowance of nothing: every payment asks for the PIN");
-        // twelve bytes with a zero allowance are the eight-byte form and the allowance off
+        // a zero allowance is the allowance off
         assertEquals(SW_OK, setAllowance(1000, 100, 0));
         assertEquals(1000, limit());
         assertEquals(100, paymentLimit());
@@ -12414,7 +12527,7 @@ class CashuAppletTest {
         byte[] d = info();
         assertEquals(30, d.length);
         byte[] fresh = new byte[30];
-        fresh[0] = 1; fresh[1] = 22; fresh[2] = (byte) 128; fresh[5] = (byte) 128; fresh[6] = (byte) 0xFF; fresh[8] = 4; fresh[9] = 3;
+        fresh[0] = 1; fresh[1] = 23; fresh[2] = (byte) 128; fresh[5] = (byte) 128; fresh[6] = (byte) 0xFF; fresh[8] = 4; fresh[9] = 3;
         System.arraycopy(u32(nowBefore), 0, fresh, 17, 4);
         assertArrayEquals(fresh, d, "GET_INFO: a new card, with the clock it had");
         assertEquals(nowBefore, now());
@@ -12535,7 +12648,7 @@ class CashuAppletTest {
         assertEquals(SW_OWNER_PROOF, setLimit(5), "the old owner's proof is no proof now");
         assertEquals(SW_OWNER_PROOF, resetCard(), "nor does it reset the card");
         assertEquals(SW_OWNER_PROOF, sw(changePinCommand(ownerProof(L_PIN, OWNER, nonceBytes(), TEST_PIN), TEST_PIN)));
-        assertEquals(SW_OK, sw(setLimitCommand(ownerProof(L_LIMIT, OTHER_OWNER, nonceBytes(), u32(9)), 9)), "the new owner's is");
+        assertEquals(SW_OK, sw(setLimitCommand(ownerProof(L_LIMIT, OTHER_OWNER, nonceBytes(), dayValue(9)), dayValue(9))), "the new owner's is");
         assertEquals(9, limit());
         assertEquals(SW_OK, load(buildProof(KEYSET, 5, 71)).getSW(), "and loading works");
         assertEquals(1, logTaps(), "the log begins at once with this tap's load");

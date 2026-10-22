@@ -503,7 +503,7 @@ class TagTest {
         assertEquals(0x6999, selectTag().getSW(), "the tag application refuses its name");
         ResponseAPDU card = selectCard();
         assertEquals(SW_OK, card.getSW(), "the card's own name is selected");
-        assertArrayEquals(new byte[] { 0x01, 0x16 }, card.getData(), "and answers its version, 1.22");
+        assertArrayEquals(new byte[] { 0x01, 0x17 }, card.getData(), "and answers its version, 1.23");
         assertEquals(1, infoTag().getData()[42], "and says the tag is off");
         assertEquals(0x6999, selectTag().getSW(), "the tag asks at each selection, and it is still off");
         selectCard();
@@ -577,7 +577,7 @@ class TagTest {
     }
 
     @Test
-    @DisplayName("GET_INFO says it in the 43rd byte of the answer to P1 = 2, 00 on and 01 off; P1 = 0 is the 30 bytes and P1 = 1 the 42 bytes they always were, to the byte, whatever the tag's state; any other P1 is answered as it was, with the thirty bytes")
+    @DisplayName("GET_INFO says it in the 43rd byte of the answer to P1 = 2, 00 on and 01 off; P1 = 0 is the 30 bytes and P1 = 1 the 42 bytes they always were, to the byte, whatever the tag's state; any other P1 but 3 (1.23, which is P1 = 2's and the book's) is answered as it was, with the thirty bytes")
     void testGetInfo() {
         owned();
         byte[] thirtyOn = info().getData(), longOn = infoTap().getData(), tagOn = infoTag().getData();
@@ -595,7 +595,8 @@ class TagTest {
         assertArrayEquals(longOff, Arrays.copyOf(tagOff, 42), "P1 = 2 begins with them");
         assertEquals(1, tagOff[42], "and the tag is off");
         assertArrayEquals(thirtyOn, Arrays.copyOf(tagOff, 30), "the 30 are the first of the 43");
-        for (int p1 : new int[] { 3, 4, 0x10, 0x7F, 0x80, 0xFF }) {
+        assertArrayEquals(tagOff, Arrays.copyOf(send(new CommandAPDU(CLA, INS_GET_INFO, 3, 0, 256)).getData(), 43), "P1 = 3 (1.23) begins with the 43 of P1 = 2");
+        for (int p1 : new int[] { 4, 5, 0x10, 0x7F, 0x80, 0xFF }) {
             ResponseAPDU other = send(new CommandAPDU(CLA, INS_GET_INFO, p1, 0, 256));
             assertEquals(SW_OK, other.getSW(), "P1 = " + p1);
             assertArrayEquals(thirtyOff, other.getData(), "any other P1 is answered as it was: the thirty bytes (P1 = " + p1 + ")");
@@ -616,7 +617,7 @@ class TagTest {
     @DisplayName("A reader of software 1.18 sees nothing new: it takes the answer to P1 = 1 as the long form because it is exactly 42 bytes, with the tag on or off, and reads the limit on one payment (with the owner's grant) and the no-PIN allowance as it did")
     void testAReaderOfSoftware118SeesNothingNew() {
         owned();
-        byte[] limits = concat(CashuAppletTest.u32(1000), CashuAppletTest.u32(100), CashuAppletTest.u32(50));
+        byte[] limits = CashuAppletTest.limits16(1000, 100, 50);
         assertEquals(SW_OK, sw(new CommandAPDU(CLA, 0x34, 0, 0, ownerData(ownerProof("FoxyCard/set-limit", OWNER, nonce(), limits), limits))), "the owner sets all three limits");
         assertEquals(SW_OK, sw(new CommandAPDU(CLA, 0x45, 0, 0, ownerData(ownerProof("FoxyCard/load", OWNER, nonce(), new byte[0]), new byte[0]))), "and gives the grant, so that the limit on one payment is said");
         long[] on = readAsAWalletOf118Does(info().getData(), infoTap().getData());

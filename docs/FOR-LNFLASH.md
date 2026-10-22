@@ -393,12 +393,13 @@ visit, where the owner has set one.
   money on such a card: it has no owner to unblock it.
 - A cash card that is lost is lost money.
 
-## 9. What a 2.0 should carry from 1.21 and 1.22
+## 9. What a 2.0 should carry from 1.21, 1.22 and 1.23
 
 The rules as built are in `docs/FOXY-CARD-DAILY-LIMIT.md`: 6f (a PIN first, the
-allowance), 8.2 (the card's own change), 8.3 (the claim) and 8.4 (a holder with no
-phone); section 15 there lists them version by version. What a 2.0 card should
-carry from them:
+allowance), 8.2 (the card's own change), 8.3 (the claim), 8.4 (a holder with no
+phone) and 8.5 (dollars and sats on one card); section 15 there lists them version by
+version, and `docs/FOXY-CARD-KEYSETS.md` has 1.23's design with its reasons. What a 2.0
+card should carry from them:
 
 1. **A PIN before any money.** A card with no PIN takes no piece and makes no
    payment (`6A97`). Every load wants the PIN given in the tap, and nothing waives
@@ -457,11 +458,32 @@ carry from them:
    the holder's history in the same tap. With the hold done the PIN is told the
    limit on one payment, which no owner's grant can show on such a card. The
    balance and the pieces are not held for: a till needs them to be paid.
+9. **Every piece of one unit, known to the card** (1.23). A card at a mint that
+   issues dollars and sats keeps a table of the keysets it holds and the unit of
+   each, told at the load that first brings a keyset (a byte before the pieces, or
+   the record's unit) and never changed while a piece or an opening of change names
+   it. A keyset entered as one unit refuses a piece labelled the other. A new keyset
+   of the other unit, unless it is the last payment's (a till's refund in the mint's
+   new keyset), wants the holder's say in the tap, and at most two entries may lack
+   it, so a till with the PIN cannot fill the table. A payment is of one unit, refused
+   before anything is hashed otherwise. A phone that knows one unit must be stopped
+   by something it already checks: here the format byte, 5 while the card holds both.
+10. **One ceiling, in one money** (1.23). Every limit in cents, and a payment in sats
+   turned into cents with a rate the owner's phone writes with the limits, under the
+   same proof, rounded so that a payment is never counted for less than its worth; no
+   rate and a limit set refuses every payment in sats, and every load of sats, so that
+   no card holds sats it can never pay. Two ceilings, one a unit, would
+   give a terminal with the PIN both and a thief two allowances. The arithmetic is on
+   bytes, as nothing on the card uses `int`.
 
 What 1.22 leaves to a 2.0: a reader that keeps a card's PIN, rather than one handed
 it for a payment, can still hold a tap of its own on a card with no owner and read,
 rewrite or spoil there (`SECURITY-MODEL.md` 20 to 22); and a card with no owner
-whose PIN is blocked strands its money (14).
+whose PIN is blocked strands its money (14). What 1.23 leaves: the rate does not follow
+the market between two reads by the owner's phone, and a terminal can label a piece of
+its own money wrongly where it may enter its keyset (`SECURITY-MODEL.md` 23, 24); and a
+card at more than one mint, for which the door is marked (an instruction and a form left
+unused, two bits of each entry's state byte zero).
 
 ## 10. Where it is
 

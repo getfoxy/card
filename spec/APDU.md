@@ -8,14 +8,17 @@ This is upstream's command reference, with Foxy's software noted where it differ
 Foxy's applet has an AID of its own (`F0 46 4F 58 59 43 41 52 44`) and a wire of its
 own. Every command of it is in one table in `docs/FOXY-CARD-DAILY-LIMIT.md` section 8,
 with the answers in the order the card checks them; the notes on this page say what
-Foxy's software 1.22 does (`SELECT` answers `01 16`), and say the same. In short: a
+Foxy's software 1.23 does (`SELECT` answers `01 17`), and say the same. In short: a
 card is given its PIN before anything goes on it or leaves it (1.21); every load wants
 the PIN given in the tap; the card makes its own change, bound to the mint's key named
 at the payment, and unblinds it itself, and any reader may write that change back
 ([LOAD_CHANGE](#load_change-0x53--software-121)); an owner is claimed slowly
 ([SET_OWNER](#set_owner-0x43--software-121)); and a card with a PIN and no owner, the
 card of a holder with no phone, is set up and loaded under its PIN and holds its history
-for its PIN (1.22, [GET_LOG](#get_log-0x18--software-122-on-a-card-with-no-owner)).
+for its PIN (1.22, [GET_LOG](#get_log-0x18--software-122-on-a-card-with-no-owner)); and a
+card holds dollars and sats at its one mint, a table on the card saying which unit each
+keyset is, every limit in cents and a payment in sats turned into cents at a rate the
+owner's phone writes (1.23, [Software 1.23](#software-123-dollars-and-sats-on-one-card)).
 
 ---
 
@@ -79,7 +82,7 @@ Returns applet version, capabilities, and slot statistics. Always available with
 | 2 | PIN protection available |
 | 3–7 | Reserved (0) |
 
-**In Foxy's software** the answer is 30 bytes (see `docs/FOXY-CARD-SPEC.md` 5.2; any P1 but 1 and 2). Asked with P1 = 1 it is 42 bytes. From 1.19, asked with P1 = 2 it is those 42 bytes and one more, the 43rd, which says whether the NFC tag is on: `00` on, `01` off. Nothing in them says whether the card has room for the mint's proofs (see [GET_DLEQ](#get_dleq-0x1a--software-120)). Byte 29 is `01` while change is owed to the card (an opening of its own change waits for its piece) and `00` otherwise, said to anyone (1.21; up to 1.20 it said whether this tap might load with no PIN). Byte 7 is as above; a PIN state of 0 is a card that holds nothing and pays nothing (1.21). The limit on one payment (bytes 30 to 33 of the 42) is told to the owner's grant given in the tap, and, on a card with no owner, to the PIN given in a tap in which the history was held for (1.22); to any other reader it is zeros. GET_INFO refuses nothing.
+**In Foxy's software** the answer is 30 bytes (see `docs/FOXY-CARD-SPEC.md` 5.2; any P1 but 1, 2 and 3). Asked with P1 = 1 it is 42 bytes. From 1.19, asked with P1 = 2 it is those 42 bytes and one more, the 43rd, which says whether the NFC tag is on: `00` on, `01` off. Nothing in them says whether the card has room for the mint's proofs (see [GET_DLEQ](#get_dleq-0x1a--software-120)). Byte 29 is `01` while change is owed to the card (an opening of its own change waits for its piece) and `00` otherwise, said to anyone (1.21; up to 1.20 it said whether this tap might load with no PIN). Byte 7 is as above; a PIN state of 0 is a card that holds nothing and pays nothing (1.21). The limit on one payment (bytes 30 to 33 of the 42) is told to the owner's grant given in the tap, and, on a card with no owner, to the PIN given in a tap in which the history was held for (1.22); to any other reader it is zeros. From 1.23, asked with P1 = 3 it is the 43 bytes of P1 = 2 and eight more, 51 in all: the book's format (43: `01`, or `00` where the card has no book, before its first `SET_CARD` or refused the room), the rate (44 to 47, sats to the dollar, told to whom the limit on one payment is told and zeros to anyone else), the entries of the table in use (48), how many of them lack the mark (49), and the last payment's unit (50: `80` the record's, `A0` the other, `00` none). Byte 8, the card's format, is worked out at each asking from 1.23: `04` for a card whose table holds no keyset of the other unit than the record's, `05` for one that does; the secret of every piece is format 4's either way, and a phone that knows only 4 refuses a card that says 5. GET_INFO refuses nothing.
 
 **PIN state 2 is not "no PIN".** A blocked card still has a PIN; it can never
 be verified again (`VERIFY_PIN` answers `6983`), so every PIN-gated command
@@ -117,6 +120,8 @@ Returns the card's secp256k1 public key (compressed, 33 bytes). This key is gene
 ### GET_BALANCE (0x11)
 
 Returns the sum of all unspent proof amounts as a 4-byte big-endian uint32. Unit matches the keyset unit (sats or cents).
+
+**In Foxy's software 1.23** the sum (P1 = 0, and any P1 but 1) is of the unspent pieces of the record's unit alone: on a card of one unit every piece, as it always was, and never a sum of cents and sats together. With **P1 = 1** the answer is how many units the card holds (1: 0, 1 or 2), then for each, sats first, its unit code (1: `00` sats, `01` dollars), its pieces (1) and their sum (4): 13 bytes at the most. A sum past four bytes wraps, as it always has. A piece whose keyset is in no entry of the table is in no sum.
 
 | Field | Value |
 |-------|-------|
@@ -238,11 +243,13 @@ Gives back the mint's proof (NUT-12) that the card keeps with an unspent piece: 
 
 The card's own account of its taps (P1 = 0) and its receipts (P1 = 1, P2 = how many back from the newest to begin); the sizes are in `docs/FOXY-CARD-SPEC.md` 5.2 and the layouts in `docs/FOXY-CARD-DAILY-LIMIT.md` 6b. Who reads them depends on the card.
 
+From software 1.23 a log entry is of one unit: bit 5 (`20`) of its flags says the other unit than the record's, and a tap whose payment or load is of another unit than its entry begins a new entry. **P1 = 2** is P1 = 0's answer with the other unit's count of what was signed for, ever (4), after the four counts: 20 bytes of counts and up to eight entries, 180 bytes at the most. **P1 = 3** is P1 = 1's with each receipt followed by its payment's unit (`80` the record's, `A0` the other, `00` a receipt made before the book), 78 bytes a receipt, 238 at the most. P1 = 2 is read as P1 = 0 is and P1 = 3 as P1 = 1, and on a card with no owner each counts toward the held tap as the form it extends.
+
 | Field | Value |
 |-------|-------|
 | CLA | B0 |
 | INS | 18 |
-| P1 | 00 the log; 01 the receipts |
+| P1 | 00 the log; 01 the receipts; 02 and 03 the same with the units (1.23) |
 | P2 | 00 for the log; for the receipts, how many back from the newest |
 | Le | 00 (256) |
 
@@ -256,7 +263,7 @@ The card's own account of its taps (P1 = 0) and its receipts (P1 = 1, P2 = how m
 
 | SW | Meaning |
 |----|---------|
-| 6A86 | A P1 other than 00 and 01 (it neither counts nor ends the history's count) |
+| 6A86 | A P1 other than 00 to 03 (00 and 01 up to 1.22; it neither counts nor ends the history's count) |
 | 6982 | The PIN not given in this tap (and, with an owner, no grant; the receipts of a card with an owner want the grant) |
 | 6985 | A card with no owner, in a time in the field in which a payment was signed; before any asking is counted |
 | 6A98 | Keep holding: an asking of a card with no owner counted, and the history not yet given; ask again |
@@ -386,9 +393,19 @@ Stores a new proof in the next available empty slot. Used during card top-up (fu
 | 6700 | Foxy: a length that is not one, two or three pieces of 81 bytes (with P1 = 1: not 177) |
 | 6A8E | Foxy, for each piece: a dated piece on a card with no refund key (after `6A84` for a piece with no slot left) |
 | 6A80 | Foxy, for each piece: a `C` that is not a compressed point, an amount of 0, or (P1 = 1) a proof of 96 zero bytes |
+| 6B00 | Foxy, 1.23: a P2 other than 00 and 01 (before the length) |
+| 6700 | Foxy, 1.23, with P2 = 1: a length that is not the unit and one to three pieces (82, 163, 244; with P1 = 1, 178) |
+| 6A80 | Foxy, 1.23, with P2 = 1: a unit code over `01` |
+| 6A9C | Foxy, 1.23, with P2 = 1: a label of the other unit on a card refused the room for its book |
+| 6A99 | Foxy, 1.23: pieces in sats (P2 = 1 with the unit `00`, or P2 = 0 on a sats record) on a card with a limit set (the daily limit, the limit on one payment or the no-PIN allowance) and no rate; nothing written. No payment of them could be signed (`SPEND_ALL_SIGN` answers `6A99`), and a card with no owner takes a rate only while it is empty, so they would stay on the card for good. `LOAD_CHANGE` is not refused this way: change is of a payment already signed |
+| 6A9B | Foxy, 1.23, for each piece: its keyset is in the table as the other unit than the load names (a piece of P2 = 0 is of the record's unit) |
+| 6A9D | Foxy, 1.23, for each piece: its keyset is in no entry, and it is of neither the record's unit nor the last payment's, with no holder's say in the tap (the owner's grant; with no owner, the history held for) |
+| 6A9C | Foxy, 1.23, for each piece: its keyset is in no entry, and after a reclaim of the table no entry is free, or the new entry would be a third live one without the mark |
 | 6A94 | Foxy, for each piece: a piece whose nonce is already in a slot, spent or not; checked last, before anything is written |
 
-(Up to 1.21, `6A90` for a card with no owner came after `6982`.)
+(Up to 1.21, `6A90` for a card with no owner came after `6982`. The rows of 1.23 come in this order: `6B00` and `6700` after `6A84`, the unit's `6A80` and `6A9C` once before the first piece, then `6A99` once, and for each piece `6A9B`, `6A9D` and `6A9C` after its `6A80` and before its `6A94`.)
+
+**With P2 = 1 (Foxy's software 1.23): the pieces' unit first.** The first data byte is the unit of every piece in the command, `00` sats or `01` dollars, and everything after it is read as with P2 = 0, one byte on: one to three pieces (82, 163 or 244 bytes), or with P1 = 1 one piece and its proof (178). The answer is as with P2 = 0. A piece whose keyset is in no entry of the table is entered there as the command's unit, the entry's eight keyset bytes and then its state byte written before anything of the place: marked where the holder's say is in the tap. A card of 1.22 answers every labelled length `6700`, so a label sent by mistake writes nothing.
 
 **Write order.** The card stores the 77 bytes, then marks the slot unspent
 (D14, applet 0.4 and later; a card whose `SELECT` answers below `00 04` may
@@ -718,6 +735,27 @@ The capability container (`E103`, 15 bytes) is `00 0F 20 00 3B 00 34 04 06 E1 04
 
 ---
 
+## Software 1.23: dollars and sats on one card
+
+The design is `docs/FOXY-CARD-KEYSETS.md`; this is the wire, command by command. `SELECT` answers `01 17`. No instruction and no capability bit is new.
+
+**The book.** The first `SET_CARD` that goes through reserves 75 bytes beside the store of the mint's proofs, once and outside any transaction: the table of six entries of nine bytes (a keyset's eight bytes as a piece holds them, then a state byte: `00` free; `40` in use, ORed with `80` the mark, entered with the holder's say, and with the unit code in bit 0, `00` sats, `01` dollars), the last payment's unit (1), the other unit's count of what was signed for, ever (4), and the receipts' units (16). A card refused the room is a card of one unit: every piece the record's, and a load labelled the other unit `6A9C`.
+
+| Command | What 1.23 changes |
+|---|---|
+| `GET_INFO` (`01`) | byte 8 worked out: `04` one unit, `05` both; P1 = 3, 51 bytes (above) |
+| `GET_BALANCE` (`11`) | P1 = 0 the record's unit's sum; P1 = 1 each unit's (above) |
+| `GET_CARD` (`16`) | byte 0 is the card's format as GET_INFO byte 8; the rate, kept in the first four of the 29 bytes after the newest header's hash, is answered as zeros. **P1 = 2**: the table, a count (1) and each entry in use as kept (9), in the table's order, 55 bytes at the most; `00` alone on a card with no book. Any other P1 is P1 = 0. No PIN, any state |
+| `GET_LOG` (`18`) | P1 = 2 and 3 (above) |
+| `SPEND_ALL_BEGIN` (`22`) | **`6A9A`** for places of both units, or a place whose keyset is in no entry, checked as each place is named (after its `6A88`, `6985` and `6A80`); nothing hashed, no payment begun. Two keysets of one unit pay together |
+| `SPEND_ALL_SIGN` (`24`) | a payment in sats is turned into cents at the rate, `ceil(sats × 100 / rate)`, a quotient past four bytes taken as `FF FF FF FF`, its whole for the allowance and what leaves the card for the day and the wait, at the first `SIGN` and again at the last; **`6A99`** for a payment in sats with any limit set and no rate, before the PIN is asked, the payment given up and nothing signed, counted or written. A payment in dollars is held to the limits as it is. The log entry, the count and the receipt are in the payment's own unit and say it; the last payment's unit is written with the payment |
+| `LOAD_PROOF` (`30`) | P2 = 1, the unit first (above); the table's rules at every piece; **`6A99`** for pieces in sats on a card with a limit set and no rate, nothing written |
+| `CLEAR_SPENT` (`31`) | after the spent places are freed, the table is reclaimed: every entry that no unspent place and no opening of change drafted or owed names is set free |
+| `SET_CARD` (`32`) | **`6A80`** for a unit other than `00` and `01`. After every check, before the record's transaction and outside it: the book reserved the first time, any opening drafted for a payment never signed let go, the table reclaimed (every entry free, the card being empty and owed nothing), the last payment's unit `00`. The rate, every limit, the other unit's count and the receipts' units stay |
+| `SET_LIMIT`, PIN form (`33`) | **twelve bytes**: the limit on one payment (4), the no-PIN allowance (4), both cents, and the rate (4, sats to the dollar, `00000000` none). 1.22's four and eight bytes are taken only on a dollars record (they are cents there), the rate left as it is, and are `6700` on a sats record and before the first `SET_CARD` |
+| `SET_LIMIT`, owner's form (`34`) | **sixteen bytes** after the proof: the daily limit, the limit on one payment, the no-PIN allowance (cents) and the rate; the proof is over all sixteen. 1.22's four, eight and twelve bytes are taken only on a dollars record, the rate left as it is, and are `6700` on a sats record. A rate alone changed begins no window and keeps every count |
+| `RESET_CARD` (`51`) | the book zeroed, outside any transaction; the rate zeroed with the record |
+
 ## Error Code Summary
 
 | SW | Meaning |
@@ -733,7 +771,7 @@ The capability container (`E103`, 15 bytes) is `00 0F 20 00 3B 00 34 04 06 E1 04
 | 6A 83 | Record not found (slot out of range). Foxy: also an opening of change numbered past 7 |
 | 6A 84 | Not enough memory (no empty slots). Foxy: also no opening of change free for `SPEND_ALL_CHANGE` |
 | 6A 88 | Referenced data not found (slot empty). Foxy: also an opening of change that waits for nothing, and `SPEND_ALL_AGAIN` with no signature to give again |
-| 6A 80 | Wrong data (Foxy: a piece, a key, a point, a proof or an envelope that is not what it should be) |
+| 6A 80 | Wrong data (Foxy: a piece, a key, a point, a proof or an envelope that is not what it should be; from 1.23 a unit code over `01` in `SET_CARD` or a labelled `LOAD_PROOF`) |
 | 6A 86 | Incorrect P1 or P2 (Foxy: a form the command does not have) |
 | 6A 8C | Foxy: the card has no record (`SET_CARD` has not run) |
 | 6A 8D | Foxy: something set only on an empty card, with a piece unspent or (1.21) change owed |
@@ -746,7 +784,12 @@ The capability container (`E103`, 15 bytes) is `00 0F 20 00 3B 00 34 04 06 E1 04
 | 6A 96 | Foxy: a payment of more places than the card has, or one its transaction could not hold |
 | 6A 97 | Foxy, 1.21: the card has no PIN; a load, a payment, an owner's claim or (1.22) a let-go is refused until it is given one |
 | 6A 98 | Foxy, 1.21: keep holding; a held tap counted and not yet through (an owner's claim; from 1.22 the history of a card with no owner): ask again |
-| 6B 00 | Wrong P1 or P2 (Foxy: a confirming byte, or a byte that does not match P1 or P2) |
+| 6A 99 | Foxy, 1.23: no rate. `SPEND_ALL_SIGN` of a payment in sats on a card with a limit set and no rate; the payment given up, nothing signed, counted or written |
+| 6A 9A | Foxy, 1.23: two units in one payment. `SPEND_ALL_BEGIN` given places of both units, or a place whose keyset is in no entry of the table; no payment begun |
+| 6A 9B | Foxy, 1.23: the other unit. A load of a piece whose keyset is in the table as the other unit than the load names; nothing written |
+| 6A 9C | Foxy, 1.23: no room in the table. A new keyset with no entry free after a reclaim, or a third live entry without the mark; and a load labelled the other unit on a card refused its book; nothing of the piece written |
+| 6A 9D | Foxy, 1.23: not this tap's to start. A new keyset of the other unit than the record's, not the last payment's, without the holder's say in the tap; nothing written |
+| 6B 00 | Wrong P1 or P2 (Foxy: a confirming byte, or a byte that does not match P1 or P2; from 1.23 a `LOAD_PROOF` with a P2 other than 00 and 01) |
 | 6D 00 | Instruction not supported |
 | 6E 00 | Class not supported |
 | 6F 00 | No precise diagnosis (hardware / crypto error) |

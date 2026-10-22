@@ -205,6 +205,9 @@ class SchnorrHWMathTest {
           "if (dleq == null) { try { dleq = new byte[(short)(MAX_PROOFS * DLEQ_LEN)]; } catch (SystemException e) { dleq = null; } }" },
         { "CashuApplet.java", "private void processSetCard(",
           "if (openKeys == null) { try { openKeys = new byte[(short)(CHANGE_MOST * KEY_LEN)]; } catch (SystemException e) { openKeys = null; } }" },
+        // 1.23: the book, the table of keysets and the three small things beside it, 75 bytes: past the 37 the constructors have to spare
+        { "CashuApplet.java", "private void processSetCard(",
+          "if (book == null) { try { book = new byte[BOOK_LEN]; } catch (SystemException e) { book = null; } }" },
     };
 
     /**
@@ -364,10 +367,10 @@ class SchnorrHWMathTest {
      * 1.20 reserves the store of the mint's proofs in SET_CARD, and nowhere else: the constructors name it nowhere, the one allocation
      * is the guarded one in SET_CARD, it comes before the transaction that writes the record and outside any, and nothing else assigns
      * the store. (The chip refuses an applet whose constructor asks for that much more; no simulator does, so the source is read.)
-     * 1.21's room for the openings' keys (`openKeys`) is held to the same, each array on its own.
+     * 1.21's room for the openings' keys (`openKeys`) is held to the same, each array on its own, and so is 1.23's book (`book`).
      */
     @Test
-    @DisplayName("the store of the mint's proofs and the room for the openings' keys are reserved in SET_CARD, each guarded, before and outside its transaction, and no constructor or other method assigns either")
+    @DisplayName("the store of the mint's proofs, the room for the openings' keys and the book (1.23) are reserved in SET_CARD, each guarded, before and outside its transaction, and no constructor or other method assigns any of them")
     void theProofStoreIsReservedInSetCardAndNowhereElse() throws Exception {
         String src = stripCommentsAndCharLiterals(new String(
             java.nio.file.Files.readAllBytes(mainSourceDir().resolve("CashuApplet.java")), java.nio.charset.StandardCharsets.UTF_8));
@@ -375,7 +378,7 @@ class SchnorrHWMathTest {
         int[] setCard = bodyRange(src, "private void processSetCard(");
         String body = src.substring(setCard[0], setCard[1]);
         int begin = body.indexOf("JCSystem.beginTransaction()");
-        for (String store : new String[] { "dleq", "openKeys" }) {
+        for (String store : new String[] { "dleq", "openKeys", "book" }) {
             org.junit.jupiter.api.Assertions.assertFalse(src.substring(constructor[0], constructor[1]).contains(store),
                 "the constructor does not name " + store + ": asked for there, the chip refuses to install the applet");
             int guard = body.indexOf("if (" + store + " == null)");

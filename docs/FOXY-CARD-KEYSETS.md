@@ -5,8 +5,10 @@ cents whichever it pays with, and the change to the card's software that this
 needs: a table, kept on the card, of which unit each keyset it holds is, and a
 rate, written by the owner's phone, that turns sats into cents at a payment.
 
-This is the design of software 1.23 (`SELECT` answers `01 17`). Nothing in it is
-built. It is written against software 1.22 (`01 16`) as it is in
+This is the design of software 1.23 (`SELECT` answers `01 17`). The card's part of it
+is built (`CashuApplet.java`, tested by `UnitsTest`); section 12 says what it came to,
+measured, and 12.5 where the build differs from this text. The phone's part (9) is not.
+It is written against software 1.22 (`01 16`) as it is in
 `CashuApplet.java` and as `FOXY-CARD-DAILY-LIMIT.md` (LIMIT below) describes it,
 against `FOXY-CARD-SPEC.md` (SPEC), `spec/APDU.md` and `FOXY-CARD-HARDWARE.md`,
 and against the phone's reading of a card in `build/wallet/08a-flashcard.js`,
@@ -542,6 +544,12 @@ The payment's unit is its first place's entry's (7.1). At the first
    taking a sats payment as unbounded or as zero cents, which would leave a ceiling
    the owner set with none for sats. Foxy's phone writes the rate with every
    ceiling (9.1), so `6A99` is met only by a card set by something else.
+   **And at the load:** pieces in sats on a card with a limit set and no rate are
+   refused `6A99` at `LOAD_PROOF`, before any is read, nothing written. A card with
+   no owner takes a rate only while it is empty and owes nothing (6.3), so sats put
+   on it then could never be paid, and nothing could set it again while they were
+   there. Change (`LOAD_CHANGE`) is never refused this way: it is of a payment
+   already signed, which a rate weighed.
 3. **The allowance** (`requireAllowanceOrPin`), held to the whole in cents, as 1.22
    holds it to the whole in its unit: `6A94` over it, the PIN for the whole payment.
 4. **The day** (`requireUnderLimits`), held to what leaves the card in cents, where
@@ -717,7 +725,7 @@ knows.
 | `18` | GET_LOG | as P1 = 0 and 1 | P1 = 2 or 3 | the counts with the other unit's; the receipts with their units (6.6) |
 | `22` | SPEND_ALL_BEGIN | as 1.22 | | `6A9A` for places of both units, or of no entry (7.1) |
 | `24` | SPEND_ALL_SIGN | as 1.22 | | a sats payment in cents at the rate; `6A99` with a limit and no rate; the last unit written (6.4, 7.4) |
-| `30` | LOAD_PROOF | as 1.22 for the load (the PIN given in this tap); the holder's say for a new keyset of the other unit (3.3) | P2 = 1: the unit code (1), then the pieces; any P2 but 0 and 1 is `6B00` | `6A9B`, `6A9C`, `6A9D` as 3.3; a new keyset entered |
+| `30` | LOAD_PROOF | as 1.22 for the load (the PIN given in this tap); the holder's say for a new keyset of the other unit (3.3) | P2 = 1: the unit code (1), then the pieces; any P2 but 0 and 1 is `6B00` | `6A9B`, `6A9C`, `6A9D` as 3.3; `6A99` for pieces in sats on a card with a limit and no rate (6.4); a new keyset entered |
 | `31` | CLEAR_SPENT | as 1.22 | | and a reclaim of the table (3.4) |
 | `32` | SET_CARD | as 1.22 | as 1.22 | `6A80` for a unit over `01`; drafted openings let go and the table reclaimed before its transaction; the book reserved the first time (3.4, 3.6) |
 | `33` | SET_LIMIT, PIN form | as 1.22 | 12 bytes: limit on one payment, allowance, rate | the 4 and 8 bytes of 1.22 only on a dollars record, `6700` on a sats one (6.3) |
@@ -744,7 +752,7 @@ balances") collide with 1.21's words and are not used for them:
 
 | SW | Means (1.23) |
 |---|---|
-| `6A99` | **no rate**: `SPEND_ALL_SIGN` of a sats payment on a card with a limit set and no rate. The payment given up; nothing signed, burned, counted or written in the log (6.4) |
+| `6A99` | **no rate**: `SPEND_ALL_SIGN` of a sats payment on a card with a limit set and no rate. The payment given up; nothing signed, burned, counted or written in the log; and `LOAD_PROOF` of pieces in sats on such a card, nothing written (6.4) |
 | `6A9A` | **two units in one payment**: `SPEND_ALL_BEGIN` given places of both units, or a place of no entry. Nothing hashed, counted or written; no payment begun (7.1) |
 | `6A9B` | **the other unit**: a load whose piece's keyset is in the table as the other unit than the load names. Nothing written (3.3) |
 | `6A9C` | **no room in the table**: a new keyset with no free entry after a reclaim, or a third live entry without the mark; and every load labelled the other unit on a card refused its book. Nothing of the piece written (3.3) |
@@ -1060,6 +1068,8 @@ Thirty-four tests, each and what it pins:
 | U31 | `onlyTheseMethodsNameTheBook` | a source scan, as the proofs' store has: `processSetCard`, `processResetCard`, `processLoadProof`, `loadOne`, `processLoadChange`, the reclaim, `processSpendAllBegin`, `processSpendAllSign`, and the readers of `GET_INFO`, `GET_CARD`, `GET_BALANCE` and `GET_LOG`; no other |
 | U32 | `theTransactionsGrowByWhatTheDesignSays` | the source readings that count what each transaction writes: `SIGN`'s and the receipt's one byte more, `writeLimit`'s one copy more, nothing in `SET_CARD`'s |
 | U33 | `aOneUnitCardAnswersTheTwentyTwoTranscript` | `spec/vectors/transcript.json`'s 1.22 commands replayed on a 1.23 card in sats: every answer equal but the version, and the old-length `SET_LIMIT`s, `6700` (U23); on a card in dollars, those too. Goal 5, pinned whole |
+| U35 | `satsOntoACardWithALimitAndNoRateAreRefusedAtTheLoad` | a card with no owner in sats, a limit and a rate of 0 by the twelve bytes: sats `6A99` at the load, labelled or not, nothing written; a rate written while it is empty, and they go on and are paid; a dollars card set by 1.22's eight bytes refuses sats in a held tap and takes dollars; with no limit, sats go on with no rate |
+| U36 | `dollarChangeIsLoggedAsDollars` | dollar change on a sats card, loaded with no PIN, is logged in an entry with bit 5: the unit of its opening's keyset |
 | U34 | `theCentsAreWorkedInScratchAndAskNoRam` | a source scan: the conversion names `scratch` at offsets inside `X_HEX` only, and nothing else is written there between the conversion and its use; the RAM budget test stays at 941 and 7 |
 
 Changed, keeping what each pins:
@@ -1150,7 +1160,7 @@ LIMIT 13. Numbered to follow the threat table's 16.
 | 22 | **A phone of today reading cents as sats** | in a piece: the format is 5 for a card of both units, and a phone of today refuses it at the read (10.2). In a figure: on a sats card of 1.23 it reads the ceiling's cents as sats on its screen and in its guess at the PIN, which the card overrules; it cannot write a figure in sats there (`6700`) |
 | 23 | **A figure in cents taken as sats by a card that does not know units** | the sixteen- and twelve-byte `SET_LIMIT` and the labelled `LOAD_PROOF` are lengths a card of 1.22 refuses (`6700`) |
 | 24 | **A reader that adds a card's balance**, an upstream terminal | `GET_BALANCE` P1 = 0 is the record's unit alone; no command of the card adds two units |
-| 25 | **A stale rate.** The price moves after the owner's phone wrote R, and a sats payment is weighed at the old price | The owner's phone re-pegs R at every read as owner where its price has moved more than 2% (6.5). Between reads, the ceiling for sats moves with the price as a 1.22 sats limit's worth in dollars always has. A card with no owner keeps its rate while it holds money, as it keeps its limits; it holds a sats payment to the same number of sats a 1.22 card with no owner would. A card with a ceiling and no rate fails closed: `6A99` for every sats payment, never a payment unbounded |
+| 25 | **A stale rate.** The price moves after the owner's phone wrote R, and a sats payment is weighed at the old price | The owner's phone re-pegs R at every read as owner where its price has moved more than 2% (6.5). Between reads, the ceiling for sats moves with the price as a 1.22 sats limit's worth in dollars always has. A card with no owner keeps its rate while it holds money, as it keeps its limits; it holds a sats payment to the same number of sats a 1.22 card with no owner would. A card with a ceiling and no rate fails closed: `6A99` for every sats payment, never a payment unbounded, and `6A99` for every load of sats, so that no card with no owner holds sats it can never pay |
 | 26 | **A wrong rate written by the owner's own phone**: a bad price, or a bug | It costs only sats payments, and in proportion: a rate ten times too many sats per dollar weighs a sats payment at a tenth of its worth, so the limit on one payment and the allowance let ten times their figure of sats go before the next correct re-peg; dollar payments are untouched. A rate ten times too few is ten times stricter: sats payments wait or ask the PIN, and nothing is lost. The phone writes R only from the price SET AMOUNT uses, rounds it toward the stricter, and asks the owner before writing a rate more than twice or less than half the one on the card (9.1). The card cannot judge a price, and does not try |
 | 27 | **A rate written by a till** | It cannot: the rate is written only with the owner's proof (`34`), or, on a card with no owner, under the PIN while the card is empty and owed nothing and, once used, in a held tap (`33`, LIMIT 8.4). A till with the PIN cannot change the rate of a card that holds money, as it cannot change its limits |
 | 28 | **The conversion's arithmetic** | Five bytes for every product a four-byte amount can make, rounding up, and a quotient past four bytes taken as over every ceiling (6.2). U16 and U17 pin it against `BigInteger` |
@@ -1162,21 +1172,29 @@ that has the PIN takes up to the ceiling; the receiver always asks the mint.
 
 ### 12.1 The applet
 
-| Area | Lines of applet code |
-|---|---|
-| the book: constants, the reservation, `SET_CARD`'s reclaim and unit check, `RESET_CARD`'s zeroing | 30 |
-| the table: lookup, the labelled load (the label, and the one-byte shift in `loadOne` and `logLoaded`), the gate, the cap, the order of writes | 90 |
-| the reclaim, at `CLEAR_SPENT`, at a full table or the cap, and at `SET_CARD` | 35 |
-| `SPEND_ALL_BEGIN`'s one unit; `SIGN`'s unit and the last unit | 25 |
-| the ceiling: the conversion, `6A99`, the cents handed to the allowance, the day and the wait | 55 |
-| `SET_LIMIT`: the sixteen- and twelve-byte forms, the old lengths' rule, the rate in `writeLimit` | 25 |
-| `GET_INFO` P1 = 3, the format byte, `GET_CARD` P1 = 2 and the rate masked, `GET_BALANCE` P1 = 1, `GET_LOG` P1 = 2 and 3 | 80 |
-| the log's bit, the other unit's count, the receipts' units | 30 |
-| **in all** | **about 370**, and as many lines of comment in this file's way |
+As built, measured against 1.22 (`git diff` of `CashuApplet.java`): **315 lines of code
+added or changed**, not counting `sizeTheFile`'s, and 210 of comment. The estimate before
+it was about 370. What they
+are:
 
-At the 4.3 to 5.9 bytes of load file a line of code that the earlier draft's estimate
-came to, that is about 1,600 to 2,200 bytes: a load file of about 23,400 to 24,100
-bytes.
+| Area | As built |
+|---|---|
+| the book: constants, the reservation in `SET_CARD` beside the two stores before it, `SET_CARD`'s unit check, drafted openings, reclaim and last unit, `RESET_CARD`'s zeroing | `processSetCard`, `processResetCard` |
+| the table: the lookup (`entryOf`, `placeUnit`), the labelled load (the label, the one-byte shift in `processLoadProof` and `logLoaded`), the gate, the cap (`freeEntry`), the order of writes in `loadOne` | |
+| the reclaim (`reclaim`), at `CLEAR_SPENT`, at a load where the table may be full, and at `SET_CARD` | |
+| `SPEND_ALL_BEGIN`'s one unit; `SIGN`'s unit, the other unit's count and the last unit | |
+| the ceiling: the conversion (`centsOfPayment`, `toCents`), `6A99`, the cents handed to the allowance, the day and the wait | |
+| `SET_LIMIT`: the sixteen- and twelve-byte forms, the old lengths' rule, the rate in `writeLimit` | |
+| `GET_INFO` P1 = 3, the format byte (`cardFormat`), `GET_CARD` P1 = 2 and the rate masked, `GET_BALANCE` P1 = 1, `GET_LOG` P1 = 2 and 3 | |
+| the log's bit (`logEntry` takes the unit, `logAt`), the receipts' units | |
+
+The load file: **24,390 bytes** (`tools/refcheck.py`'s measure), 2,560 bytes more than
+1.22's 21,830, at 70 past a multiple of 256 (12.2).
+
+Memory, as built: the constructors make the same **30,069** bytes of permanent arrays as
+1.22, and the card asks for the same **941** bytes cleared on deselect and 7 on reset
+(`SchnorrHWMathTest` pins both). The book's **75** bytes are asked for by the first
+`SET_CARD`, the third of the stores made there.
 
 ### 12.2 The install-size window
 
@@ -1185,7 +1203,10 @@ has found (`FOXY-CARD-HARDWARE.md`). The record so far: 1.19 installed at 19,269
 bytes (69 past a multiple of 256), 1.20 at 19,634 (178 past), 1.21 at 21,109 (117
 past); **1.22 was refused at 21,740 bytes (236 past) and installed at 21,830 (70
 past)**, with fifteen lines of `sizeTheFile` and nothing else changed. No size past
-21,830 has been tried, so `tools/refcheck.py` will say "not tried" of 1.23's.
+21,830 has been tried, so `tools/refcheck.py` says "not tried" of 1.23's.
+
+As built, 1.23's load file came to 24,196 bytes with 1.22's fifteen lines (132
+past a multiple of 256; 24,147, 83 past, before the refusal of sats at the load, 12.5). Thirty-three lines were added to `sizeTheFile` (thirty of six bytes, two of five and one of four; forty-eight in all) to bring it to 24,390 bytes, 70 past, the residue 1.22 installed at: a first candidate, and no more than that, since the rule is not known and the file is 2,560 bytes past any size tried. It has not been tried on the chip.
 
 The work: build, read the size, and try it on the chip with
 `~/.foxycard/install-try.sh`. Where it fails, move the build a line of `sizeTheFile`
@@ -1199,8 +1220,8 @@ The sitting is planned for it, with the measures of 10.7.
 
 | Work | Days |
 |---|---|
-| applet | 3 |
-| JUnit (U1 to U34, about 2,600 lines), the helpers and source scans rewritten (10.6), the transcript and the vectors | 3 |
+| applet | 3 (done) |
+| JUnit (U1 to U34, about 2,600 lines), the helpers and source scans rewritten (10.6), the transcript and the vectors | 3 (done: `UnitsTest` is 1,612 lines with U35 and U36 of the review; 411 tests in all) |
 | at the chip: the install-size window, 10.7's run and measures, `ProofStoreCheck`'s book | 1 to 2 |
 | the model of the card and its replay | 1 |
 | the phone's wallet (`08a`, `21a`, native): about 700 lines | 3 |
@@ -1214,6 +1235,54 @@ The dollars card on the cards there are (a record of `01`, dollar pieces at the 
 limits in cents typed in dollars and never re-pegged, paid by a dollar till) needed no
 new card software, and has shipped in the phone. It is a card of one unit, format 4,
 and a 1.23 card set up in dollars is the same card to that phone (10.2). 1.23 is next.
+
+### 12.5 Where the build differs from this text
+
+Each is the plainest reading where the text is silent, or what a test could do where the text asks for more:
+
+- **The methods that name the book** (U31) are `processSetCard`, `processResetCard`,
+  `processLoadProof`, `loadOne`, `processSpendAllSign`, `processGetInfo`, `processGetCard`,
+  `processGetLog`, `processGetReceipts` and five small ones beside the reclaim: `entryOf`
+  (the lookup), `placeUnit` (a place's unit), `cardFormat`, `freeEntry` (the cheap count)
+  and `reclaim`. `processSpendAllBegin`, `processGetBalance` and `processLoadChange`
+  reach the table through `placeUnit` and do not name the book themselves.
+- **`LOAD_CHANGE`** enters nothing and checks nothing in the table (3.3); its log entry
+  is of its opening keyset's unit, and of the record's where the keyset is in no entry
+  (which only a fault could leave: 3.5).
+- **The let-go** (`RESET_CARD` P1 = 1) writes no amount, and the text gives it no unit: it
+  sets its bit in the tap's entry whatever that entry's unit, and begins one of the
+  record's unit where the tap has none.
+- **`GET_INFO` P1 = 3 byte 43** is `00` before the first `SET_CARD` as well as on a card
+  refused the room: the book is not there in either.
+- **`GET_BALANCE` P1 = 1** on a card that holds nothing is the one byte `00`.
+- **U2** cannot make jCardSim refuse an allocation: it leaves the book null by reflection,
+  as the catch would leave it, and the card behaves as one refused the room.
+- **U10's "the pass is counted"**: the card keeps no count of its reclaims (one would cost
+  code and a field); the test pins instead that a dead entry is still in use after a load
+  of an entered keyset, and after a load of a new keyset with the table not full.
+- **U33** replays `spec/vectors/transcript-122.json` (the 1.22 recording, kept beside the
+  new one) on a card in sats and on one in dollars. On sats each old-length `SET_LIMIT` is
+  `6700`, and the test then writes into the record what 1.22 wrote, with a rate of 100, so
+  that the rest of the recording runs on from the state it was made in; on dollars the
+  owner's `SET_CARD` (whose proof is over a sats record) is followed by the unit put to
+  dollars by hand. Every other answer is compared to the byte: equal but the version
+  (`SELECT`, `GET_INFO` byte 1), the unit in `GET_CARD` on the dollars card, and the one
+  `GET_LOG` P1 = 2 of the recording, `6A86` on 1.22 and the log with the other unit's
+  count on 1.23.
+- **The owner's vectors** keep the four- and twelve-byte proofs (made on a dollars
+  record, where 1.23 takes them) and gain the sixteen-byte one.
+- **The chip checks**: `ChangeCheck`'s run of 1.21 and 1.22 sends the PIN form's twelve
+  bytes to a card of 1.23 (its eight are `6700` on a sats record), with a rate of 100; and
+  `ProofStoreCheck`'s claim takes `6A98`, keep holding, which it had not since 1.21.
+- **The 128 places** (9.2) are the phone's to cut; the card is unchanged for them.
+- **Sats refused at the load on a card with a limit and no rate** (6.4, `6A99` at
+  `LOAD_PROOF`): not in the first text. Without it a card with no owner given a limit and
+  a rate of 0 (the PIN's twelve bytes, or 1.22's lengths on a dollars record) took sats it
+  could never pay, and nothing could change its rate, its record or its owner while they
+  were there: they stayed on it for good. The twelve- and sixteen-byte forms still take a
+  limit with a rate of 0, as the text says; it is the sats that are kept off. U18 now puts
+  its sats on before the owner sets the limit with no rate, the one way such a card comes
+  to hold them; U35 and U36 came of the review of the build.
 
 ## 13. Decided
 
@@ -1248,6 +1317,7 @@ and what each meant for this design:
 10. **What ships first.** "ok cool". The dollars card on 1.20 has shipped in the
     phone; 1.23 is next (12.4).
 
-**Still open.** Nothing the owner has to answer before 1.23 is built. Two things are
-the chip's to answer, in the one sitting: the size at which 1.23 installs (12.2), and
-the time the conversion adds to a sats payment's first and last `SIGN` (10.7, step 5).
+**Still open.** Nothing the owner has to answer: 1.23 is built. Two things are the
+chip's to answer, in the one sitting: the size at which 1.23 installs (12.2: the first
+candidate is 24,390 bytes, not tried), and the time the conversion adds to a sats
+payment's first and last `SIGN` (10.7, step 5; `ChangeCheck` prints it).
