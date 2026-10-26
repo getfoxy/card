@@ -1,0 +1,14 @@
+<!-- The primitives probe (CapsProbe.java), for a chip the card's applet has not run on yet.
+     Build: JAVA_HOME=/opt/homebrew/opt/openjdk@17 ant -f tools/j3r452/probe-caps/build.xml  -> tools/j3r452/probe-caps/probe-caps.cap
+     Uses the ant-javacard jar tracked in applet/target (pinned there by SHA-256) and the 3.0.5 kit the main build uses.
+     Package F0464F585943415053, applet F0464F58594341505301: loads beside anything else and is deleted after its run. -->
+<project name="probe-caps" default="cap" basedir=".">
+  <taskdef name="javacard" classname="pro.javacard.ant.JavaCard" classpath="${basedir}/../../../applet/target/ant-javacard-v26.05.15.jar"/>
+  <target name="cap">
+    <javacard jckit="${user.home}/.javacard/sdks/jc305u4_kit">
+      <cap targetsdk="${user.home}/.javacard/sdks/jc305u4_kit" aid="F0464F585943415053" output="probe-caps.cap" sources="src" version="1.0">
+        <applet class="me.foxy.probe.CapsProbe" aid="F0464F58594341505301"/>
+      </cap>
+    </javacard>
+  </target>
+</project>
