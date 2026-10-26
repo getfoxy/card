@@ -15,7 +15,7 @@ import javacardx.biometry.*;
              ... 12 VEIN_PATTERN, 1F PASSWORD): 00 type on success.
    Answer of a blank J3R180 (card three, 2026-10-16): the load is accepted (the chip lists javacardx.biometry and
    biometry1toN in its registry) and every type gets 6B03, NO_SUCH_BIO_TEMPLATE: the API is there, no engine is.
-     The 1:N builder is not tried: FOXY needs 1:1 only.
+     The 1:N builder is not tried: the card needs 1:1 only.
    Delete the probe afterwards (run.sh does). The template it made goes with it. */
 public class BioProbe extends Applet {
     private OwnerBioTemplate made;
