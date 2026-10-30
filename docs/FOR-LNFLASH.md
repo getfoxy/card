@@ -156,7 +156,7 @@ Class `B0` as yours. AID: package `F0 46 4F 58 59 43 41 52 44`, applet the same 
 | `40` VERIFY_PIN | the PIN | the PIN, or sealed (P1 = 1, 1.9); it also renews the no-PIN allowance (1.21) |
 | `41` SET_PIN | the PIN, once (`6985` if one exists) | sets or replaces the PIN, and unblocks, on a card with no owner, with nothing unspent and no change owed. A card with an owner refuses it (`6A91`; ADD PIN, 1.16 to 1.20, is gone). A card with no owner that is set up keeps its PIN (1.22): a new one wants the old given in the tap, and once the card has been used the history held for; a blocked one is replaced with nothing owed, and the history goes with it |
 | `42` CHANGE_PIN | old PIN length, old PIN, new PIN | proof length, proof, new PIN. The owner's proof; no old PIN, no session, any PIN state, any funds. Resets the tries |
-| `43` SET_OWNER | none | the owner's public key, 65 bytes uncompressed. On a card with no owner, a claim (1.21): under the PIN given in the tap, only while it is empty, never in a tap that paid, asked six times in a row, `6A98` (keep holding) to each but the last; on a card with an owner, only with the old owner's proof and only while it is empty (`6A8D` otherwise, `6A91` without a good proof) |
+| `43` SET_OWNER | none | the owner's public key, 65 bytes uncompressed. On a card with no owner, a claim (1.21): under the PIN given in the tap, with no change owed (1.24: its pieces stay on it; up to 1.23 only while it was empty), never in a tap that paid, asked six times in a row, `6A98` (keep holding) to each but the last; on a card with an owner, only with the old owner's proof and only while it is empty (`6A8D` otherwise, `6A91` without a good proof) |
 | `44` GET_NONCE | none | no data; answers a fresh 16 bytes held in RAM. No PIN; `6A90` on a card with no owner. With P1 = 1, on any card, the nonce, the key a PIN is sealed to, and the card's signature over it |
 | `45` ALLOW_LOAD | none | the owner's proof (label `FoxyCard/load`). For the rest of that tap: the log and the receipts read, the limit on one payment told, a second payment not slowed, and, with the PIN, `LOAD_CHANGE` under another key (1.22). It opens no load (1.21; up to 1.20 `LOAD_PROOF` and `CLEAR_SPENT` needed no PIN under it). Not a payment |
 | `50` LOCK_CARD | the PIN if one is set; `P2 = DE` | a PIN set and verified, `P2 = DE`, and the owner's proof as data. A locked card still pays and still takes its own change |
@@ -375,8 +375,8 @@ visit, where the owner has set one.
   one, because it goes to the mint before saying paid.
 - A PIN sent in its clear form crosses a few centimetres of air as typed; the
   sealed form (1.9) does not. Nothing of the owner does.
-- A card with no owner can be claimed by a reader once it is empty (from 1.22 it
-  may hold money, and is loaded under its PIN). From 1.21 a claim wants the
+- A card with no owner can be claimed by a reader that has its PIN (from 1.22 it
+  may hold money, and is loaded under its PIN; from 1.24 it is claimed with it on). From 1.21 a claim wants the
   card's PIN given in the tap and six askings in a row, seconds of holding, and
   is never made in a tap that paid.
 - A locked card still pays, under its PIN and its no-PIN allowance; locking
@@ -425,7 +425,7 @@ card should carry from them:
    the key given (the PIN alone is a till's too); and one opening is given up by
    number (the owner's proof; on a card with no owner, the PIN in a held tap), its
    money gone, written in the log.
-4. **An owner claimed in a tap of its own**, under the PIN, only of an empty card,
+4. **An owner claimed in a tap of its own**, under the PIN, with no change owed (Foxy 1.24; 1.21 to 1.23 only of an empty card),
    never in a tap that paid, and no payment after it in that tap, after a held
    count of askings (six on this card), each but the last answered with a status
    word that is not `9000` (`6A98`) after a signature's work of the card's own.
@@ -448,7 +448,7 @@ card should carry from them:
    rewritten (record, numbers, PIN) only in a held tap, so that a till handed the
    PIN for a payment cannot, in that tap, write its own refund key, a large
    allowance or another mint. Tying the card to a phone of the holder's own is the
-   held claim of rule 4, on an empty card.
+   held claim of rule 4, with the card's money left on it.
 8. **The guest's history, held for** (1.22). On a card with a PIN and no owner the
    log and the receipts are the PIN's, read on a friend's phone as a guest, and
    held for: a count of askings (ten on this card), each but the last answered

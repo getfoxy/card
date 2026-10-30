@@ -4,7 +4,7 @@ Each entry records a call that was made, what was rejected, and why. If you are
 about to change one of these, read the entry first — most were made against a
 real alternative, and several were made *after* getting it wrong once.
 
-Anchors are stable (`#d1` … `#d17`); other docs link to them.
+Anchors are stable (`#d1` … `#d18`); other docs link to them.
 
 ---
 
@@ -542,6 +542,31 @@ reads the history; the hold makes the read slow and seen, not impossible. A card
 owner to unblock it: three wrong PINs strand its money ([`SECURITY-MODEL.md`](SECURITY-MODEL.md) #14). Its numbers
 are set with the PIN only while it is empty, and it is tied to a phone only while it is empty. A refund key the
 loading phone supplies lets that phone, and not the holder, take back a lost card's dated pieces.
+
+---
+
+## <a id="d18"></a>D18 — A card with no owner is claimed with its money on it
+
+**Decided:** in software 1.24 ([`FOXY-CARD-DAILY-LIMIT.md`](FOXY-CARD-DAILY-LIMIT.md) 8.3, and 8.4 rule 8):
+
+- The claim (`SET_OWNER` on a card with no owner) no longer wants the card empty. The pieces on it stay unspent
+  where they were, and the claim writes nothing of them. Every other guard of the claim is 1.21's ([D16](#d16)):
+  the PIN set and given in the tap, never in a tap that signed a payment, six askings in a row, the count begun
+  again by any other command, and no payment in the tap after a claim.
+- The claim is refused while change is owed (`6A8D`, as `SET_CARD` and `RESET_CARD` refuse it). An opening still
+  waiting is mended or given up under the PIN and the held history on a card with no owner, and under the owner's
+  grant or proof on one with an owner; a claim would move that say in the middle. The change goes back first
+  (`LOAD_CHANGE`, any reader).
+- A card with an owner is handed over as before: the old owner's proof, and nothing unspent. A card whose terminal
+  can empty it must not be taken over by emptying it.
+
+**Why:** a holder with no phone whose card was loaded first had to spend it to nothing to tie it to a phone of
+their own. The claim adds no way to the money: a reader with the PIN, the claim's own gate, can spend the card
+already.
+
+**Cost accepted:** a reader that keeps the PIN and holds the card for the claim's seconds, in a tap of its own,
+becomes the owner of a card with money on it, and with the owner's say changes its PIN and its limits; up to 1.23
+it could do so only once the card was empty, and could empty it under the same PIN first.
 
 ---
 

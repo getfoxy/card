@@ -152,7 +152,7 @@ Full reference: [`spec/APDU.md`](spec/APDU.md).
 | `B0` | `21` | SIGN_ARBITRARY | ✔ (if set) | Upstream's: sign 32 bytes, consuming no proof. Gone in this fork (`6D00`) |
 | `B0` | `30` | LOAD_PROOF | ✔ | Store a proof in the next free slot (P1 = 1: one piece and the mint's proof for it, 1.20) |
 | `B0` | `31` | CLEAR_SPENT | ✔ | Reclaim spent slots |
-| `B0` | `43` | SET_OWNER | ✔ (a claim) / owner's proof | Give the card its owner key; on a card with none, a claim under the PIN, six askings in a row, only of an empty card (1.21) |
+| `B0` | `43` | SET_OWNER | ✔ (a claim) / owner's proof | Give the card its owner key; on a card with none, a claim under the PIN, six askings in a row (1.21), with the money on the card and no change owed (1.24) |
 | `B0` | `53` | LOAD_CHANGE | — (the key bound at the payment); ✔ and the owner's grant or a held tap for another key | One opening of the card's own change made a piece: the card checks the mint's proof and unblinds it itself (1.21) |
 | `B0` | `40`–`42` | VERIFY/SET/CHANGE_PIN | — / ✔ | PIN management |
 | `B0` | `50` | LOCK_CARD | ✔ | Irreversibly disable writes and freeze the settings; a locked card still pays |

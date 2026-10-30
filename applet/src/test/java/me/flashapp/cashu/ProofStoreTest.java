@@ -767,7 +767,7 @@ class ProofStoreTest {
             byte[] d = c.info(p1);
             assertEquals(30, d.length, "P1 = " + p1);
             assertEquals(1, d[0]);
-            assertEquals(0x17, d[1], "version 1.23");
+            assertEquals(0x18, d[1], "version 1.24");
             assertEquals((byte) 0xFF, d[6], "capabilities as they were");
             assertEquals(4, d[8], "format 4");
         }
@@ -777,7 +777,7 @@ class ProofStoreTest {
         assertArrayEquals(c.info(1), Arrays.copyOf(c.info(2), 42));
         assertArrayEquals(c.info(2), Arrays.copyOf(c.info(3), 43));
         assertEquals(0, c.info(2)[42], "the tag is on");
-        assertArrayEquals(new byte[] { 0x01, 0x17 }, c.send(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR))).getData(), "SELECT says 1.23");
+        assertArrayEquals(new byte[] { 0x01, 0x18 }, c.send(new CommandAPDU(0x00, 0xA4, 0x04, 0x00, hexToBytes(AID_STR))).getData(), "SELECT says 1.24");
         // with pieces on, the same on a card whose pieces came with proofs and one whose did not
         Card plain = new Card().ready(), proofed = new Card().ready();
         for (int i = 0; i < 4; i++) {

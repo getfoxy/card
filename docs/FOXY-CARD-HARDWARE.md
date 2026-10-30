@@ -107,6 +107,11 @@ held (175 and 36 checks): a guest's hold of ten askings 4.7 s, the claim 2.8 s,
 SET_LIMIT with its rate 84 ms, SET_CARD with the reclaim 74 ms, three new pieces
 with a new keyset 221 ms.
 
+Software 1.24 (the claim of a card with no owner with its money on it) came to 24,412
+bytes (92 past a multiple of 256) with 1.23's lines of `sizeTheFile`, a size not tried,
+and is built at 24,390, the size 1.23 installed at, with four of those lines taken away
+(three of six bytes and the one of four). It has not been tried on the chip.
+
 What the software does: `CashuApplet.sizeTheFile` is never called and is in
 the package for its length alone, about six bytes a line, so that a build
 can be moved to a size that is known to install; `tools/refcheck.py`, after

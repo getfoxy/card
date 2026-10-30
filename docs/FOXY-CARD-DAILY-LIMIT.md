@@ -1336,14 +1336,15 @@ A card with a PIN and no owner may hold money (1.22): the card of a holder with
 no phone, loaded under its PIN by whichever phone sends it money (8.4). It has no
 owner to change its PIN or unblock it, and its numbers, its record and its PIN are
 the PIN's, while it holds nothing and is owed nothing. It is tied to an owner, if
-the holder wants one, by the claim, which wants it empty (8.3). Up to 1.21 such a
+the holder wants one, by the claim, which takes it with its money on it and no
+change owed (8.3; up to 1.23 it wanted it empty). Up to 1.21 such a
 card could not be loaded (rule 7 said "no money without an owner"), and was only
 an unfinished set-up.
 
 ## 8. Commands
 
 Class `B0` (any other class is `6E00`, and an instruction the card does not have
-is `6D00`). The instructions of software 1.23, by byte; a row in **bold** is new
+is `6D00`). The instructions of software 1.24, by byte; a row in **bold** is new
 or changed from `FOXY-CARD-SPEC.md` 5.2's first form and the allowance draft. The
 answers are listed in the order the card checks them. A word the row does not
 explain is in the table of status words below.
@@ -1376,7 +1377,7 @@ explain is in the table of status words below.
 | `40` | **VERIFY_PIN** | a PIN set | the PIN, 4 to 8 bytes; or, with **P1 = 1**, the PIN sealed (6e) | nothing; the PIN is given for the rest of this tap, and the no-PIN allowance renews (its count goes to 0: 1.21, 6f). In order: `6A86` for a P1 other than 0 and 1; `6984` with no PIN set; `6983` with the PIN blocked; sealed, `6700` for an envelope too short, `6985` with no nonce asked for, a try lost for an envelope that does not open (as a wrong PIN, below), `6700` for a block that is not nine bytes or a length in it not 4 to 8; `6700` for a PIN that is not 4 to 8 bytes; `63CX` for a wrong PIN, X tries left, and `6983` for the one that blocks it. A wrong PIN ends the PIN given earlier in the tap |
 | `41` | **SET_PIN** | **a card with no owner**; nothing unspent and no change owed. A card not set up (no PIN, a blocked PIN, or no record): no PIN and no proof. A card set up (a PIN that is not blocked, and a record) (1.22): the PIN it has, given in this tap, and, once used, the history held for in this tap (8.4). It is the first thing a card is given (1.21). (From 1.16 to 1.20 also, ADD PIN, a card with an owner and no PIN under the owner's grant; gone, 6f) | the PIN; or, with **P1 = 1**, the PIN sealed (6e) | nothing; sets or replaces the PIN, gives back the tries, unblocks, and ends the PIN given earlier in the tap. A blocked PIN replaced takes the log and the receipts with it; on a card that had no PIN the allowance is nothing. In order: `6A86` for a P1 other than 0 and 1; `6986` on a locked card; `6A91` on a card with an owner, grant or none (use `42`); on a set-up card `6982` with its PIN not given; `6A8D` if anything is unspent or change is owed; on a set-up card that has been used, `6985` in a time in the field in which a payment was signed and `6982` with no hold; sealed, `6700` for an envelope too short, `6985` with no nonce, `6A80` for an envelope that does not open (no try is lost), `6700` for a block that is not nine bytes; `6700` for a PIN that is not 4 to 8 bytes |
 | `42` | **CHANGE_PIN** | the owner's proof. **No PIN, no session, any PIN state, any funds** | proof length (1), proof (DER), the new PIN; or, with **P1 = 1**, the same sealed, the PIN as its nine-byte block (6e) | nothing; sets the PIN, gives back the tries, unblocks, and ends the PIN given earlier in the tap. In order: `6A86` for a P1 other than 0 and 1; `6986` on a locked card; `6A90`; sealed, `6700` for an envelope too short, `6985` with no nonce, `6A80` for an envelope that does not open, `6700` for a bad block; `6A91` with no good proof (over the PIN itself and the same nonce the seal is under); `6700` for a new PIN that is not 4 to 8 bytes |
-| `43` | **SET_OWNER** | no owner (the claim, 1.21): a PIN set and given in this tap, no payment signed in this time in the field, nothing unspent; the same key asked for six times in a row (8.3). Owner: the owner's proof, nothing unspent | 65 bytes, the owner's public key, uncompressed; with an owner, proof length (1) and the proof first | the claim: `6A98`, keep holding, with no data, to each of the first five askings, a signature's work each, and the sixth sets the owner, answering nothing; a different key, or any other command between, begins the count again. With an owner: replaces it at once. In order: `6986` on a locked card; with an owner `6A91` with no good proof; with no owner `6A97` with no PIN, `6982` with the PIN not given, `6985` in a time in the field in which a payment was signed; `6A8D` if anything is unspent; `6700` for a key that is not 65 bytes; `6A80` for a key not beginning `04`; then the askings; `6A80` for a key that is not a point. After a claim, no payment is signed in that time in the field |
+| `43` | **SET_OWNER** | no owner (the claim, 1.21): a PIN set and given in this tap, no payment signed in this time in the field, no change owed (1.24: its pieces stay on it; up to 1.23 nothing unspent); the same key asked for six times in a row (8.3). Owner: the owner's proof, nothing unspent | 65 bytes, the owner's public key, uncompressed; with an owner, proof length (1) and the proof first | the claim: `6A98`, keep holding, with no data, to each of the first five askings, a signature's work each, and the sixth sets the owner, answering nothing; a different key, or any other command between, begins the count again. With an owner: replaces it at once. In order: `6986` on a locked card; with an owner `6A91` with no good proof; with no owner `6A97` with no PIN, `6982` with the PIN not given, `6985` in a time in the field in which a payment was signed; `6A8D` with an owner if anything is unspent, with none if change is owed (1.24); `6700` for a key that is not 65 bytes; `6A80` for a key not beginning `04`; then the askings; `6A80` for a key that is not a point. After a claim, no payment is signed in that time in the field |
 | `44` | GET_NONCE | a card with an owner. No PIN | | 16 bytes. `6A86` for a P1 other than 0 and 1; `6A90` with no owner. With **P1 = 1**, on any card: the 16 bytes, the PIN key (33, compressed) and the card key's signature over it (64), for sealing a PIN (6e) |
 | `45` | **ALLOW_LOAD** | the owner's proof, over `FoxyCard/load` and no value | proof length (1), proof | nothing; for the rest of this tap the owner's grant (rule 9): the log and the receipts read, the limit on one payment told, a second payment not slowed, and with the PIN another key for `LOAD_CHANGE` (8.2). It opens no load (1.21; up to 1.20 `LOAD_PROOF` and `CLEAR_SPENT` needed no PIN under it). `6986` on a locked card; `6A90`; `6A91`; `6700` for bytes after the proof |
 | `50` | LOCK_CARD | PIN set and given in this tap; the owner's proof | P2 = `DE` (P1 is not read); proof length (1), proof | nothing; the card locked for good. A locked card **still pays**, under its PIN and its no-PIN allowance, up to its limits, and **still takes its own change** (`LOAD_CHANGE`: receiving what it is owed changes no setting); **every other write is `6986`**, so its limit, its allowance and its PIN can no longer be changed, nor its places freed or loaded. Only `RESET_CARD`, with the PIN as well, takes it back (its let-go form, P1 = 1, also works on a locked card, with the proof and the PIN). The phone never sends it. In order: `6982` with no PIN given (a card with no PIN, or a blocked one, cannot be locked); `6B00` for a P2 not `DE`; `6985` on a card already locked; `6A90`; `6A91`; `6700` for bytes after the proof |
@@ -1463,7 +1464,7 @@ column it is in (the let-go answers `6A83` for a number past 7 first).
 | `SET_LIMIT` (`33`, PIN form) | the PIN given in this tap, **while nothing is unspent or owed**, and once used the history held for (1.22) | **refused**; `6986` on a locked card |
 | `SET_LIMIT` (`34`) | `6A90` | the owner's proof, empty or not |
 | `SET_LIMIT` with the rate (1.23) | `33`, twelve bytes, as 1.22's `33` | `34`, sixteen bytes, as 1.22's `34` |
-| `SET_OWNER` (`43`) | **the claim, while nothing is unspent**: under the PIN given in this tap, six askings in a row, never in a tap that signed a payment (8.3) | **the owner's proof, and nothing unspent** |
+| `SET_OWNER` (`43`) | **the claim, with no change owed** (1.24, pieces on the card or not; up to 1.23 while nothing is unspent): under the PIN given in this tap, six askings in a row, never in a tap that signed a payment (8.3) | **the owner's proof, and nothing unspent** |
 | `ALLOW_LOAD` (`45`) | `6A90` | the owner's proof |
 | `LOCK_CARD` (`50`) | `6A90` (after the PIN gate) | PIN set and given, and the owner's proof |
 | `RESET_CARD` (`51`, 1.17) | `6A90`; with P1 = 1 (1.22) one opening given up under the PIN in a held tap | the owner's proof, nothing unspent or owed (`6A8D`); on a locked card the PIN as well (`6982`); with P1 = 1 one opening given up under the proof |
@@ -1482,7 +1483,7 @@ words the card gives a meaning of its own:
 | SW | Means |
 |---|---|
 | `6A8C` | no card record: a load (`LOAD_PROOF`) before `SET_CARD` has run |
-| `6A8D` | card in use: a thing that is set only on an empty card, on a card with an unspent piece; and (1.21) `SET_CARD`, `RESET_CARD`, and on a card with no owner `SET_PIN` and the PIN form of `SET_LIMIT`, while change is owed to the card (8.2) |
+| `6A8D` | card in use: a thing that is set only on an empty card, on a card with an unspent piece; and (1.21) `SET_CARD`, `RESET_CARD`, and on a card with no owner `SET_PIN`, the PIN form of `SET_LIMIT` and (1.24) the claim, while change is owed to the card (8.2) |
 | `6A8E` | a dated piece on a card with no refund key |
 | `6A8F` | over the day: this payment would take today past its limit. Nothing signed, nothing burned, the payment given up, and the refusal written in the card's log |
 | `6A95` | unused. It was "over the limit on one tap", when that was a window and refused; a payment over the limit on one payment now waits (6a) |
@@ -1707,9 +1708,16 @@ under the PIN:
 
 - **The PIN, set and given in this tap.** `6A97` with none set, `6982` with one not
   given. A card's first steps are `SET_PIN`, `VERIFY_PIN` and then the claim.
-- **Only of an empty card.** `6A8D` with anything unspent on it. A card with no
-  owner may hold money since 1.22 (8.4); it is claimed only once it is empty
-  again.
+- **With its money on it, and no change owed** (1.24). A card with no owner may
+  hold money since 1.22 (8.4), and is claimed with its pieces on it: the claim
+  writes the owner's key and nothing of the pieces, which stay unspent where they
+  were. `6A8D` while change is owed to it (an opening of its own change waits for
+  its piece; `GET_INFO` byte 29), at every asking and before any is counted: an
+  opening still waiting is mended or given up under the PIN and the held history
+  on a card with no owner and under the owner's grant or proof on one with an
+  owner (8.2), and a claim would move that say in the middle. The change is
+  written back first (`LOAD_CHANGE`, any reader). Up to 1.23 the claim was only of
+  an empty card (`6A8D` with anything unspent).
 - **Six askings in a row** (`CLAIM_ASKINGS`). The first five are each answered
   `6A98`, keep holding, with no data, after a signature's work of the card's own,
   thrown away, as a payment's wait does it (6a): about half a second each on the
@@ -1798,10 +1806,11 @@ and the two ways out of change owed (8.2).
    at once, in a paying tap as well; the receipts by the grant alone; the record by
    the owner's proof; loads and `CLEAR_SPENT` under the PIN. Nothing is held for
    and nothing is marked read.
-8. **The claim, only of an empty card.** `SET_OWNER` on a card with no owner is
-   made under the PIN given in the tap, by six askings in a row, never in a tap
-   that paid, and only while nothing is unspent (`6A8D`, 8.3). A holder with no
-   phone who ties the card to a phone of their own does it with the card empty.
+8. **The claim, with the money on the card** (1.24). `SET_OWNER` on a card with
+   no owner is made under the PIN given in the tap, by six askings in a row, never
+   in a tap that paid, and not while change is owed (`6A8D`, 8.3); the pieces on it
+   stay where they are. A holder with no phone who ties the card to a phone of
+   their own does it without spending the card (up to 1.23 it had to be empty).
 9. **The card keeps its PIN.** `SET_PIN` on a card with no owner whose record is
    set and whose PIN is not blocked (the card is set up) wants the PIN it has,
    given in this tap (`6982`), nothing unspent and no change owed (`6A8D`), and,
@@ -1844,7 +1853,7 @@ for as long as the card answers `6A98`, saying **KEEP HOLDING** on the screen an
 counting up, as a payment's wait and the claim do; then it reads the receipts and
 shows the balance and the history, and makes no payment in that tap. A phone that
 sees `6A98` once and stops has read nothing: `6A98` is not `9000`. TIE OWNERSHIP
-TO THIS PHONE is the claim (8.3), and wants the card empty (rule 8). The phone that
+TO THIS PHONE is the claim (8.3), and takes the card with its money on it (rule 8, 1.24). The phone that
 set the card up and loaded it shows neither as its own: it is not the card's owner.
 A set-up cut off after the PIN is taken up again with `VERIFY_PIN` first (rule 9).
 With the guest's hold done, the same screen can show the limit on one payment
@@ -2132,8 +2141,9 @@ gets one day; a test checks that the page never receives an owner secret.
 - No refund key: a lost card is cash gone, as Foxy's phone sets cards up. A blocked
   card with an owner is not, because the owner unblocks it; a blocked card with no
   owner and money on it is (8.4).
-- A card with no owner and nothing on it can be claimed by a reader that has its
-  PIN, and that is accepted: it holds nothing. The claim wants the PIN given in
+- A card with no owner can be claimed by a reader that has its PIN, money on it
+  or not (1.24), and that is accepted: a reader with the PIN can spend what is on
+  it already, and the claim moves none of it. The claim wants the PIN given in
   the tap and six askings in a row, seconds of the card held to the reader, which
   the holder sees, and never comes in a tap that signed a payment (8.3). A card
   leaves the issuer's hands set up, as the draft's 5.4 says, so that nobody has to
@@ -2542,7 +2552,8 @@ here overrides anything above.
 5. No payment in a tap that read the history (8.4, rule 5).
 6. The balance, the pieces and `GET_INFO` stay open (8.4, rule 6).
 7. A card with an owner is 1.21's (8.4, rule 7).
-8. The claim is only of an empty card (8.3; 8.4, rule 8).
+8. The claim is only of an empty card (8.3; 8.4, rule 8). From 1.24 it takes the
+   card with its money on it, and not while change is owed.
 9. A set-up card keeps its PIN; a blocked one is replaced only with nothing owed,
    and the history goes with it (8.4, rule 9).
 10. A used card is rewritten only after a hold (8.4, rule 10).
@@ -2556,3 +2567,8 @@ the table of keysets in the book the first `SET_CARD` makes, every limit in cent
 rate written beside them, one unit a payment, and the log and the receipts saying each
 payment's unit (8.5, and `FOXY-CARD-KEYSETS.md`). Sats are not put on a card with a limit
 and no rate (`6A99` at the load), where no payment could take them off again.
+
+**Software 1.24** (`SELECT` answers `01 18`): the claim of a card with no owner takes it with
+its money on it, the pieces left unspent where they were, and is refused while change is owed
+(`6A8D`, 8.3; 8.4, rule 8). A card with an owner is handed over as before, with nothing
+unspent and the old owner's proof. The wire is otherwise 1.23's.

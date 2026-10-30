@@ -1039,7 +1039,7 @@ class UnitsTest {
         assertEquals(51, three.length);
         assertArrayEquals(two, Arrays.copyOf(three, 43), "0 to 42: P1 = 2's");
         assertEquals(1, three[0]);
-        assertEquals(0x17, three[1], "1.23");
+        assertEquals(0x18, three[1], "1.24");
         assertEquals(5, three[8], "a card of both units");
         assertEquals(1, three[43], "the book's format");
         assertEquals(1000, readUint32(three, 44), "the rate, to the grant");
@@ -1466,10 +1466,10 @@ class UnitsTest {
                 byte[] got = r.getData();
                 if ((apdu[0] & 0xFF) == 0x00 && ins == 0xA4) {
                     assertArrayEquals(new byte[] { 1, 0x16 }, wantData, name);
-                    assertArrayEquals(new byte[] { 1, 0x17 }, got, name + ": the version, 1.23");
+                    assertArrayEquals(new byte[] { 1, 0x18 }, got, name + ": the version, 1.24");
                 } else if (ins == 0x01 && got.length >= 30) {
                     assertEquals(0x16, wantData[1]);
-                    assertEquals(0x17, got[1], name + ": the version");
+                    assertEquals(0x18, got[1], name + ": the version");
                     got = got.clone();
                     got[1] = 0x16;
                     assertArrayEquals(wantData, got, name);

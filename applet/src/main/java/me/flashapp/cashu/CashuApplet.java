@@ -47,7 +47,7 @@ import javacardx.crypto.*;
  *   0x40  VERIFY_PIN       — verify the PIN
  *   0x41  SET_PIN          — set or replace the PIN on an open card (no owner, nothing unspent)
  *   0x42  CHANGE_PIN       — the owner's proof and the new PIN: no old PIN, any state
- *   0x43  SET_OWNER        — give the card its owner key: an open card claimed under its PIN, asked for six times in a row (6A98 "keep holding" to each but the last); or the old owner's proof; nothing unspent
+ *   0x43  SET_OWNER        — give the card its owner key: an open card claimed under its PIN, asked for six times in a row (6A98 "keep holding" to each but the last), with its pieces on it and no change owed (1.24); or the old owner's proof, with nothing unspent
  *   0x44  GET_NONCE        — a fresh nonce for the owner's proof
  *   0x45  ALLOW_LOAD       — the owner's proof, for this tap: the log, the receipts and the limit on one payment read, and a second payment not slowed; it opens no load (1.21), but with the PIN lets LOAD_CHANGE mend an opening under another key (1.22)
  *   0x50  LOCK_CARD        — freeze the card's settings and refuse every write (PIN, and the owner's proof); a locked card still pays under its PIN and allowance, and still takes its own change
@@ -189,7 +189,16 @@ public class CashuApplet extends Applet implements TagSwitch {
     // into cents at a rate the owner's phone writes with the limits (SET_LIMIT of sixteen bytes, or twelve by the PIN), rounded
     // so that it is never counted for less than its worth. The log and the receipts say each payment's unit. A card of one unit
     // with no limit set answers as 1.22 to the byte but for the version.
-    static final byte VERSION_MINOR = (byte) 0x17;
+    // 1.24 lets the holder of a card with no owner claim it (SET_OWNER, the PIN's six askings) while it holds money: the pieces
+    // stay on the card, unspent and where they were, and the claim moves none of them. Up to 1.23 the claim was of an empty card
+    // only (6A8D), so a holder with no phone whose card was loaded first had to spend it to nothing to give it a phone. Every
+    // other guard of the claim is 1.21's: the PIN set and given in the tap, never in a tap that signed a payment, held for, and no
+    // payment after it in the same tap. A claim is still refused while change is owed (6A8D, as SET_CARD and RESET_CARD refuse
+    // it): an opening still waiting is mended (LOAD_CHANGE under another key) or given up (RESET_CARD's let-go) under the PIN
+    // and the held history on a card with no owner and under the owner's grant or proof on one with an owner, and a claim in
+    // the middle would move that say from the holder's PIN to a key the holder may not yet have used. A card with an owner is
+    // handed over as before, under the old owner's proof and with nothing unspent. The wire is otherwise 1.23's.
+    static final byte VERSION_MINOR = (byte) 0x18;
     /** What a piece's secret is (format 4, SIG_ALL), and what GET_INFO byte 8 says of a card of one unit. */
     static final byte FORMAT        = (byte) 0x04;
     /** GET_INFO byte 8 and GET_CARD byte 0 on a card that holds a keyset of the other unit (1.23): the secret is format 4's. */
@@ -3760,9 +3769,9 @@ public class CashuApplet extends Applet implements TagSwitch {
      * that already has an owner, the old owner's proof's length (1) and the
      * proof come first.
      *
-     * Only with nothing unspent. On a card WITH an owner the old owner's proof
-     * is needed, empty or not, because the only thing that could authorise a
-     * new owner is the old one, and a card whose terminal can empty it must not
+     * On a card WITH an owner, only with nothing unspent, and the old owner's
+     * proof is needed, empty or not, because the only thing that could authorise
+     * a new owner is the old one, and a card whose terminal can empty it must not
      * be taken over by emptying it. The key is kept and never read out:
      * nothing here answers with it. One transaction: the key and the flag that
      * it is there.
@@ -3782,6 +3791,21 @@ public class CashuApplet extends Applet implements TagSwitch {
      * key not the one asked for before begins the count
      * again, and so does any other command (`process`); the count is gone with
      * the tap. After a claim this time in the field signs no payment.
+     *
+     * A claim is of a card holding money too (1.24; up to 1.23 only of an empty
+     * one, `6A8D`): it writes the owner's key and nothing of the pieces, which
+     * stay unspent where they were, and the balance with them. It is refused
+     * while change is owed (`6A8D`, as SET_CARD and RESET_CARD refuse it), at
+     * every asking: an opening still waiting is mended or given up under the
+     * PIN and the held history while the card has no owner, and under the
+     * owner's grant or proof once it has one, and a claim would move that say
+     * in the middle. The change is written back first (LOAD_CHANGE, any
+     * reader), and then the card is claimed. An opening whose piece is on the
+     * card already owes nothing and is let go, as GET_CHANGE lets it go.
+     *
+     * Order of the refusals on a card with no owner: `6A97` with no PIN,
+     * `6982` for the PIN not given, `6985` in a tap that signed a payment,
+     * `6A8D` for change owed, then the key's `6700` and `6A80`.
      */
     private void processSetOwner(APDU apdu) {
         requireNotLocked();
@@ -3798,13 +3822,14 @@ public class CashuApplet extends Applet implements TagSwitch {
             requirePinSetAndVerified();
             if ((tapOpen[2] & TAP_PAID) != 0) ISOException.throwIt(ISO7816.SW_CONDITIONS_NOT_SATISFIED);
         }
-        requireNothingUnspent();
+        // handed over: nothing unspent; claimed (1.24): the pieces stay, and no change owed
+        if (owned) requireNothingUnspent(); else requireNoChangeOwed();
         if (len != EC_POINT_LEN) ISOException.throwIt(ISO7816.SW_WRONG_LENGTH);
         if (buf[at] != (byte) 0x04) ISOException.throwIt(ISO7816.SW_WRONG_DATA);
         if (!owned) {
             /* The key asked for is kept between askings where a payment's places are kept (allSlots): no payment is in hand,
              * since this command has given it up (`process`), and any command between askings begins the count again. (A
-             * card with no owner may hold pieces since 1.22; the claim is still only of an empty one, above.) */
+             * card with no owner may hold pieces since 1.22, and is claimed with them since 1.24: nothing here touches a place.) */
             short asked = (short)(nonceLive[1] & 0x7F);
             if (asked == 0 || Util.arrayCompare(buf, at, allSlots, (short) 0, EC_POINT_LEN) != 0) {
                 Util.arrayCopyNonAtomic(buf, at, allSlots, (short) 0, EC_POINT_LEN);
@@ -4394,6 +4419,15 @@ public class CashuApplet extends Applet implements TagSwitch {
      */
     private void requireNothingOwed() {
         requireNothingUnspent();
+        requireNoChangeOwed();
+    }
+
+    /**
+     * `6A8D` if any change is owed to the card: the half of requireNothingOwed that is not the pieces, for an owner's claim
+     * (1.24), which takes a card with its pieces on it but not one with change still to come. An opening whose piece is on the
+     * card already is let go, and owes nothing.
+     */
+    private void requireNoChangeOwed() {
         for (short k = 0; k < CHANGE_MOST; k++) {
             if (openState[k] != OPEN_PENDING) continue;
             if (slotWithNonce(changeOpen, (short)(k * OPEN_LEN + OPEN_NONCE)) < 0) ISOException.throwIt(SW_CARD_IN_USE);
@@ -4878,8 +4912,9 @@ public class CashuApplet extends Applet implements TagSwitch {
      * take away.
      *
      * 1.23 came to 24,196 bytes (132 past) with the fifteen lines of 1.22; the thirty-three after them (thirty of six bytes, then
-     * two of five and one of four) bring it to 24,390 (70 past, the residue 1.22 installed at), a first candidate. Neither size has
-     * been tried on the chip.
+     * two of five and one of four) brought it to 24,390 (70 past, the residue 1.22 installed at), which installed on the chip at
+     * the first try. 1.24 came to 24,412 (92 past) with those lines, a size not tried; three lines of six bytes and the one of
+     * four are taken away to bring it back to 24,390, the size 1.23 installed at. 1.24 itself has not been tried on the chip.
      */
     private static void sizeTheFile(byte[] a) {
         // fifteen lines, six bytes each: the 1.22 build of 21,740 bytes (236 past a multiple of 256) was refused at INSTALL (6F00); at 21,830 (70 past) it installed in two seconds, as 1.21 did at 21,109 (117 past) and 1.19 at 19,269 (69 past)
@@ -4925,11 +4960,7 @@ public class CashuApplet extends Applet implements TagSwitch {
         a[49] = (byte) 59;
         a[50] = (byte) 60;
         a[51] = (byte) 61;
-        a[52] = (byte) 62;
-        a[53] = (byte) 63;
-        a[54] = (byte) 64;
         a[55] = (byte) 5;
         a[64] = (byte) 0;
-        a[0] = (byte) 1;
     }
 }

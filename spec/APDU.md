@@ -8,7 +8,7 @@ This is upstream's command reference, with Foxy's software noted where it differ
 Foxy's applet has an AID of its own (`F0 46 4F 58 59 43 41 52 44`) and a wire of its
 own. Every command of it is in one table in `docs/FOXY-CARD-DAILY-LIMIT.md` section 8,
 with the answers in the order the card checks them; the notes on this page say what
-Foxy's software 1.23 does (`SELECT` answers `01 17`), and say the same. In short: a
+Foxy's software 1.24 does (`SELECT` answers `01 18`), and say the same. In short: a
 card is given its PIN before anything goes on it or leaves it (1.21); every load wants
 the PIN given in the tap; the card makes its own change, bound to the mint's key named
 at the payment, and unblinds it itself, and any reader may write that change back
@@ -18,7 +18,8 @@ card of a holder with no phone, is set up and loaded under its PIN and holds its
 for its PIN (1.22, [GET_LOG](#get_log-0x18--software-122-on-a-card-with-no-owner)); and a
 card holds dollars and sats at its one mint, a table on the card saying which unit each
 keyset is, every limit in cents and a payment in sats turned into cents at a rate the
-owner's phone writes (1.23, [Software 1.23](#software-123-dollars-and-sats-on-one-card)).
+owner's phone writes (1.23, [Software 1.23](#software-123-dollars-and-sats-on-one-card));
+and a card with no owner is claimed with its money on it (1.24, [SET_OWNER](#set_owner-0x43--software-121)).
 
 ---
 
@@ -562,7 +563,7 @@ Gives a card its owner's key, a P-256 public key, 65 bytes uncompressed (`docs/F
 | Data | The owner key, `04 ‖ X ‖ Y` (65); with an owner, proof length (1) and the old owner's proof first |
 | Response | Nothing. On a claim, `6A98` (keep holding, no data) to each of the first five askings in a row, and `9000` to the sixth, which sets the owner |
 
-**The claim.** The PIN must be set and given in this tap, no payment signed in this time in the field, and nothing unspent on the card. The same key is asked for six times in a row; each of the first five is answered `6A98`, keep holding, with no data, after a signature's work of the card's own, thrown away, as a payment's wait does it (about half a second each on the chip). `6A98` is not `9000`, so a phone that asks once never takes it for done. A different key, or any other command between (a `SELECT` among them), begins the count again; a `SET_OWNER` refused for its own data neither counts nor ends it. After a claim, no payment is signed in that time in the field.
+**The claim.** The PIN must be set and given in this tap, no payment signed in this time in the field, and no change owed to the card (an opening of its own change waiting for its piece, `GET_INFO` byte 29). From 1.24 the card may hold pieces: they stay unspent where they were, and the claim writes nothing of them; up to 1.23 the claim wanted nothing unspent. A card with an owner is handed over only with nothing unspent, as before. The same key is asked for six times in a row; each of the first five is answered `6A98`, keep holding, with no data, after a signature's work of the card's own, thrown away, as a payment's wait does it (about half a second each on the chip). `6A98` is not `9000`, so a phone that asks once never takes it for done. A different key, or any other command between (a `SELECT` among them), begins the count again; a `SET_OWNER` refused for its own data neither counts nor ends it. After a claim, no payment is signed in that time in the field.
 
 **Errors** (in the order they are checked):
 
@@ -573,7 +574,7 @@ Gives a card its owner's key, a P-256 public key, 65 bytes uncompressed (`docs/F
 | 6A97 | A claim on a card with no PIN |
 | 6982 | A claim with the PIN not given in this tap |
 | 6985 | A claim in a time in the field in which a payment was signed |
-| 6A8D | Anything unspent is on the card |
+| 6A8D | With an owner: anything unspent is on the card. A claim (1.24): change is owed to the card (up to 1.23: anything unspent) |
 | 6700 | A key that is not 65 bytes |
 | 6A80 | A key that does not begin `04` |
 | 6A98 | A claim: keep holding, the first five askings; ask again |
